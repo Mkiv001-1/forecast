@@ -17,6 +17,22 @@
 
 ---
 
+## [2026-05-05] IB Gateway integration improvements
+
+### Added
+- New `IBConfig` table and model for storing IB Gateway connection settings
+- API endpoints for IB Config management: GET/POST/PUT/DELETE `/ib-config`
+- `type` field (paper/live) to `AccountRecord` and `PositionRecord` models
+- `type` parameter to sync endpoints for distinguishing paper/live trading
+- Client methods for IB Config management in `api_client.py`
+
+### Fixed
+- asyncio event loop conflicts with ib_insync library
+- TypeError in `_run_with_loop` wrapper function
+- `avgCost` → `averageCost` attribute name in portfolio positions
+
+---
+
 <!-- TEMPLATE для новых сессий:
 
 ## [YYYY-MM-DD] Краткое название задачи

@@ -14,7 +14,7 @@ except Exception:
     pass
 
 from scripts.shared.models import (
-    ForecastLog, TickerSetting, ProviderSetting,
+    ForecastLog, TickerSetting, ProviderSetting, IBConfigRecord, IBConfigResponse,
     LogsResponse, TickersResponse, ProvidersResponse,
     TickerCreate, TickerUpdate, ProviderUpdate,
     RunResponse, HealthResponse,
@@ -248,8 +248,8 @@ class ForecastApiClient:
         data = self._get("/accounts", params=params)
         return AccountsResponse(**data)
 
-    def sync_accounts(self, host: str = "127.0.0.1", port: int = 7497, client_id: int = 1) -> dict:
-        return self._post("/accounts/sync", json={}, params={"host": host, "port": port, "client_id": client_id})
+    def sync_accounts(self, host: str = "127.0.0.1", port: int = 7497, client_id: int = 1, type: str = "paper") -> dict:
+        return self._post("/accounts/sync", json={}, params={"host": host, "port": port, "client_id": client_id, "type": type})
 
     def get_portfolio(self, account: Optional[str] = None) -> PortfolioResponse:
         params = {}
@@ -258,9 +258,33 @@ class ForecastApiClient:
         data = self._get("/portfolio", params=params)
         return PortfolioResponse(**data)
 
-    def sync_portfolio(self, host: str = "127.0.0.1", port: int = 7497, client_id: int = 1) -> dict:
-        return self._post("/portfolio/sync", json={}, params={"host": host, "port": port, "client_id": client_id})
+    def sync_portfolio(self, host: str = "127.0.0.1", port: int = 7497, client_id: int = 1, type: str = "paper") -> dict:
+        return self._post("/portfolio/sync", json={}, params={"host": host, "port": port, "client_id": client_id, "type": type})
 
     def test_ib_connection(self, host: str = "127.0.0.1", port: int = 7497, client_id: int = 1) -> dict:
         """Test IB Gateway connection and return detailed logs."""
         return self._get("/ib/test-connection", params={"host": host, "port": port, "client_id": client_id})
+
+    def get_ib_configs(self) -> IBConfigResponse:
+        """Get all IB Gateway connection configurations."""
+        data = self._get("/ib-config")
+        return IBConfigResponse(**data)
+
+    def get_ib_config(self, config_id: int) -> IBConfigRecord:
+        """Get specific IB Gateway configuration."""
+        data = self._get(f"/ib-config/{config_id}")
+        return IBConfigRecord(**data)
+
+    def create_ib_config(self, config: IBConfigRecord) -> IBConfigRecord:
+        """Create new IB Gateway configuration."""
+        data = self._post("/ib-config", json=config.model_dump())
+        return IBConfigRecord(**data)
+
+    def update_ib_config(self, config_id: int, config: IBConfigRecord) -> IBConfigRecord:
+        """Update IB Gateway configuration."""
+        data = self._put(f"/ib-config/{config_id}", json=config.model_dump())
+        return IBConfigRecord(**data)
+
+    def delete_ib_config(self, config_id: int) -> dict:
+        """Delete IB Gateway configuration."""
+        return self._delete(f"/ib-config/{config_id}")

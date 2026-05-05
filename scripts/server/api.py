@@ -20,7 +20,7 @@ for _p in [_PROJECT_ROOT, _SCRIPTS_DIR]:
         sys.path.insert(0, _p)
 
 from scripts.shared.models import (
-    ForecastLog, TickerSetting, ProviderSetting,
+    ForecastLog, TickerSetting, ProviderSetting, IBConfigRecord, IBConfigResponse,
     LogsResponse, TickersResponse, ProvidersResponse,
     TickerUpdate, TickerCreate, ProviderUpdate,
     RunResponse, HealthResponse,
@@ -649,14 +649,15 @@ async def sync_accounts(
     host: str = Query("127.0.0.1"),
     port: int = Query(7497),
     client_id: int = Query(1, ge=0, le=999),
+    type: str = Query("paper"),
 ):
     try:
         from scripts.core.ib_gateway_client import sync_accounts_with_ib_async
         em = _get_db_manager()
-        ok = await sync_accounts_with_ib_async(em, host=host, port=port, client_id=client_id)
+        ok = await sync_accounts_with_ib_async(em, host=host, port=port, client_id=client_id, type=type)
         if not ok:
             raise HTTPException(status_code=502, detail="IB Gateway returned no accounts. Ensure TWS/Gateway is running and API is enabled on port " + str(port))
-        return {"synced": True, "client_id": client_id}
+        return {"synced": True, "client_id": client_id, "type": type}
     except HTTPException:
         raise
     except Exception as e:
@@ -690,14 +691,15 @@ async def sync_portfolio(
     host: str = Query("127.0.0.1"),
     port: int = Query(7497),
     client_id: int = Query(1, ge=0, le=999),
+    type: str = Query("paper"),
 ):
     try:
         from scripts.core.ib_gateway_client import sync_portfolio_with_ib_async
         em = _get_db_manager()
-        ok = await sync_portfolio_with_ib_async(em, host=host, port=port, client_id=client_id)
+        ok = await sync_portfolio_with_ib_async(em, host=host, port=port, client_id=client_id, type=type)
         if not ok:
             raise HTTPException(status_code=502, detail="IB Gateway returned no positions. Ensure TWS/Gateway is running and API is enabled on port " + str(port))
-        return {"synced": True, "client_id": client_id}
+        return {"synced": True, "client_id": client_id, "type": type}
     except HTTPException:
         raise
     except Exception as e:
@@ -715,3 +717,101 @@ async def test_ib_connection_endpoint(
     from scripts.core.ib_gateway_client import test_ib_connection_async
     result = await test_ib_connection_async(host=host, port=port, client_id=client_id)
     return result
+
+
+# ---------------------------------------------------------------------------
+# IB Config endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/ib-config", response_model=IBConfigResponse, dependencies=[Depends(verify_api_key)])
+async def get_ib_configs():
+    """Get all IB Gateway connection configurations."""
+    try:
+        em = _get_db_manager()
+        df = em.read_sheet('IBConfig')
+        if df.empty:
+            return IBConfigResponse(items=[], total=0)
+        df = df.where(df.notna(), None)
+        items = [IBConfigRecord(**_safe_row(r)) for r in df.to_dict('records')]
+        return IBConfigResponse(items=items, total=len(items))
+    except Exception as e:
+        logger.exception("Error reading IB configs")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ib-config/{config_id}", response_model=IBConfigRecord, dependencies=[Depends(verify_api_key)])
+async def get_ib_config(config_id: int):
+    """Get specific IB Gateway configuration by ID."""
+    try:
+        em = _get_db_manager()
+        with em._connect() as con:
+            cur = con.execute("SELECT * FROM ib_config WHERE id = ?", (config_id,))
+            row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="IB config not found")
+        return IBConfigRecord(**_safe_row(dict(row)))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error reading IB config")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ib-config", response_model=IBConfigRecord, dependencies=[Depends(verify_api_key)])
+async def create_ib_config(body: IBConfigRecord):
+    """Create new IB Gateway configuration."""
+    try:
+        em = _get_db_manager()
+        row = {
+            "name": body.name,
+            "host": body.host,
+            "port": body.port,
+            "client_id": body.client_id,
+            "type": body.type,
+            "active": body.active,
+        }
+        em.upsert_row("ib_config", row)
+        return body
+    except Exception as e:
+        logger.exception("Error creating IB config")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/ib-config/{config_id}", response_model=IBConfigRecord, dependencies=[Depends(verify_api_key)])
+async def update_ib_config(config_id: int, body: IBConfigRecord):
+    """Update IB Gateway configuration."""
+    try:
+        em = _get_db_manager()
+        with em._connect() as con:
+            cur = con.execute("SELECT * FROM ib_config WHERE id = ?", (config_id,))
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="IB config not found")
+        row = {
+            "id": config_id,
+            "name": body.name,
+            "host": body.host,
+            "port": body.port,
+            "client_id": body.client_id,
+            "type": body.type,
+            "active": body.active,
+        }
+        em.upsert_row("ib_config", row)
+        return body
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error updating IB config")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/ib-config/{config_id}", dependencies=[Depends(verify_api_key)])
+async def delete_ib_config(config_id: int):
+    """Delete IB Gateway configuration."""
+    try:
+        em = _get_db_manager()
+        with em._connect() as con:
+            con.execute("DELETE FROM ib_config WHERE id = ?", (config_id,))
+        return {"deleted": config_id}
+    except Exception as e:
+        logger.exception("Error deleting IB config")
+        raise HTTPException(status_code=500, detail=str(e))

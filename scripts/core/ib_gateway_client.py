@@ -149,7 +149,7 @@ def fetch_ib_positions(host: str = "127.0.0.1", port: int = 7497, client_id: int
     return positions
 
 
-def sync_accounts_with_ib(excel_manager, host: str = "127.0.0.1", port: int = 7497, client_id: int = 1) -> bool:
+def sync_accounts_with_ib(excel_manager, host: str = "127.0.0.1", port: int = 7497, client_id: int = 1, type: str = "paper") -> bool:
     """Fetch account balances from IB and store them in SQLite accounts table."""
     try:
         accounts = fetch_ib_accounts(host, port, client_id)
@@ -159,6 +159,7 @@ def sync_accounts_with_ib(excel_manager, host: str = "127.0.0.1", port: int = 74
 
         excel_manager.clear_sheet('Accounts')
         for acc in accounts:
+            acc['type'] = type  # 'paper' or 'live'
             excel_manager.upsert_row('Accounts', acc)
 
         logger.info(f"Synced {len(accounts)} accounts to accounts table")
@@ -168,10 +169,10 @@ def sync_accounts_with_ib(excel_manager, host: str = "127.0.0.1", port: int = 74
         return False
 
 
-def sync_portfolio_with_ib(excel_manager, host: str = "127.0.0.1", port: int = 7497, client_id: int = 1) -> bool:
+def sync_portfolio_with_ib(excel_manager, host: str = "127.0.0.1", port: int = 7497, client_id: int = 1, type: str = "paper") -> bool:
     """Fetch positions AND accounts from IB and store them in SQLite."""
     try:
-        ok1 = sync_accounts_with_ib(excel_manager, host, port, client_id)
+        ok1 = sync_accounts_with_ib(excel_manager, host, port, client_id, type)
         if not ok1:
             logger.warning("Account sync returned no data, continuing with positions")
 
@@ -181,6 +182,7 @@ def sync_portfolio_with_ib(excel_manager, host: str = "127.0.0.1", port: int = 7
             return False
 
         for pos in positions:
+            pos['type'] = type  # 'paper' or 'live'
             excel_manager.upsert_row('Portfolio', pos)
 
         logger.info(f"Synced {len(positions)} positions to portfolio table")
@@ -231,21 +233,21 @@ _sync_portfolio_wrapped = _run_in_thread(sync_portfolio_with_ib)
 # Async wrappers for use in FastAPI (avoids event loop conflicts)
 # ---------------------------------------------------------------------------
 
-async def sync_accounts_with_ib_async(excel_manager, host: str = "127.0.0.1", port: int = 7497, client_id: int = 1) -> bool:
+async def sync_accounts_with_ib_async(excel_manager, host: str = "127.0.0.1", port: int = 7497, client_id: int = 1, type: str = "paper") -> bool:
     """Async version that runs sync_accounts_with_ib in a thread to avoid event loop conflicts."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         None, 
-        functools.partial(_sync_accounts_wrapped, excel_manager, host, port, client_id)
+        functools.partial(_sync_accounts_wrapped, excel_manager, host, port, client_id, type)
     )
 
 
-async def sync_portfolio_with_ib_async(excel_manager, host: str = "127.0.0.1", port: int = 7497, client_id: int = 1) -> bool:
+async def sync_portfolio_with_ib_async(excel_manager, host: str = "127.0.0.1", port: int = 7497, client_id: int = 1, type: str = "paper") -> bool:
     """Async version that runs sync_portfolio_with_ib in a thread to avoid event loop conflicts."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         None, 
-        functools.partial(_sync_portfolio_wrapped, excel_manager, host, port, client_id)
+        functools.partial(_sync_portfolio_wrapped, excel_manager, host, port, client_id, type)
     )
 
 

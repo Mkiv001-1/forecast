@@ -246,6 +246,7 @@ class AccountRecord(BaseModel):
     cash: Optional[Any] = None
     maintenance_margin: Optional[Any] = None
     last_update: Optional[str] = None
+    type: Optional[str] = None  # 'paper' or 'live'
 
 
 class AccountsResponse(BaseModel):
@@ -271,10 +272,29 @@ class PositionRecord(BaseModel):
     sector: Optional[str] = None
     last_update: Optional[str] = None
     con_id: Optional[int] = None
+    type: Optional[str] = None  # 'paper' or 'live'
 
 
 class PortfolioResponse(BaseModel):
     items: List[PositionRecord]
+    total: int
+
+
+class IBConfigRecord(BaseModel):
+    """IB Gateway connection settings."""
+    id: Optional[int] = None
+    name: str = "default"
+    host: str = "127.0.0.1"
+    port: int = 7497
+    client_id: int = 1
+    type: str = "paper"  # 'paper' or 'live'
+    active: int = 1
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class IBConfigResponse(BaseModel):
+    items: List[IBConfigRecord]
     total: int
 
 

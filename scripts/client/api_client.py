@@ -23,6 +23,8 @@ from scripts.shared.models import (
     PriceRecord, PriceDataResponse,
     IndicatorRecord, IndicatorsResponse,
     ConsensusRecord, ConsensusResponse,
+    PositionRecord, PortfolioResponse,
+    AccountRecord, AccountsResponse,
     SystemLogResponse,
 )
 
@@ -44,9 +46,9 @@ class ForecastApiClient:
         resp.raise_for_status()
         return resp.json()
 
-    def _post(self, path: str, json: dict = None):
+    def _post(self, path: str, json: dict = None, params: dict = None):
         url = f"{self.server_url}{path}"
-        resp = self._session.post(url, json=json, timeout=self.timeout)
+        resp = self._session.post(url, json=json, params=params, timeout=self.timeout)
         resp.raise_for_status()
         return resp.json()
 
@@ -238,3 +240,27 @@ class ForecastApiClient:
 
     def reset_prompt_template(self, method: str) -> dict:
         return self._post(f"/prompt-templates/{method}/reset", {})
+
+    def get_accounts(self, broker: Optional[str] = None) -> AccountsResponse:
+        params = {}
+        if broker:
+            params["broker"] = broker
+        data = self._get("/accounts", params=params)
+        return AccountsResponse(**data)
+
+    def sync_accounts(self, host: str = "127.0.0.1", port: int = 7497, client_id: int = 1) -> dict:
+        return self._post("/accounts/sync", json={}, params={"host": host, "port": port, "client_id": client_id})
+
+    def get_portfolio(self, account: Optional[str] = None) -> PortfolioResponse:
+        params = {}
+        if account:
+            params["account"] = account
+        data = self._get("/portfolio", params=params)
+        return PortfolioResponse(**data)
+
+    def sync_portfolio(self, host: str = "127.0.0.1", port: int = 7497, client_id: int = 1) -> dict:
+        return self._post("/portfolio/sync", json={}, params={"host": host, "port": port, "client_id": client_id})
+
+    def test_ib_connection(self, host: str = "127.0.0.1", port: int = 7497, client_id: int = 1) -> dict:
+        """Test IB Gateway connection and return detailed logs."""
+        return self._get("/ib/test-connection", params={"host": host, "port": port, "client_id": client_id})

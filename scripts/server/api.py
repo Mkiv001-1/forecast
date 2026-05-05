@@ -29,6 +29,8 @@ from scripts.shared.models import (
     PriceRecord, PriceDataResponse,
     IndicatorRecord, IndicatorsResponse,
     ConsensusRecord, ConsensusResponse,
+    PositionRecord, PortfolioResponse,
+    AccountRecord, AccountsResponse,
     SystemLogResponse,
 )
 from scripts.server.config import ServerConfig
@@ -619,3 +621,97 @@ async def refresh_model_catalog():
     except Exception as e:
         logger.exception("Error refreshing model catalog")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Accounts endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/accounts", response_model=AccountsResponse, dependencies=[Depends(verify_api_key)])
+async def get_accounts(broker: str = Query(None)):
+    try:
+        em = _get_db_manager()
+        df = em.read_sheet('Accounts')
+        if df.empty:
+            return AccountsResponse(items=[], total=0)
+        if broker:
+            df = df[df.get('broker', '') == broker]
+        df = df.where(df.notna(), None)
+        items = [AccountRecord(**row) for row in df.to_dict('records')]
+        return AccountsResponse(items=items, total=len(items))
+    except Exception as e:
+        logger.exception("Error reading accounts")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/accounts/sync", dependencies=[Depends(verify_api_key)])
+async def sync_accounts(
+    host: str = Query("127.0.0.1"),
+    port: int = Query(7497),
+    client_id: int = Query(1, ge=0, le=999),
+):
+    try:
+        from scripts.core.ib_gateway_client import sync_accounts_with_ib_async
+        em = _get_db_manager()
+        ok = await sync_accounts_with_ib_async(em, host=host, port=port, client_id=client_id)
+        if not ok:
+            raise HTTPException(status_code=502, detail="IB Gateway returned no accounts. Ensure TWS/Gateway is running and API is enabled on port " + str(port))
+        return {"synced": True, "client_id": client_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error syncing accounts")
+        raise HTTPException(status_code=502, detail=f"Cannot connect to IB Gateway at {host}:{port} — {e}")
+
+
+# ---------------------------------------------------------------------------
+# Portfolio endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/portfolio", response_model=PortfolioResponse, dependencies=[Depends(verify_api_key)])
+async def get_portfolio(account: str = Query(None)):
+    try:
+        em = _get_db_manager()
+        df = em.read_sheet('Portfolio')
+        if df.empty:
+            return PortfolioResponse(items=[], total=0)
+        if account:
+            df = df[df.get('account', '') == account]
+        df = df.where(df.notna(), None)
+        items = [PositionRecord(**row) for row in df.to_dict('records')]
+        return PortfolioResponse(items=items, total=len(items))
+    except Exception as e:
+        logger.exception("Error reading portfolio")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/portfolio/sync", dependencies=[Depends(verify_api_key)])
+async def sync_portfolio(
+    host: str = Query("127.0.0.1"),
+    port: int = Query(7497),
+    client_id: int = Query(1, ge=0, le=999),
+):
+    try:
+        from scripts.core.ib_gateway_client import sync_portfolio_with_ib_async
+        em = _get_db_manager()
+        ok = await sync_portfolio_with_ib_async(em, host=host, port=port, client_id=client_id)
+        if not ok:
+            raise HTTPException(status_code=502, detail="IB Gateway returned no positions. Ensure TWS/Gateway is running and API is enabled on port " + str(port))
+        return {"synced": True, "client_id": client_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error syncing portfolio")
+        raise HTTPException(status_code=502, detail=f"Cannot connect to IB Gateway at {host}:{port} — {e}")
+
+
+@app.get("/ib/test-connection", dependencies=[Depends(verify_api_key)])
+async def test_ib_connection_endpoint(
+    host: str = Query("127.0.0.1"),
+    port: int = Query(7497),
+    client_id: int = Query(1, ge=0, le=999),
+):
+    """Test IB Gateway connection and return detailed logs."""
+    from scripts.core.ib_gateway_client import test_ib_connection_async
+    result = await test_ib_connection_async(host=host, port=port, client_id=client_id)
+    return result

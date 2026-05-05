@@ -89,6 +89,44 @@ CREATE TABLE IF NOT EXISTS price_data (
 );
 CREATE INDEX IF NOT EXISTS idx_price_ticker ON price_data(ticker);
 
+CREATE TABLE IF NOT EXISTS accounts (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    broker              TEXT NOT NULL DEFAULT 'ibkr',
+    account_id          TEXT NOT NULL,
+    name                TEXT DEFAULT '',
+    account_type        TEXT DEFAULT '',
+    base_currency       TEXT DEFAULT 'USD',
+    buying_power        REAL DEFAULT 0,
+    net_liquidation     REAL DEFAULT 0,
+    available_funds     REAL DEFAULT 0,
+    cash                REAL DEFAULT 0,
+    maintenance_margin  REAL DEFAULT 0,
+    last_update         TEXT DEFAULT '',
+    UNIQUE(broker, account_id)
+);
+CREATE INDEX IF NOT EXISTS idx_accounts_broker ON accounts(broker);
+
+CREATE TABLE IF NOT EXISTS portfolio (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker        TEXT NOT NULL,
+    account       TEXT DEFAULT '',
+    broker        TEXT DEFAULT 'ibkr',
+    quantity      REAL DEFAULT 0,
+    avg_cost      REAL DEFAULT 0,
+    market_price  REAL DEFAULT 0,
+    market_value  REAL DEFAULT 0,
+    unrealized_pnl REAL DEFAULT 0,
+    realized_pnl  REAL DEFAULT 0,
+    currency      TEXT DEFAULT 'USD',
+    asset_type    TEXT DEFAULT 'STK',
+    sector        TEXT DEFAULT '',
+    last_update   TEXT DEFAULT '',
+    con_id        INTEGER DEFAULT 0,
+    UNIQUE(ticker, account, broker)
+);
+CREATE INDEX IF NOT EXISTS idx_portfolio_ticker ON portfolio(ticker);
+CREATE INDEX IF NOT EXISTS idx_portfolio_account ON portfolio(account);
+
 CREATE TABLE IF NOT EXISTS indicators (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker       TEXT NOT NULL,
@@ -306,6 +344,8 @@ _SHEET_TO_TABLE = {
     "Indicators": "indicators",
     "Prompts":    "prompts",
     "Consensus":  "consensus",
+    "Portfolio":  "portfolio",
+    "Accounts":   "accounts",
     # legacy
     "Log":        "logs",
     "Forecasts":  "logs",
@@ -340,6 +380,7 @@ class SQLiteManager:
                 logger.info(f"Created new database: {self.db_file}")
             else:
                 logger.info(f"Using existing database: {self.db_file}")
+                self._migrate_schema(con)
         finally:
             con.close()
 
@@ -365,6 +406,20 @@ class SQLiteManager:
             "INSERT OR IGNORE INTO prompt_templates(method, prompt_text, updated_at) VALUES (?,?,?)",
             [(r[0], r[1], ts) for r in _DEFAULT_PROMPT_TEMPLATES],
         )
+
+    def _migrate_schema(self, con: sqlite3.Connection):
+        """Idempotently add columns that may be missing from older DB instances."""
+        _MISSING_COLS = [
+            ("logs", "actual_open",       "REAL"),
+            ("logs", "exit_successful",   "INTEGER"),
+        ]
+        cur = con.execute("PRAGMA table_info(logs)")
+        existing = {row[1] for row in cur.fetchall()}
+        for table, col, col_type in _MISSING_COLS:
+            if col not in existing:
+                con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+                con.commit()
+                logger.info(f"Schema migration: added column {table}.{col}")
 
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.db_file, timeout=30)

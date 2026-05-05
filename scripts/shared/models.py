@@ -232,6 +232,52 @@ class ConsensusResponse(BaseModel):
     total: int
 
 
+class AccountRecord(BaseModel):
+    """One row from the accounts table."""
+    id: Optional[int] = None
+    broker: Optional[str] = None
+    account_id: Optional[str] = None
+    name: Optional[str] = None
+    account_type: Optional[str] = None
+    base_currency: Optional[str] = None
+    buying_power: Optional[Any] = None
+    net_liquidation: Optional[Any] = None
+    available_funds: Optional[Any] = None
+    cash: Optional[Any] = None
+    maintenance_margin: Optional[Any] = None
+    last_update: Optional[str] = None
+
+
+class AccountsResponse(BaseModel):
+    items: List[AccountRecord]
+    total: int
+
+
+class PositionRecord(BaseModel):
+    """One row from the portfolio table."""
+    id: Optional[int] = None
+    ticker: Optional[str] = None
+    account: Optional[str] = None
+    account_id: Optional[int] = None
+    broker: Optional[str] = None
+    quantity: Optional[Any] = None
+    avg_cost: Optional[Any] = None
+    market_price: Optional[Any] = None
+    market_value: Optional[Any] = None
+    unrealized_pnl: Optional[Any] = None
+    realized_pnl: Optional[Any] = None
+    currency: Optional[str] = None
+    asset_type: Optional[str] = None
+    sector: Optional[str] = None
+    last_update: Optional[str] = None
+    con_id: Optional[int] = None
+
+
+class PortfolioResponse(BaseModel):
+    items: List[PositionRecord]
+    total: int
+
+
 class SystemLogResponse(BaseModel):
     lines: List[str]
     total: int

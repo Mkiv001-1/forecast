@@ -20,7 +20,7 @@ _SCRIPTS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
-from scripts.shared.models import ForecastLog, TickerSetting, ProviderSetting
+from scripts.shared.models import ForecastLog, TickerSetting, ProviderSetting, PositionRecord, AccountRecord
 from scripts.client.api_client import ForecastApiClient
 from scripts.client.config import ClientConfig
 
@@ -1554,6 +1554,225 @@ class IndicatorsTab(QWidget):
             QMessageBox.critical(self, "Error", f"Failed to load indicators:\n{e}")
 
 
+class AccountsTab(QWidget):
+    def __init__(self, api: ForecastApiClient, parent=None):
+        super().__init__(parent)
+        self.api = api
+        self._accounts: List[AccountRecord] = []
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(6)
+
+        toolbar = QHBoxLayout()
+        self.sync_btn = QPushButton("Sync with IB Gateway")
+        self.sync_btn.setToolTip("Fetch account balances from IB Gateway")
+        self.sync_btn.clicked.connect(self._on_sync)
+        toolbar.addWidget(self.sync_btn)
+
+        self.host_edit = QLineEdit("127.0.0.1")
+        self.host_edit.setMaximumWidth(120)
+        toolbar.addWidget(QLabel("Host:"))
+        toolbar.addWidget(self.host_edit)
+
+        self.port_edit = QLineEdit("7497")
+        self.port_edit.setMaximumWidth(60)
+        toolbar.addWidget(QLabel("Port:"))
+        toolbar.addWidget(self.port_edit)
+
+        toolbar.addStretch()
+        layout.addLayout(toolbar)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(9)
+        self.table.setHorizontalHeaderLabels([
+            "Broker", "Account ID", "Name", "Type", "Base CCY",
+            "Net Liq", "Buying Power", "Available Funds", "Cash"
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSortingEnabled(True)
+        layout.addWidget(self.table, 1)
+
+        self.summary_label = QLabel("Accounts: 0 | Total Net Liq: $0.00 | Total Buying Power: $0.00")
+        layout.addWidget(self.summary_label)
+
+        self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.clicked.connect(self.load)
+        toolbar.addWidget(self.refresh_btn)
+
+    def _on_sync(self):
+        host = self.host_edit.text().strip()
+        try:
+            port = int(self.port_edit.text().strip())
+        except ValueError:
+            port = 7497
+        self.sync_btn.setEnabled(False)
+        self.sync_btn.setText("Syncing…")
+        try:
+            self.api.sync_accounts(host=host, port=port)
+            self.load()
+            QMessageBox.information(self, "Sync Complete", "Accounts synced from IB Gateway.")
+        except Exception as e:
+            QMessageBox.critical(self, "Sync Failed", str(e))
+        finally:
+            self.sync_btn.setEnabled(True)
+            self.sync_btn.setText("Sync with IB Gateway")
+
+    def load(self):
+        try:
+            resp = self.api.get_accounts()
+            self._accounts = resp.items
+            self._populate_table()
+            self._update_summary()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load accounts:\n{e}")
+
+    def _populate_table(self):
+        self.table.setRowCount(len(self._accounts))
+        for r, acc in enumerate(self._accounts):
+            vals = [
+                acc.broker or "",
+                acc.account_id or "",
+                acc.name or "",
+                acc.account_type or "",
+                acc.base_currency or "USD",
+                f"${acc.net_liquidation:,.2f}" if acc.net_liquidation else "$0.00",
+                f"${acc.buying_power:,.2f}" if acc.buying_power else "$0.00",
+                f"${acc.available_funds:,.2f}" if acc.available_funds else "$0.00",
+                f"${acc.cash:,.2f}" if acc.cash else "$0.00",
+            ]
+            for c, v in enumerate(vals):
+                item = QTableWidgetItem(v)
+                self.table.setItem(r, c, item)
+        self.table.resizeColumnsToContents()
+
+    def _update_summary(self):
+        total_nliq = sum(a.net_liquidation or 0 for a in self._accounts)
+        total_bp = sum(a.buying_power or 0 for a in self._accounts)
+        self.summary_label.setText(
+            f"Accounts: {len(self._accounts)} | "
+            f"Total Net Liq: ${total_nliq:,.2f} | "
+            f"Total Buying Power: ${total_bp:,.2f}"
+        )
+
+
+class PortfolioTab(QWidget):
+    def __init__(self, api: ForecastApiClient, parent=None):
+        super().__init__(parent)
+        self.api = api
+        self._positions: List[PositionRecord] = []
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(6)
+
+        # Toolbar
+        toolbar = QHBoxLayout()
+        self.sync_btn = QPushButton("Sync with IB Gateway")
+        self.sync_btn.setToolTip("Connect to IB Gateway and fetch current positions")
+        self.sync_btn.clicked.connect(self._on_sync)
+        toolbar.addWidget(self.sync_btn)
+
+        self.host_edit = QLineEdit("127.0.0.1")
+        self.host_edit.setMaximumWidth(120)
+        toolbar.addWidget(QLabel("Host:"))
+        toolbar.addWidget(self.host_edit)
+
+        self.port_edit = QLineEdit("7497")
+        self.port_edit.setMaximumWidth(60)
+        toolbar.addWidget(QLabel("Port:"))
+        toolbar.addWidget(self.port_edit)
+
+        toolbar.addStretch()
+        layout.addLayout(toolbar)
+
+        # Table
+        self.table = QTableWidget()
+        self.table.setColumnCount(10)
+        self.table.setHorizontalHeaderLabels([
+            "Ticker", "Account", "Qty", "Avg Cost", "Mkt Price",
+            "Mkt Value", "Unreal PnL", "Real PnL", "Currency", "Updated"
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSortingEnabled(True)
+        layout.addWidget(self.table, 1)
+
+        # Summary
+        self.summary_label = QLabel("Positions: 0 | Total Value: $0.00 | Unrealized PnL: $0.00")
+        layout.addWidget(self.summary_label)
+
+        # Refresh btn
+        self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.clicked.connect(self.load)
+        toolbar.addWidget(self.refresh_btn)
+
+    def _on_sync(self):
+        host = self.host_edit.text().strip()
+        try:
+            port = int(self.port_edit.text().strip())
+        except ValueError:
+            port = 7497
+        self.sync_btn.setEnabled(False)
+        self.sync_btn.setText("Syncing…")
+        try:
+            self.api.sync_portfolio(host=host, port=port)
+            self.load()
+            QMessageBox.information(self, "Sync Complete", "Portfolio synced from IB Gateway.")
+        except Exception as e:
+            QMessageBox.critical(self, "Sync Failed", str(e))
+        finally:
+            self.sync_btn.setEnabled(True)
+            self.sync_btn.setText("Sync with IB Gateway")
+
+    def load(self):
+        try:
+            resp = self.api.get_portfolio()
+            self._positions = resp.items
+            self._populate_table()
+            self._update_summary()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load portfolio:\n{e}")
+
+    def _populate_table(self):
+        self.table.setRowCount(len(self._positions))
+        for r, pos in enumerate(self._positions):
+            vals = [
+                pos.ticker or "",
+                pos.account or "",
+                f"{pos.quantity:,.0f}" if pos.quantity else "0",
+                f"${pos.avg_cost:,.2f}" if pos.avg_cost else "$0.00",
+                f"${pos.market_price:,.2f}" if pos.market_price else "$0.00",
+                f"${pos.market_value:,.2f}" if pos.market_value else "$0.00",
+                f"${pos.unrealized_pnl:,.2f}" if pos.unrealized_pnl else "$0.00",
+                f"${pos.realized_pnl:,.2f}" if pos.realized_pnl else "$0.00",
+                pos.currency or "USD",
+                pos.last_update or "",
+            ]
+            for c, v in enumerate(vals):
+                item = QTableWidgetItem(v)
+                if c == 6 and pos.unrealized_pnl and pos.unrealized_pnl > 0:
+                    item.setForeground(QBrush(QColor("#2e7d32")))
+                elif c == 6 and pos.unrealized_pnl and pos.unrealized_pnl < 0:
+                    item.setForeground(QBrush(QColor("#c62828")))
+                self.table.setItem(r, c, item)
+        self.table.resizeColumnsToContents()
+
+    def _update_summary(self):
+        total_val = sum(p.market_value or 0 for p in self._positions)
+        total_unreal = sum(p.unrealized_pnl or 0 for p in self._positions)
+        self.summary_label.setText(
+            f"Positions: {len(self._positions)} | "
+            f"Total Value: ${total_val:,.2f} | "
+            f"Unrealized PnL: ${total_unreal:,.2f}"
+        )
+
+
 class _TabLoader:
     """Chains tab loads via QTimer.singleShot(0) so the event loop
     stays responsive between each step (all runs in the main thread)."""
@@ -1569,6 +1788,8 @@ class _TabLoader:
             ("Prompts",     lambda: w.prompts_tab.load()),
             ("Price Data",  lambda: w.price_tab.load()),
             ("Indicators",  lambda: w.indicators_tab.load()),
+            ("Accounts",    lambda: w.accounts_tab.load()),
+            ("Portfolio",   lambda: w.portfolio_tab.load()),
             ("System Log",  lambda: w.syslog_tab.load()),
             ("Done",        lambda: self._finish()),
         ]
@@ -1648,6 +1869,12 @@ class MainWindow(QMainWindow):
 
         self.indicators_tab = IndicatorsTab(self.api)
         self.tabs.addTab(self.indicators_tab, "📈 Indicators")
+
+        self.accounts_tab = AccountsTab(self.api)
+        self.tabs.addTab(self.accounts_tab, "🏦 Accounts")
+
+        self.portfolio_tab = PortfolioTab(self.api)
+        self.tabs.addTab(self.portfolio_tab, "💼 Portfolio")
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)

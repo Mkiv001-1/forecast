@@ -261,6 +261,7 @@ Yahoo Finance / Alpha Vantage / Finnhub
 |------|-------|--------|
 | 2026-05-06 | **Google Sheets (`gspread`) удалён** — legacy-зависимость с устаревшей oauth2client; код (`save_price_data_to_sheet`) и документация очищены | ✅ Выполнено |
 | 2026-05-07 | **`main_excel.py` удалён** — заменён на `forecast_runner.py`; ARCHITECTURE.md и README.md синхронизированы | ✅ Выполнено |
+| 2026-05-07 | **Файлы структурированы** — тесты в `scripts/tests/`, документация в `docs/`, корень очищен | ✅ Выполнено |
 
 1. **PAUSED статус для ордеров.** Не реализована логика: (a) перевод QUEUED в PAUSED при потере связи с IB, (b) автоматический resubmit в QUEUED при восстановлении, (c) проверка актуальности цен перед resubmit после длительной паузы. Текущее поведение: QUEUED-ордера expire по `ORDER_QUEUE_MAX_AGE_HOURS` (задача `expire_queued_orders` в scheduler.py), ручной resubmit через API `/orders/submit`.
 

@@ -608,6 +608,27 @@ python scripts/core/forecast_runner.py --clear
 | `SCHEDULER_MAX_RETRIES` | 2 | Макс. повторов при ошибке задачи |
 | `FORECAST_TTL_MINUTES` | 240 | TTL сигнала (минуты) |
 
+## Тесты
+
+Все тесты находятся в `scripts/tests/`:
+
+```bash
+# Unit tests (consensus, orders, circuit breaker)
+python -m pytest scripts/tests/test_core_logic.py -v
+
+# Integration tests
+python -m pytest scripts/tests/test_integration.py -v
+python -m pytest scripts/tests/test_integration_api.py -v
+python -m pytest scripts/tests/test_integration_ib_mock.py -v
+python -m pytest scripts/tests/test_integration_portfolio_risk.py -v
+
+# Mock consensus → orders → GUI
+python -m pytest scripts/tests/test_mock_consensus_orders_gui.py -v
+
+# Real IB Gateway (требуется запущенный IB Gateway, paper account)
+python -m pytest scripts/tests/test_ib_real_connection.py -v -m integration
+```
+
 ## Логирование
 
 Логи пишутся в `trading_robot.log` и выводятся в консоль.

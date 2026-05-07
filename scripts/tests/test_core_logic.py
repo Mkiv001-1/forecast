@@ -1,7 +1,7 @@
 """
 Unit tests for critical trading robot logic (ред. 2).
 
-Run with:  python -m pytest test_core_logic.py -v
+Run with:  python -m pytest scripts/tests/test_core_logic.py -v
 """
 
 import sys
@@ -10,9 +10,9 @@ import sqlite3
 import tempfile
 import pytest
 
-# Ensure core modules are importable
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts", "core"))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
+# Ensure core modules are importable (tests run from scripts/tests/)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "core"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 # ===========================================================================

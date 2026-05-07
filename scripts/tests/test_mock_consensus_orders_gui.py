@@ -8,7 +8,7 @@ This test demonstrates the complete flow:
 4. Simulate IB Gateway interactions (fill callbacks, cancellations)
 5. Verify order status updates in the GUI
 
-Run with:  python -m pytest test_mock_consensus_orders_gui.py -v -s
+Run with:  python -m pytest scripts/tests/test_mock_consensus_orders_gui.py -v -s
 """
 
 import sys
@@ -21,8 +21,8 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch, Mock
 from typing import Dict, Any, List, Optional
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts", "core"))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "core"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 # ============================================================================
 # MOCK IB GATEWAY

@@ -305,11 +305,16 @@ Error: "Could not connect to IB Gateway"
 
 ```
 d:\Git\forecast\
-├── test_mock_consensus_orders_gui.py     ← 8 fast mock tests
-├── test_ib_real_connection.py             ← 6 real IB tests
-├── TEST_MOCK_CONSENSUS_README.md          ← Mock test docs
-├── TEST_IB_REAL_CONNECTION_README.md      ← Real test docs
-├── INTEGRATION_TEST_SUITE.md              ← This file
+├── scripts/tests/
+│   ├── test_mock_consensus_orders_gui.py  ← 8 fast mock tests
+│   ├── test_ib_real_connection.py         ← 6 real IB tests
+│   └── ...
+│
+├── docs/tests/
+│   ├── TEST_MOCK_CONSENSUS_README.md     ← Mock test docs
+│   ├── TEST_IB_REAL_CONNECTION_README.md ← Real test docs
+│   └── INTEGRATION_TEST_SUITE.md         ← This file
+│
 ├── scripts/
 │   ├── core/
 │   │   ├── consensus.py                   ← Consensus logic

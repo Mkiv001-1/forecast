@@ -7,9 +7,10 @@ Write-Host "  FORECAST TRADING BOT - TEST SUITE QUICK REFERENCE" -ForegroundColo
 Write-Host "════════════════════════════════════════════════════════════" -ForegroundColor Cyan
 Write-Host ""
 
-# Test suite locations
-$mockTests = "test_mock_consensus_orders_gui.py"
-$realTests = "test_ib_real_connection.py"
+# Test suite locations (run from project root)
+$testDir = "scripts/tests"
+$mockTests = "$testDir/test_mock_consensus_orders_gui.py"
+$realTests = "$testDir/test_ib_real_connection.py"
 
 Write-Host "📍 TEST FILES:" -ForegroundColor Yellow
 Write-Host "   Mock Tests (8 tests, 2.3s):   $mockTests"

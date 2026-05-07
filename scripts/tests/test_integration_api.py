@@ -1,7 +1,7 @@
 """
 Integration tests for API config endpoints.
 
-Run with: python -m pytest test_integration_api.py -v
+Run with: python -m pytest scripts/tests/test_integration_api.py -v
 """
 
 import os

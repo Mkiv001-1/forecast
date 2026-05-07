@@ -15,8 +15,8 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-# Make core modules importable without a full package install
-_CORE = os.path.join(os.path.dirname(__file__), "scripts", "core")
+# Make core modules importable without a full package install (tests run from scripts/tests/)
+_CORE = os.path.join(os.path.dirname(__file__), "..", "core")
 if _CORE not in sys.path:
     sys.path.insert(0, _CORE)
 

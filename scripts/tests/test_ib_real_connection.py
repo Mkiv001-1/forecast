@@ -7,7 +7,7 @@ Prerequisites:
   3. Account is connected in IB Gateway
 
 Run with:
-  python -m pytest test_ib_real_connection.py -v -s -m integration
+  python -m pytest scripts/tests/test_ib_real_connection.py -v -s -m integration
 
 This test:
   1. Checks IB Gateway connectivity
@@ -25,8 +25,8 @@ import os
 import pytest
 import logging
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts", "core"))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "core"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -472,6 +472,6 @@ if __name__ == "__main__":
     print("  3. Account connected to IB Gateway")
     print("  4. ORDER_MODE=paper (for safety)")
     print("\nRun with:")
-    print("  pytest test_ib_real_connection.py -v -s -m integration")
+    print("  pytest scripts/tests/test_ib_real_connection.py -v -s -m integration")
     print("\n⚠️  WARNING: Tests place REAL orders (paper account only)!")
     print("="*80 + "\n")

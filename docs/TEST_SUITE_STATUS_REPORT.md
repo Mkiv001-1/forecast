@@ -315,13 +315,17 @@ Before running real IB Gateway tests:
 
 ```
 d:\Git\forecast\
-├── test_mock_consensus_orders_gui.py       ← 8 mock tests ✅
-├── test_ib_real_connection.py              ← 6 real tests ✅
+├── scripts/tests/
+│   ├── test_mock_consensus_orders_gui.py   ← 8 mock tests ✅
+│   ├── test_ib_real_connection.py          ← 6 real tests ✅
+│   ├── test_core_logic.py                  ← Unit tests
+│   └── ...
 │
-├── TEST_MOCK_CONSENSUS_README.md           ← Mock test docs
-├── TEST_IB_REAL_CONNECTION_README.md       ← Real test docs
-├── INTEGRATION_TEST_SUITE.md               ← Complete guide
-├── TEST_COMMANDS.ps1                       ← Command reference
+├── docs/tests/
+│   ├── TEST_MOCK_CONSENSUS_README.md       ← Mock test docs
+│   ├── TEST_IB_REAL_CONNECTION_README.md   ← Real test docs
+│   ├── INTEGRATION_TEST_SUITE.md           ← Complete guide
+│   └── TEST_COMMANDS.ps1                   ← Command reference
 │
 ├── scripts/
 │   ├── core/

@@ -5,7 +5,7 @@ Integration test with IB Gateway mocking — verifies full flow:
   3. simulated IB callbacks → status updates
   4. DB verification at each step
 
-Run with:  python -m pytest test_integration_ib_mock.py -v
+Run with:  python -m pytest scripts/tests/test_integration_ib_mock.py -v
 """
 
 import sys
@@ -18,8 +18,8 @@ from datetime import datetime
 from unittest.mock import MagicMock, patch
 from typing import Dict, Any, List
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts", "core"))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "core"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 # ---------------------------------------------------------------------------

@@ -263,16 +263,25 @@ notepad TEST_IB_REAL_CONNECTION_README.md
 
 ```
 d:\Git\forecast\
-├── TEST FILES
+├── scripts/tests/                              ← Тесты
 │   ├── test_mock_consensus_orders_gui.py       ← 8 mock tests ✅
 │   ├── test_ib_real_connection.py              ← 6 real tests ✅
+│   ├── test_core_logic.py                      ← Unit tests (consensus, orders, circuit breaker)
+│   ├── test_integration.py                     ← Full pipeline simulation
+│   ├── test_integration_api.py                 ← API config endpoints
+│   ├── test_integration_ib_mock.py             ← IB Gateway mocking
+│   ├── test_integration_portfolio_risk.py      ← Portfolio risk end-to-end
+│   ├── test_api_config_validation.py           ← Config validation
+│   ├── test_capital_provider_failsafe.py       ← Capital provider
+│   ├── test_position_sizer_portfolio_mode.py   ← Position sizer
+│   ├── test_working_db_trading_tab_visibility.py ← Trading tab visibility
+│   └── TEST_COMMANDS.ps1                       ← Command reference
 │
-├── DOCUMENTATION (6 files)
+├── docs/tests/                                 ← Документация тестов
 │   ├── INTEGRATION_TEST_SUITE.md               ← Overview & workflows
 │   ├── TEST_MOCK_CONSENSUS_README.md           ← Mock test guide
 │   ├── TEST_IB_REAL_CONNECTION_README.md       ← Real test guide
 │   ├── TEST_ARCHITECTURE_DIAGRAMS.md           ← Visual diagrams
-│   ├── TEST_COMMANDS.ps1                       ← Command reference
 │   └── TEST_SUITE_STATUS_REPORT.md             ← Status report
 │
 ├── CORE CODE (already existed)
@@ -381,7 +390,7 @@ d:\Git\forecast\
 - **Mock Tests:** [TEST_MOCK_CONSENSUS_README.md](TEST_MOCK_CONSENSUS_README.md)
 - **Real Tests:** [TEST_IB_REAL_CONNECTION_README.md](TEST_IB_REAL_CONNECTION_README.md)
 - **Architecture:** [TEST_ARCHITECTURE_DIAGRAMS.md](TEST_ARCHITECTURE_DIAGRAMS.md)
-- **Commands:** `pwsh TEST_COMMANDS.ps1`
+- **Commands:** `pwsh scripts/tests/TEST_COMMANDS.ps1`
 
 ### Common Issues
 **"IB Gateway not found"**

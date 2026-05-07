@@ -9,7 +9,7 @@ Use scripts/tools/cleanup_test_orders.py for cleanup.
 
 Run:
   set FORECAST_ALLOW_WORKING_DB_TEST=1
-  python -m pytest test_working_db_trading_tab_visibility.py -v -m integration
+  python -m pytest scripts/tests/test_working_db_trading_tab_visibility.py -v -m integration
 """
 
 import asyncio
@@ -21,8 +21,8 @@ from unittest.mock import patch
 
 import pytest
 
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-CORE_DIR = os.path.join(PROJECT_ROOT, "scripts", "core")
+PROJECT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+CORE_DIR = os.path.join(PROJECT_ROOT, "core")
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 if CORE_DIR not in sys.path:

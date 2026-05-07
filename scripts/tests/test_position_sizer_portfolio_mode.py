@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 import pytest
 
-_CORE = os.path.join(os.path.dirname(__file__), "scripts", "core")
+_CORE = os.path.join(os.path.dirname(__file__), "..", "core")
 if _CORE not in sys.path:
     sys.path.insert(0, _CORE)
 

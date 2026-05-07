@@ -6,7 +6,7 @@ Scope: capital_provider → position_sizer → order_manager.submit_signal
 No real IB, AI, or network connections. IB gateway is mocked.
 The `accounts` table is populated to simulate live IB data.
 
-Run:  python -m pytest test_integration_portfolio_risk.py -v
+Run:  python -m pytest scripts/tests/test_integration_portfolio_risk.py -v
 """
 
 import gc
@@ -25,9 +25,9 @@ import pytest
 # ---------------------------------------------------------------------------
 _ROOT = os.path.dirname(__file__)
 for _p in (
-    os.path.join(_ROOT, "scripts", "core"),
-    os.path.join(_ROOT, "scripts"),
-    os.path.join(_ROOT, "scripts", "shared"),
+    os.path.join(_ROOT, "..", "core"),
+    os.path.join(_ROOT, ".."),
+    os.path.join(_ROOT, "..", "shared"),
 ):
     if _p not in sys.path:
         sys.path.insert(0, _p)

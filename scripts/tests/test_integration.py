@@ -2,7 +2,7 @@
 Integration test — full pipeline simulation:
   forecast → consensus → position sizing → order placement → DB verification
 
-Run with:  python -m pytest test_integration.py -v
+Run with:  python -m pytest scripts/tests/test_integration.py -v
 """
 
 import sys
@@ -13,9 +13,9 @@ import pytest
 import gc
 from datetime import datetime
 
-# Ensure core modules are importable
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts", "core"))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "scripts"))
+# Ensure core modules are importable (tests run from scripts/tests/)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "core"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 def _cleanup_db(db_file: str):

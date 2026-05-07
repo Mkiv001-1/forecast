@@ -12,10 +12,10 @@ import sys
 import pytest
 from fastapi import HTTPException
 
-# Make server module importable
-_SERVER = os.path.join(os.path.dirname(__file__), "scripts", "server")
-_CORE   = os.path.join(os.path.dirname(__file__), "scripts", "core")
-_SHARED = os.path.join(os.path.dirname(__file__), "scripts", "shared")
+# Make server module importable (tests run from scripts/tests/)
+_SERVER = os.path.join(os.path.dirname(__file__), "..", "server")
+_CORE   = os.path.join(os.path.dirname(__file__), "..", "core")
+_SHARED = os.path.join(os.path.dirname(__file__), "..", "shared")
 for _p in (_SERVER, _CORE, _SHARED):
     if _p not in sys.path:
         sys.path.insert(0, _p)

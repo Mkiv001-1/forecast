@@ -85,6 +85,71 @@ def fetch_price_data_yfinance(ticker, days=250, max_retries=3):
     
     return []
 
+
+def fetch_intraday_yfinance(ticker: str, days: int = 60, interval: str = "1h", max_retries: int = 3) -> list:
+    """Fetch intraday bars via yfinance.
+
+    Args:
+        ticker:   Exchange-prefixed ticker, e.g. 'NASDAQ:TQQQ'
+        days:     How many calendar days of history to fetch (max 730 for 1h)
+        interval: yfinance interval string, e.g. '1h', '30m', '15m'
+
+    Returns:
+        list of dicts: {datetime, interval, open, high, low, close, volume}
+        datetime is an ISO string: '2026-05-07 14:00:00'
+    """
+    symbol = ticker.split(":")[-1]
+    period = f"{min(days, 730)}d"
+
+    for attempt in range(max_retries):
+        try:
+            logging.info(f"📈 Intraday {ticker} ({symbol}) period={period} interval={interval} (attempt {attempt+1})")
+            ticker_obj = yf.Ticker(symbol)
+            data = ticker_obj.history(period=period, interval=interval)
+
+            if data.empty:
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                    continue
+                logging.warning(f"⚠️ No intraday data for {ticker}")
+                return []
+
+            bars = []
+            for dt_idx, row in data.iterrows():
+                if any(pd.isna(row[col]) for col in ["Open", "High", "Low", "Close", "Volume"]):
+                    continue
+                # Normalize timezone-aware index to naive UTC-local string
+                if hasattr(dt_idx, "tz_localize"):
+                    dt_str = str(dt_idx)[:19]
+                elif hasattr(dt_idx, "strftime"):
+                    dt_str = dt_idx.strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    dt_str = str(dt_idx)[:19]
+
+                bars.append({
+                    "datetime": dt_str,
+                    "interval": interval,
+                    "open":     float(row["Open"]),
+                    "high":     float(row["High"]),
+                    "low":      float(row["Low"]),
+                    "close":    float(row["Close"]),
+                    "volume":   int(row["Volume"]),
+                })
+
+            logging.info(f"✅ Fetched {len(bars)} intraday bars for {ticker} ({interval})")
+            return bars
+
+        except Exception as e:
+            if attempt < max_retries - 1:
+                logging.warning(f"⚠️ Intraday fetch error for {ticker}: {e}, retrying...")
+                time.sleep(2)
+            else:
+                logging.error(f"❌ Intraday fetch failed for {ticker} after {max_retries} attempts: {e}")
+                return []
+
+    return []
+
+
 def fetch_price_data(ticker, days=250, db_manager=None):
     """
     Универсальная функция загрузки данных с кэшированием в Excel

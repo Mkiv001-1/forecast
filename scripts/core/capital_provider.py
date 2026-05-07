@@ -1,10 +1,18 @@
 """
 Capital provider — single source of truth for available trading capital.
 
-Priority hierarchy:
+Priority hierarchy (legacy mode):
   1. Live IB account (PREFERRED_ACCOUNT_TYPE = 'live')
   2. Paper IB account (fallback)
   3. MANUAL_CAPITAL_OVERRIDE config value
+
+Portfolio risk mode (RISK_MODE=percent_of_portfolio_on_stop):
+  - Uses explicit RISK_ACCOUNT_ID to pull NetLiquidation from IB.
+  - Staleness → forced refresh from IB.
+  - If IB still unavailable:
+      IB_CAPITAL_FAILSAFE=manual_only → use MANUAL_CAPITAL_OVERRIDE (or raise if empty)
+      IB_CAPITAL_FAILSAFE=deny        → raise CapitalUnavailableError
+  - Cache is never used as fallback in portfolio risk mode.
 
 Staleness check: if the last IB sync is older than CAPITAL_STALENESS_MINUTES,
 a forced refresh is triggered before returning the value.
@@ -12,11 +20,15 @@ a forced refresh is triggered before returning the value.
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 _FALLBACK_CAPITAL_CACHE: dict = {}
+
+
+class CapitalUnavailableError(RuntimeError):
+    """Raised when capital cannot be obtained and failsafe denies fallback."""
 
 
 def _get_config(db_manager, key: str, default: str = "") -> str:
@@ -166,3 +178,115 @@ async def get_net_liquidation_async(db_manager) -> float:
     """Async wrapper for use in FastAPI endpoints."""
     import asyncio
     return await asyncio.get_event_loop().run_in_executor(None, get_net_liquidation, db_manager)
+
+
+# ---------------------------------------------------------------------------
+# Portfolio risk mode helpers
+# ---------------------------------------------------------------------------
+
+def _get_account_by_id(db_manager, account_id: str) -> Optional[dict]:
+    """Fetch one account row by exact account_id."""
+    try:
+        import sqlite3
+        with sqlite3.connect(db_manager.db_file) as con:
+            con.row_factory = sqlite3.Row
+            row = con.execute(
+                "SELECT * FROM accounts WHERE account_id = ?", (account_id,)
+            ).fetchone()
+        return dict(row) if row else None
+    except Exception as e:
+        logger.error(f"capital_provider: DB read error for account_id={account_id}: {e}")
+        return None
+
+
+def get_portfolio_net_liquidation(db_manager) -> Tuple[float, str]:
+    """
+    Return (net_liquidation, source) for the portfolio risk mode.
+
+    Behaviour controlled by config:
+      RISK_ACCOUNT_ID        — mandatory; the explicit IB account to use.
+      CAPITAL_STALENESS_MINUTES — refresh threshold.
+      IB_CAPITAL_FAILSAFE    — 'manual_only' | 'deny'
+          manual_only: fall back to MANUAL_CAPITAL_OVERRIDE when IB unavailable.
+          deny: raise CapitalUnavailableError when IB unavailable.
+      MANUAL_CAPITAL_OVERRIDE — used only when IB fails and failsafe = manual_only.
+
+    Returns:
+      (net_liquidation, source_label)  where source_label is one of:
+        'ib_live', 'ib_refresh', 'manual_override'
+
+    Raises:
+      CapitalUnavailableError when capital cannot be obtained.
+    """
+    risk_account_id = _get_config(db_manager, "RISK_ACCOUNT_ID", "").strip()
+    failsafe = _get_config(db_manager, "IB_CAPITAL_FAILSAFE", "manual_only").lower().strip()
+    staleness = _staleness_minutes(db_manager)
+
+    if not risk_account_id:
+        raise CapitalUnavailableError(
+            "RISK_ACCOUNT_ID is not configured. "
+            "Set it to the IB account_id to use for portfolio risk sizing."
+        )
+
+    account = _get_account_by_id(db_manager, risk_account_id)
+    if account is None:
+        logger.warning(
+            f"capital_provider: account '{risk_account_id}' not found in DB, triggering IB refresh…"
+        )
+        _refresh_ib_sync(db_manager)
+        account = _get_account_by_id(db_manager, risk_account_id)
+
+    if account is not None:
+        last_sync = account.get("last_sync") or account.get("last_update", "")
+        if _is_stale(last_sync, staleness):
+            logger.info(
+                f"capital_provider: account '{risk_account_id}' data stale, triggering IB refresh…"
+            )
+            refreshed = _refresh_ib_sync(db_manager)
+            if refreshed:
+                _write_last_sync(db_manager, risk_account_id)
+                account = _get_account_by_id(db_manager, risk_account_id)
+            else:
+                account = None  # treat as unavailable
+
+    if account is not None:
+        net_liq = float(account.get("net_liquidation") or 0)
+        if net_liq > 0:
+            logger.info(
+                f"capital_provider [portfolio]: account={risk_account_id} "
+                f"net_liquidation={net_liq:,.2f} source=ib"
+            )
+            return net_liq, "ib"
+
+    # IB data unavailable — apply failsafe policy
+    logger.warning(
+        f"capital_provider [portfolio]: IB data unavailable for account '{risk_account_id}', "
+        f"failsafe={failsafe}"
+    )
+
+    if failsafe == "manual_only":
+        manual = _manual_override(db_manager)
+        if manual is not None:
+            logger.warning(
+                f"capital_provider [portfolio]: using MANUAL_CAPITAL_OVERRIDE={manual} "
+                f"(IB data unavailable)"
+            )
+            return manual, "manual_override"
+        raise CapitalUnavailableError(
+            f"IB data unavailable for account '{risk_account_id}' and "
+            "MANUAL_CAPITAL_OVERRIDE is not set. Cannot size position safely."
+        )
+
+    # failsafe == "deny" or unknown
+    raise CapitalUnavailableError(
+        f"IB data unavailable for account '{risk_account_id}' and "
+        f"IB_CAPITAL_FAILSAFE='{failsafe}'. Order blocked."
+    )
+
+
+async def get_portfolio_net_liquidation_async(db_manager) -> Tuple[float, str]:
+    """Async wrapper for get_portfolio_net_liquidation."""
+    import asyncio
+    return await asyncio.get_event_loop().run_in_executor(
+        None, get_portfolio_net_liquidation, db_manager
+    )

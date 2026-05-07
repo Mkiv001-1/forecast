@@ -154,6 +154,15 @@ def _save_order(db_manager, order_data: dict) -> int:
         return cur.lastrowid
 
 
+def _table_has_column(db_manager, table: str, column: str) -> bool:
+    try:
+        with sqlite3.connect(db_manager.db_file) as con:
+            rows = con.execute(f"PRAGMA table_info({table})").fetchall()
+            return any(str(r[1]).lower() == column.lower() for r in rows)
+    except Exception:
+        return False
+
+
 def _update_order(db_manager, row_id: int, updates: dict) -> None:
     set_parts = ", ".join(f"{k}=?" for k in updates)
     vals = list(updates.values()) + [row_id]
@@ -263,6 +272,8 @@ def submit_signal(
     position_size: dict,
     db_manager,
     log_id: str = "",
+    is_test: bool = False,
+    test_tag: str = "",
 ) -> Dict[str, Any]:
     """
     Convert a consensus signal + position size into a bracket order.
@@ -272,6 +283,12 @@ def submit_signal(
       SUBMITTED, QUEUED, DISABLED, SKIPPED_*, ROLLBACK_PENDING, ERROR
     """
     mode = _cfg(db_manager, "ORDER_MODE", "disabled").lower()
+    normalized_tag = (test_tag or "").strip()
+    order_ref = ""
+    if is_test:
+        order_ref = normalized_tag if normalized_tag else f"TEST:{ticker.upper()}"
+    has_order_test_cols = _table_has_column(db_manager, "orders", "is_test") and _table_has_column(db_manager, "orders", "test_tag")
+    has_trade_test_cols = _table_has_column(db_manager, "trades", "is_test") and _table_has_column(db_manager, "trades", "test_tag")
 
     if mode == "disabled":
         logger.info(f"order_manager: ORDER_MODE=disabled, skipping {ticker}")
@@ -385,6 +402,9 @@ def submit_signal(
             "spread_at_submission": spread_info.get("spread_pct"),
             "error_message":        "",
         }
+        if has_order_test_cols:
+            order_row["is_test"] = 1 if is_test else 0
+            order_row["test_tag"] = normalized_tag
         parent_db_id = _save_order(db_manager, order_row)
 
         if initial_status == "QUEUED":
@@ -414,6 +434,7 @@ def submit_signal(
             use_stop_limit=use_stop_limit,
             stop_limit_offset_pct=stop_limit_offset_pct,
             allow_extended_hours=allow_extended,
+            order_ref=order_ref,
             port=ib_port,
         )
     except Exception as e:
@@ -444,6 +465,9 @@ def submit_signal(
         "status": "SUBMITTED", "account_type": mode,
         "created_at": now, "submitted_at": _now_utc(), "error_message": "",
     }
+    if has_order_test_cols:
+        child_base["is_test"] = 1 if is_test else 0
+        child_base["test_tag"] = normalized_tag
     target_row = {**child_base, "ib_order_id": target_ib_id, "order_role": "TAKE_PROFIT",
                   "order_type": "LMT", "action": "SELL" if action == "BUY" else "BUY",
                   "limit_price": float(target_price), "stop_price": None}
@@ -460,6 +484,42 @@ def submit_signal(
         level="INFO",
     )
 
+    # Create a trades record for this bracket group
+    trade_id: Optional[int] = None
+    try:
+        now_ts = _now_utc()
+        with sqlite3.connect(db_manager.db_file) as con:
+            if has_trade_test_cols:
+                cur = con.execute(
+                    """INSERT INTO trades
+                       (ticker, ib_parent_id, signal, quantity, entry_price,
+                        stop_loss, target_price, status, created_at, updated_at, is_test, test_tag)
+                       VALUES (?,?,?,?,?,?,?,'OPEN',?,?,?,?)""",
+                    (ticker, parent_ib_id,
+                     "LONG" if action == "BUY" else "SHORT",
+                     quantity, entry_price_val,
+                     float(stop_loss), float(target_price),
+                     now_ts, now_ts,
+                     1 if is_test else 0,
+                     normalized_tag),
+                )
+            else:
+                cur = con.execute(
+                    """INSERT INTO trades
+                       (ticker, ib_parent_id, signal, quantity, entry_price,
+                        stop_loss, target_price, status, created_at, updated_at)
+                       VALUES (?,?,?,?,?,?,?,'OPEN',?,?)""",
+                    (ticker, parent_ib_id,
+                     "LONG" if action == "BUY" else "SHORT",
+                     quantity, entry_price_val,
+                     float(stop_loss), float(target_price),
+                     now_ts, now_ts),
+                )
+            trade_id = cur.lastrowid
+        logger.info(f"order_manager: created trade id={trade_id} for {ticker} IB#{parent_ib_id}")
+    except Exception as e:
+        logger.warning(f"order_manager: could not create trade record for {ticker}: {e}")
+
     logger.info(
         f"order_manager: bracket submitted for {ticker} "
         f"parent={parent_ib_id} target={target_ib_id} stop={stop_ib_id}"
@@ -468,6 +528,7 @@ def submit_signal(
         "status":    "SUBMITTED",
         "order_ids": [parent_db_id, target_db_id, stop_db_id],
         "ib_ids":    {"parent": parent_ib_id, "target": target_ib_id, "stop": stop_ib_id},
+        "trade_id":  trade_id,
         "message":   f"Bracket submitted IB#{parent_ib_id}",
     }
 
@@ -632,3 +693,310 @@ def check_child_timeouts(db_manager) -> None:
                 rollback_bracket_group(row["id"], db_manager)
         except Exception as e:
             logger.error(f"check_child_timeouts: error processing row {row['id']}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# IB Gateway audit log
+# ---------------------------------------------------------------------------
+
+def log_ib_operation(
+    db_manager,
+    operation: str,
+    ticker: str = "",
+    ib_order_id: int = 0,
+    status: str = "",
+    latency_ms: Optional[int] = None,
+    request_data: str = "",
+    response_data: str = "",
+    error_msg: str = "",
+) -> None:
+    """Write one row to ib_gateway_log for audit trail."""
+    try:
+        with sqlite3.connect(db_manager.db_file) as con:
+            con.execute(
+                """INSERT INTO ib_gateway_log
+                   (occurred_at, operation, ticker, ib_order_id, status,
+                    latency_ms, request_data, response_data, error_msg)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (_now_utc(), operation, ticker, ib_order_id, status,
+                 latency_ms, request_data, response_data, error_msg),
+            )
+    except Exception as e:
+        logger.warning(f"log_ib_operation: failed to write log: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Shared consensus activation entrypoint
+# ---------------------------------------------------------------------------
+
+def _is_within_order_window(db_manager) -> tuple[bool, str]:
+    """
+    Check whether the current UTC time is within the configured order window.
+
+    Returns (allowed: bool, reason: str).
+    When ORDER_WINDOW_ENABLED=false always returns (True, "").
+    """
+    if not _cfg_bool(db_manager, "ORDER_WINDOW_ENABLED"):
+        return True, ""
+
+    import json as _json
+    now = datetime.now(tz=timezone.utc)
+
+    # Weekday check (0=Mon … 4=Fri)
+    try:
+        allowed_days = _json.loads(_cfg(db_manager, "ORDER_WINDOW_WEEKDAYS", "[0,1,2,3,4]"))
+    except Exception:
+        allowed_days = [0, 1, 2, 3, 4]
+    if now.weekday() not in allowed_days:
+        return False, f"outside_weekday({now.weekday()})"
+
+    # Time window check
+    def _parse_hhmm(s: str):
+        h, m = s.split(":")
+        return now.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
+
+    try:
+        win_start = _parse_hhmm(_cfg(db_manager, "ORDER_WINDOW_START", "14:30"))
+        win_end   = _parse_hhmm(_cfg(db_manager, "ORDER_WINDOW_END",   "20:45"))
+        if not (win_start <= now <= win_end):
+            return False, f"outside_time_window({_cfg(db_manager, 'ORDER_WINDOW_START')}–{_cfg(db_manager, 'ORDER_WINDOW_END')})"
+    except Exception:
+        pass  # bad config — allow
+
+    return True, ""
+
+
+def preview_consensus_order(
+    consensus_id: int,
+    db_manager,
+) -> Dict[str, Any]:
+    """Return trade preview (including calculated quantity) for a consensus record."""
+    try:
+        with sqlite3.connect(db_manager.db_file) as con:
+            con.row_factory = sqlite3.Row
+            row = con.execute("SELECT * FROM consensus WHERE id=?", (consensus_id,)).fetchone()
+    except Exception as e:
+        return {"status": "ERROR", "message": f"DB read failed: {e}"}
+
+    if row is None:
+        return {"status": "ERROR", "message": f"consensus id={consensus_id} not found"}
+
+    ticker = str(row["ticker"] or "")
+    signal = str(row["signal"] or "").upper()
+    entry_limit_price = row["entry_limit_price"]
+    stop_loss = row["stop_loss"]
+    target_price = row["target_price"]
+
+    if signal not in ("LONG", "SHORT"):
+        return {
+            "status": "SKIPPED",
+            "message": "neutral_signal",
+            "ticker": ticker,
+            "signal": signal,
+        }
+
+    entry_action = "BUY" if signal == "LONG" else "SELL"
+    exit_action = "SELL" if signal == "LONG" else "BUY"
+    if entry_limit_price is not None and float(entry_limit_price) > 0:
+        entry_order_type = "LMT"
+        entry_price_val = float(entry_limit_price)
+    else:
+        entry_order_type = "MKT"
+        entry_price_val = None
+
+    from position_sizer import calculate_position
+    from capital_provider import get_capital
+
+    capital = get_capital(db_manager)
+    if capital.get("status") != "OK":
+        return {
+            "status": "PENDING",
+            "message": f"capital_unavailable:{capital.get('status')}",
+            "ticker": ticker,
+            "signal": signal,
+            "entry_order_type": entry_order_type,
+            "entry_action": entry_action,
+            "take_profit_order_type": "LMT",
+            "take_profit_action": exit_action,
+            "stop_loss_order_type": "STP",
+            "stop_loss_action": exit_action,
+            "entry_price": entry_price_val,
+            "target_price": target_price,
+            "stop_loss": stop_loss,
+        }
+
+    position = calculate_position(
+        ticker=ticker,
+        entry_price=entry_limit_price or stop_loss or 0,
+        stop_loss=stop_loss,
+        db_manager=db_manager,
+        net_liquidation=capital["net_liquidation"],
+    )
+
+    return {
+        "status": "OK" if position.get("status") == "OK" else position.get("status", "ERROR"),
+        "message": "" if position.get("status") == "OK" else f"position_size_failed:{position.get('status', 'UNKNOWN')}",
+        "ticker": ticker,
+        "signal": signal,
+        "entry_order_type": entry_order_type,
+        "entry_action": entry_action,
+        "take_profit_order_type": "LMT",
+        "take_profit_action": exit_action,
+        "stop_loss_order_type": "STP",
+        "stop_loss_action": exit_action,
+        "entry_price": entry_price_val,
+        "target_price": target_price,
+        "stop_loss": stop_loss,
+        "quantity": int(position.get("quantity", 0) or 0),
+        "risk_amount": position.get("risk_amount"),
+        "risk_mode": position.get("risk_mode"),
+        "capital_source": position.get("capital_source"),
+    }
+
+
+def activate_consensus_order(
+    consensus_id: int,
+    db_manager,
+) -> Dict[str, Any]:
+    """
+    Shared activation entrypoint for a single consensus record.
+
+    Evaluates TTL, order window, position constraints and calls submit_signal().
+    Updates consensus.order_state / order_reason / order_checked_at / order_attempted_at / trade_id.
+
+    Returns {status, message}.
+    """
+    now_str = _now_utc()
+
+    # Load the consensus record
+    try:
+        with sqlite3.connect(db_manager.db_file) as con:
+            con.row_factory = sqlite3.Row
+            row = con.execute(
+                "SELECT * FROM consensus WHERE id=?", (consensus_id,)
+            ).fetchone()
+    except Exception as e:
+        return {"status": "ERROR", "message": f"DB read failed: {e}"}
+
+    if row is None:
+        return {"status": "ERROR", "message": f"consensus id={consensus_id} not found"}
+
+    ticker = row["ticker"]
+    signal = (row["signal"] or "").upper()
+    confidence = row["confidence"] or 0.0
+    created_at_str = row["date"] or ""
+
+    def _set_state(state: str, reason: str, attempted: bool = False):
+        updates = {
+            "order_state":      state,
+            "order_reason":     reason,
+            "order_checked_at": now_str,
+        }
+        if attempted:
+            updates["order_attempted_at"] = now_str
+        try:
+            set_parts = ", ".join(f"{k}=?" for k in updates)
+            with sqlite3.connect(db_manager.db_file) as con:
+                con.execute(
+                    f"UPDATE consensus SET {set_parts} WHERE id=?",
+                    list(updates.values()) + [consensus_id],
+                )
+        except Exception as e:
+            logger.warning(f"activate_consensus_order: could not update state: {e}")
+
+    # Guard: signal must be LONG or SHORT
+    if signal not in ("LONG", "SHORT"):
+        _set_state("ORDER_SKIPPED", "neutral_signal")
+        return {"status": "SKIPPED", "message": "neutral_signal"}
+
+    # Guard: TTL check
+    ttl_minutes = _cfg_int(db_manager, "FORECAST_TTL_MINUTES", 240)
+    try:
+        created_at = datetime.fromisoformat(created_at_str.replace(" ", "T"))
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        age_minutes = (datetime.now(tz=timezone.utc) - created_at).total_seconds() / 60
+        if age_minutes > ttl_minutes:
+            _set_state("EXPIRED", "ttl_expired")
+            logger.info(f"activate_consensus_order: consensus {consensus_id} EXPIRED (age={age_minutes:.0f}m > ttl={ttl_minutes}m)")
+            return {"status": "EXPIRED", "message": "ttl_expired"}
+    except Exception as e:
+        logger.warning(f"activate_consensus_order: TTL check failed: {e}")
+
+    # Guard: order window
+    window_ok, window_reason = _is_within_order_window(db_manager)
+    if not window_ok:
+        _set_state("PENDING_ORDER", f"outside_window:{window_reason}")
+        return {"status": "PENDING", "message": window_reason}
+
+    # Guard: ORDER_MODE must not be disabled
+    mode = _cfg(db_manager, "ORDER_MODE", "disabled").lower()
+    if mode == "disabled":
+        _set_state("ORDER_SKIPPED", "order_mode_disabled", attempted=True)
+        return {"status": "SKIPPED", "message": "ORDER_MODE=disabled"}
+
+    # Build position size
+    from position_sizer import calculate_position
+    from capital_provider import get_capital
+
+    capital = get_capital(db_manager)
+    if capital.get("status") != "OK":
+        reason = f"capital_unavailable:{capital.get('status')}"
+        _set_state("PENDING_ORDER", reason, attempted=True)
+        logger.warning(f"activate_consensus_order: {ticker} — {reason}")
+        return {"status": "PENDING", "message": reason}
+
+    consensus_dict = dict(row)
+    position = calculate_position(
+        ticker=ticker,
+        entry_price=row["entry_limit_price"] or row["stop_loss"] or 0,
+        stop_loss=row["stop_loss"],
+        db_manager=db_manager,
+        net_liquidation=capital["net_liquidation"],
+    )
+    if position.get("status") != "OK" or position.get("quantity", 0) <= 0:
+        reason = f"position_size_failed:{position.get('status', 'UNKNOWN')}"
+        _set_state("ORDER_SKIPPED", reason, attempted=True)
+        return {"status": "SKIPPED", "message": reason}
+
+    # Call the existing submit_signal
+    result = submit_signal(
+        ticker=ticker,
+        consensus=consensus_dict,
+        position_size=position,
+        db_manager=db_manager,
+        log_id="",
+    )
+
+    r_status = result.get("status", "ERROR")
+    r_msg    = result.get("message", "")
+
+    if r_status == "SUBMITTED":
+        # Link trade to consensus
+        trade_id = result.get("trade_id")
+        try:
+            update_cols: Dict[str, Any] = {
+                "order_state":       "ORDER_SUBMITTED",
+                "order_reason":      "",
+                "order_checked_at":  now_str,
+                "order_attempted_at": now_str,
+            }
+            if trade_id:
+                update_cols["trade_id"] = trade_id
+            set_parts = ", ".join(f"{k}=?" for k in update_cols)
+            with sqlite3.connect(db_manager.db_file) as con:
+                con.execute(
+                    f"UPDATE consensus SET {set_parts} WHERE id=?",
+                    list(update_cols.values()) + [consensus_id],
+                )
+        except Exception as e:
+            logger.warning(f"activate_consensus_order: could not update ORDER_SUBMITTED: {e}")
+        logger.info(f"activate_consensus_order: consensus {consensus_id} → ORDER_SUBMITTED ({r_msg})")
+    elif r_status in ("QUEUED",):
+        _set_state("PENDING_ORDER", f"queued:{r_msg}", attempted=True)
+    elif r_status.startswith("SKIPPED") or r_status == "DISABLED":
+        _set_state("ORDER_SKIPPED", r_status.lower(), attempted=True)
+    else:
+        _set_state("ORDER_SKIPPED", f"error:{r_msg}", attempted=True)
+
+    return {"status": r_status, "message": r_msg}

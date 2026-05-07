@@ -5,6 +5,58 @@
 
 ---
 
+## [2026-05-07] Trading Tab UX Consolidation
+
+### Added
+- Новый верхнеуровневый таб **Trading** в GUI с подвкладками **Trades** и **Orders**
+- Новый `TradesTab` (read-only MVP): фильтры `ticker/status`, таблица сделок, цветовая индикация PnL
+- Двусторонняя кросс-навигация между `Orders` и `Trades` по `ticker` + `ib_parent_id`
+- Явные UI-состояния для пустой выборки и ошибок загрузки в обеих подвкладках
+- Linked-mode индикаторы (`parent #...`) и кнопки `Reset Filters` в `Trades` и `Orders`
+- `api_client.get_trades()` как удобная обертка над `GET /trades`
+
+### Changed
+- `OrdersTab` выровнен со схемой БД: колонка `Action` теперь читает поле `action` (вместо `side`), добавлена колонка `Role` из `order_role`
+- `_TabLoader` теперь загружает `Trading` единым шагом вместо отдельного `Orders`
+
+### Decisions
+- `System Log` намеренно оставлен отдельной верхнеуровневой вкладкой (не переносится в `Trading`)
+- Для MVP не менялись серверные API-контракты `/orders` и `/trades`
+
+---
+
+## [2026-05-07] Consensus Engine Improvements & Scheduler Workers
+
+### Added
+- **`model_stats` parameter in `calculate_consensus()`** — отдельный словарь точности по имени AI-модели (keyed by `providers.name`), имеет приоритет над `method_stats` для `ema_accuracy`. Загружается из таблицы `providers` в `forecast_runner.py` и `consensus_recalc.py`
+- **`exit_successful` field** — сохраняется в таблицу `consensus` при оценке: `1` = target hit first, `0` = stop hit first, `NULL` = ни один не достигнут. Соответствующая колонка добавлена в миграцию `sqlite_manager.py`
+- **`has_consensus` return value** — `process_ticker()` в `forecast_runner.py` теперь возвращает кортеж `(log_ids, has_consensus)` вместо только `log_ids`; `run_trading_bot()` обновлён для распаковки
+- **`SCHEDULER_MAX_WORKERS` config key** — конфигурируемый размер thread pool планировщика (дефолт 4), добавлен в оба seed-листа `sqlite_manager.py`
+- **Configurable thread pool** — `start_scheduler()` читает `SCHEDULER_MAX_WORKERS` из config; `stop_scheduler()` корректно завершает pool через `shutdown(wait=False, cancel_futures=True)`
+- **GUI field for `SCHEDULER_MAX_WORKERS`** — QSpinBox (диапазон 1–16) в подвкладке IB Settings таба Settings
+- **`test_integration_api.py`** — новый файл интеграционных тестов API; тест `test_api_config_scheduler_max_workers_roundtrip` проверяет GET/PUT/GET цикл для `/config`
+- **9 новых unit-тестов** в `test_core_logic.py`:
+  - `test_consensus_model_stats_overrides_method_stats_ema` — model_stats имеет приоритет
+  - `test_consensus_model_stats_fallback_to_method_stats` — fallback если модель не в model_stats
+  - `test_consensus_total_weight_accumulates_all_non_filtered` — все ненефильтрованные прогнозы в total_weight
+  - `test_consensus_total_weight_not_counting_filtered` — отфильтрованные прогнозы исключены
+  - `test_consensus_evaluator_exit_successful_persisted` — exit_successful=1 сохраняется в DB
+  - `test_consensus_evaluator_exit_successful_stop_first` — exit_successful=0 для stop-first сценария
+  - `test_scheduler_max_workers_default_is_4` — дефолтный пул 4 worker
+  - `test_scheduler_max_workers_from_config` — пул читается из config
+
+### Fixed
+- **Bug: `exit_successful` не сохранялся** — `_evaluate_one()` вычислял поле но не передавал в `_save_eval()`. Исправлено: добавлен `exit_successful=exit_successful` в вызов `_save_eval()`
+- **Bug: `exit_successful` отсутствовал в миграции** — добавлена запись `("consensus", "exit_successful", "INTEGER")` в список `_ADD_MISSING_COLUMNS` в `sqlite_manager.py`
+- **Bug: `total_weight` не накапливался** — в старой версии `total_weight += weight` выполнялся до `continue` для filtered прогнозов; теперь накапливается только после проверки на фильтр
+- **Bug: смешение `ema_accuracy` в `method_stats`** — `consensus_recalc.py` больше не добавляет `ema_accuracy` в `method_stats`; используется отдельный `model_stats` dict
+
+### Changed
+- **Confidence calibration** — теперь вычисляется для аналитики, но НЕ влияет на вес (raw confidence + ema_weight); устраняет двойной счёт (calibrated weight ≡ raw × ema_weight)
+- **`_process_group()` в `consensus_recalc.py`** — строит `model_stats` из таблицы `providers` (идентично `forecast_runner.py`), передаёт в `calculate_consensus()`
+- **`test_core_logic.py`: `_make_consensus_db`** — добавлена колонка `exit_successful` в тестовую схему
+
+---
 ## [2026-05-05] GUI Consensus Tab + Bugfix
 
 ### Added

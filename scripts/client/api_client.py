@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 class ForecastApiClient:
     """Synchronous HTTP client for the Forecast server."""
 
-    def __init__(self, server_url: str, api_key: str, timeout: int = 30):
+    def __init__(self, server_url: str, api_key: str, timeout: int = 8):
         self.server_url = server_url.rstrip("/")
         self.timeout = timeout
         self._session = requests.Session()
@@ -64,8 +64,9 @@ class ForecastApiClient:
         resp.raise_for_status()
         return resp.json()
 
-    def health(self) -> HealthResponse:
-        data = self._session.get(f"{self.server_url}/health", timeout=self.timeout).json()
+    def health(self, timeout: Optional[int] = None) -> HealthResponse:
+        req_timeout = timeout if timeout is not None else self.timeout
+        data = self._session.get(f"{self.server_url}/health", timeout=req_timeout).json()
         return HealthResponse(**data)
 
     def get_logs(
@@ -169,6 +170,14 @@ class ForecastApiClient:
         data = self._get("/config")
         return ConfigResponse(**data)
 
+    def set_config(self, key: str, value: str) -> None:
+        """Convenience wrapper: PUT /config/{key}."""
+        self._put(f"/config/{key}", json={"key": key, "value": value, "description": ""})
+
+    def get(self, path: str, params: dict = None) -> dict:
+        """Generic GET — returns raw dict. Used by new tabs (trades, ib-log, etc.)."""
+        return self._get(path, params=params)
+
     def update_config(self, key: str, body: ConfigParam) -> ConfigParam:
         data = self._put(f"/config/{key}", json=body.model_dump())
         return ConfigParam(**data)
@@ -245,6 +254,14 @@ class ForecastApiClient:
         if force:
             params["force"] = "true"
         return self._post("/consensus/recalculate", params=params)
+
+    def activate_consensus(self, consensus_id: int) -> dict:
+        """Trigger trade placement for one consensus record."""
+        return self._post(f"/consensus/{int(consensus_id)}/activate")
+
+    def preview_consensus_trade(self, consensus_id: int) -> dict:
+        """Fetch trade preview details for one consensus record."""
+        return self._get(f"/consensus/{int(consensus_id)}/preview-trade")
 
     def get_system_log(
         self,
@@ -341,6 +358,8 @@ class ForecastApiClient:
         ticker: Optional[str] = None,
         status: Optional[str] = None,
         limit: int = 200,
+        include_test: Optional[bool] = None,
+        test_only: Optional[bool] = None,
     ) -> list:
         """Return orders from the server."""
         params = {"limit": limit}
@@ -348,8 +367,33 @@ class ForecastApiClient:
             params["ticker"] = ticker
         if status:
             params["status"] = status
+        if include_test is not None:
+            params["include_test"] = include_test
+        if test_only is not None:
+            params["test_only"] = test_only
         data = self._get("/orders", params=params)
         return data.get("items", [])
+
+    def get_trades(
+        self,
+        ticker: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 200,
+        include_test: Optional[bool] = None,
+        test_only: Optional[bool] = None,
+    ) -> list:
+        """Return trades from the server."""
+        params = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        if status:
+            params["status"] = status
+        if include_test is not None:
+            params["include_test"] = include_test
+        if test_only is not None:
+            params["test_only"] = test_only
+        data = self._get("/trades", params=params)
+        return data.get("trades", [])
 
     def cancel_order(self, order_id: int) -> dict:
         """Cancel an IB order by DB id."""

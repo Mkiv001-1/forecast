@@ -95,6 +95,20 @@ CREATE TABLE IF NOT EXISTS price_data (
 );
 CREATE INDEX IF NOT EXISTS idx_price_ticker ON price_data(ticker);
 
+CREATE TABLE IF NOT EXISTS price_data_intraday (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker   TEXT NOT NULL,
+    datetime TEXT NOT NULL,
+    interval TEXT NOT NULL DEFAULT '1h',
+    open     REAL,
+    high     REAL,
+    low      REAL,
+    close    REAL,
+    volume   INTEGER,
+    UNIQUE(ticker, datetime, interval)
+);
+CREATE INDEX IF NOT EXISTS idx_price_intraday_ticker ON price_data_intraday(ticker, datetime);
+
 CREATE TABLE IF NOT EXISTS accounts (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     broker              TEXT NOT NULL DEFAULT 'ibkr',
@@ -229,11 +243,15 @@ CREATE TABLE IF NOT EXISTS orders (
     filled_price            REAL    DEFAULT NULL,
     execution_latency_ms    INTEGER DEFAULT NULL,
     spread_at_submission    REAL    DEFAULT NULL,
-    error_message           TEXT    DEFAULT ''
+    error_message           TEXT    DEFAULT '',
+    is_test                 INTEGER DEFAULT 0,
+    test_tag                TEXT    DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_orders_ticker     ON orders(ticker);
 CREATE INDEX IF NOT EXISTS idx_orders_status     ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_orders_ib_parent  ON orders(ib_parent_id);
+CREATE INDEX IF NOT EXISTS idx_orders_is_test    ON orders(is_test);
+CREATE INDEX IF NOT EXISTS idx_orders_test_tag   ON orders(test_tag);
 
 CREATE TABLE IF NOT EXISTS scheduled_tasks (
     name                TEXT PRIMARY KEY,
@@ -272,6 +290,49 @@ CREATE TABLE IF NOT EXISTS tickets (
 );
 CREATE INDEX IF NOT EXISTS idx_tickets_ticker ON tickets(ticker);
 CREATE INDEX IF NOT EXISTS idx_tickets_portfolio ON tickets(portfolio);
+
+CREATE TABLE IF NOT EXISTS trades (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker           TEXT    NOT NULL,
+    consensus_id     INTEGER REFERENCES consensus(id),
+    ib_parent_id     INTEGER DEFAULT 0,
+    signal           TEXT    DEFAULT '',
+    quantity         REAL    DEFAULT 0,
+    entry_price      REAL    DEFAULT NULL,
+    stop_loss        REAL    DEFAULT NULL,
+    target_price     REAL    DEFAULT NULL,
+    entry_filled_at  TEXT    DEFAULT '',
+    exit_filled_at   TEXT    DEFAULT '',
+    exit_price       REAL    DEFAULT NULL,
+    close_reason     TEXT    DEFAULT '',
+    realized_pnl     REAL    DEFAULT NULL,
+    r_multiple       REAL    DEFAULT NULL,
+    status           TEXT    DEFAULT 'OPEN',
+    created_at       TEXT    DEFAULT '',
+    updated_at       TEXT    DEFAULT '',
+    is_test          INTEGER DEFAULT 0,
+    test_tag         TEXT    DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_trades_ticker    ON trades(ticker);
+CREATE INDEX IF NOT EXISTS idx_trades_status    ON trades(status);
+CREATE INDEX IF NOT EXISTS idx_trades_consensus ON trades(consensus_id);
+CREATE INDEX IF NOT EXISTS idx_trades_is_test   ON trades(is_test);
+CREATE INDEX IF NOT EXISTS idx_trades_test_tag  ON trades(test_tag);
+
+CREATE TABLE IF NOT EXISTS ib_gateway_log (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at    TEXT    NOT NULL,
+    operation      TEXT    NOT NULL,
+    ticker         TEXT    DEFAULT '',
+    ib_order_id    INTEGER DEFAULT 0,
+    status         TEXT    DEFAULT '',
+    latency_ms     INTEGER DEFAULT NULL,
+    request_data   TEXT    DEFAULT '',
+    response_data  TEXT    DEFAULT '',
+    error_msg      TEXT    DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_ib_log_ticker   ON ib_gateway_log(ticker);
+CREATE INDEX IF NOT EXISTS idx_ib_log_occurred ON ib_gateway_log(occurred_at);
 """
 
 _DEFAULT_CONFIG = [
@@ -296,6 +357,11 @@ _DEFAULT_CONFIG = [
     ("PRICE_STALENESS_BUSINESS_DAYS", "2",         "Price data staleness threshold for daily candles (business days)"),
     ("PREFERRED_ACCOUNT_TYPE",       "live",       "Preferred IB account type: live | paper"),
     ("MANUAL_CAPITAL_OVERRIDE",      "",           "Manual capital override (leave empty to use IB)"),
+    # Portfolio risk sizing
+    ("RISK_MODE",                    "percent_of_capital", "Risk sizing mode: percent_of_capital | percent_of_portfolio_on_stop"),
+    ("RISK_PERCENT_ON_STOP",         "1.0",        "Risk as % of portfolio when stop is hit (used when RISK_MODE=percent_of_portfolio_on_stop, e.g. 1.0 = 1%)"),
+    ("RISK_ACCOUNT_ID",              "",           "IB account_id to use for portfolio value (required in percent_of_portfolio_on_stop mode)"),
+    ("IB_CAPITAL_FAILSAFE",         "manual_only", "Fallback when IB data stale/unavailable: manual_only | deny. manual_only allows MANUAL_CAPITAL_OVERRIDE; deny blocks all orders"),
     # Order management
     ("ORDER_MODE",                   "disabled",   "Order mode: disabled | paper | live"),
     ("LIVE_TRADING_CONFIRMED",       "false",      "Must be 'true' to enable live trading"),
@@ -319,8 +385,17 @@ _DEFAULT_CONFIG = [
     ("FORECAST_INTERVAL_MINUTES",    "60",         "Forecast cycle interval in minutes"),
     ("EVALUATE_INTERVAL_MINUTES",    "120",        "Evaluate past forecasts interval in minutes"),
     ("PRICE_DATA_INTERVAL_MINUTES",  "60",         "Price data refresh interval in minutes"),
+    ("INTRADAY_UPDATE_INTERVAL_MINUTES", "60",     "Intraday (hourly) price data refresh interval in minutes"),
+    ("SCHEDULER_MAX_WORKERS",        "4",          "Scheduler thread pool worker count"),
     ("SCHEDULER_MAX_RETRIES",        "2",          "Max retries for failed scheduled tasks"),
     ("HEARTBEAT_OPENROUTER_GRACE_SEC","120",        "Grace period before circuit-open triggers degradation"),
+    # Order activation pipeline
+    ("FORECAST_TTL_MINUTES",         "240",        "Signal TTL in minutes — PENDING_ORDER older than this becomes EXPIRED"),
+    ("ORDER_WINDOW_ENABLED",         "false",      "Restrict order submission to a time window"),
+    ("ORDER_WINDOW_START",           "14:30",      "Order window start UTC (HH:MM, NYSE open)"),
+    ("ORDER_WINDOW_END",             "20:45",      "Order window end UTC (HH:MM, 15 min before NYSE close)"),
+    ("ORDER_WINDOW_WEEKDAYS",        "[0,1,2,3,4]","Allowed weekdays JSON list (0=Mon … 4=Fri)"),
+    ("PENDING_ORDERS_INTERVAL_MINUTES","1",        "How often to process PENDING_ORDER consensus (minutes)"),
 ]
 
 _DEFAULT_PROVIDERS = [
@@ -625,6 +700,7 @@ class SQLiteManager:
             ("consensus", "target_hit",                 "INTEGER"),
             ("consensus", "stop_hit",                   "INTEGER"),
             ("consensus", "first_hit",                  "TEXT"),
+            ("consensus", "exit_successful",             "INTEGER"),
             ("consensus", "direction_correct",          "INTEGER"),
             ("consensus", "pnl_pct",                    "REAL"),
             ("consensus", "r_multiple",                 "REAL"),
@@ -638,6 +714,17 @@ class SQLiteManager:
             ("forecast_run_links", "entry_price",            "REAL"),
             ("forecast_run_links", "r_multiple",             "REAL"),
             ("forecast_run_links", "atr_14",                 "REAL"),
+            # Order activation fields (Phase 1)
+            ("consensus", "order_state",       "TEXT DEFAULT ''"),
+            ("consensus", "order_checked_at",  "TEXT DEFAULT ''"),
+            ("consensus", "order_attempted_at","TEXT DEFAULT ''"),
+            ("consensus", "order_reason",      "TEXT DEFAULT ''"),
+            ("consensus", "trade_id",          "INTEGER REFERENCES trades(id)"),
+            # Test marker fields
+            ("orders",    "is_test",           "INTEGER DEFAULT 0"),
+            ("orders",    "test_tag",          "TEXT DEFAULT ''"),
+            ("trades",    "is_test",           "INTEGER DEFAULT 0"),
+            ("trades",    "test_tag",          "TEXT DEFAULT ''"),
         ]
         for table, col, col_type in _MISSING_COLS:
             try:
@@ -678,11 +765,15 @@ class SQLiteManager:
                 filled_price         REAL    DEFAULT NULL,
                 execution_latency_ms INTEGER DEFAULT NULL,
                 spread_at_submission REAL    DEFAULT NULL,
-                error_message        TEXT    DEFAULT ''
+                error_message        TEXT    DEFAULT '',
+                is_test              INTEGER DEFAULT 0,
+                test_tag             TEXT    DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_orders_ticker    ON orders(ticker);
             CREATE INDEX IF NOT EXISTS idx_orders_status    ON orders(status);
             CREATE INDEX IF NOT EXISTS idx_orders_ib_parent ON orders(ib_parent_id);
+            CREATE INDEX IF NOT EXISTS idx_orders_is_test   ON orders(is_test);
+            CREATE INDEX IF NOT EXISTS idx_orders_test_tag  ON orders(test_tag);
             CREATE TABLE IF NOT EXISTS scheduled_tasks (
                 name                TEXT PRIMARY KEY,
                 schedule_type       TEXT    DEFAULT 'interval',
@@ -756,6 +847,49 @@ class SQLiteManager:
             CREATE INDEX IF NOT EXISTS idx_run_links_run_id ON forecast_run_links(run_id);
             CREATE INDEX IF NOT EXISTS idx_run_links_ticker ON forecast_run_links(ticker, run_id);
             CREATE INDEX IF NOT EXISTS idx_run_links_weight ON forecast_run_links(run_id, final_weight DESC);
+
+            CREATE TABLE IF NOT EXISTS trades (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker           TEXT    NOT NULL,
+                consensus_id     INTEGER REFERENCES consensus(id),
+                ib_parent_id     INTEGER DEFAULT 0,
+                signal           TEXT    DEFAULT '',
+                quantity         REAL    DEFAULT 0,
+                entry_price      REAL    DEFAULT NULL,
+                stop_loss        REAL    DEFAULT NULL,
+                target_price     REAL    DEFAULT NULL,
+                entry_filled_at  TEXT    DEFAULT '',
+                exit_filled_at   TEXT    DEFAULT '',
+                exit_price       REAL    DEFAULT NULL,
+                close_reason     TEXT    DEFAULT '',
+                realized_pnl     REAL    DEFAULT NULL,
+                r_multiple       REAL    DEFAULT NULL,
+                status           TEXT    DEFAULT 'OPEN',
+                created_at       TEXT    DEFAULT '',
+                updated_at       TEXT    DEFAULT '',
+                is_test          INTEGER DEFAULT 0,
+                test_tag         TEXT    DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_trades_ticker    ON trades(ticker);
+            CREATE INDEX IF NOT EXISTS idx_trades_status    ON trades(status);
+            CREATE INDEX IF NOT EXISTS idx_trades_consensus ON trades(consensus_id);
+            CREATE INDEX IF NOT EXISTS idx_trades_is_test   ON trades(is_test);
+            CREATE INDEX IF NOT EXISTS idx_trades_test_tag  ON trades(test_tag);
+
+            CREATE TABLE IF NOT EXISTS ib_gateway_log (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                occurred_at    TEXT    NOT NULL,
+                operation      TEXT    NOT NULL,
+                ticker         TEXT    DEFAULT '',
+                ib_order_id    INTEGER DEFAULT 0,
+                status         TEXT    DEFAULT '',
+                latency_ms     INTEGER DEFAULT NULL,
+                request_data   TEXT    DEFAULT '',
+                response_data  TEXT    DEFAULT '',
+                error_msg      TEXT    DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_ib_log_ticker   ON ib_gateway_log(ticker);
+            CREATE INDEX IF NOT EXISTS idx_ib_log_occurred ON ib_gateway_log(occurred_at);
         """)
         con.commit()
 
@@ -815,8 +949,16 @@ class SQLiteManager:
             ("MODEL_WEIGHT_EMA_ALPHA",       "0.2",    "EMA smoothing factor for provider accuracy weights"),
             ("FORECAST_INTERVAL_MINUTES",    "60",     "Forecast cycle interval in minutes"),
             ("EVALUATE_INTERVAL_MINUTES",    "120",    "Evaluate past forecasts interval in minutes"),
+            ("SCHEDULER_MAX_WORKERS",        "4",      "Scheduler thread pool worker count"),
             ("SCHEDULER_MAX_RETRIES",        "2",      "Max retries for failed scheduled tasks"),
             ("HEARTBEAT_OPENROUTER_GRACE_SEC","120",   "Grace period before circuit-open triggers degradation"),
+            # Order activation pipeline (Phase 1)
+            ("FORECAST_TTL_MINUTES",         "240",    "Signal TTL in minutes — PENDING_ORDER older than this becomes EXPIRED"),
+            ("ORDER_WINDOW_ENABLED",         "false",  "Restrict order submission to a time window"),
+            ("ORDER_WINDOW_START",           "14:30",  "Order window start UTC (HH:MM, NYSE open)"),
+            ("ORDER_WINDOW_END",             "20:45",  "Order window end UTC (HH:MM, 15 min before NYSE close)"),
+            ("ORDER_WINDOW_WEEKDAYS",        "[0,1,2,3,4]", "Allowed weekdays JSON list (0=Mon … 4=Fri)"),
+            ("PENDING_ORDERS_INTERVAL_MINUTES","1",   "How often to process PENDING_ORDER consensus (minutes)"),
         ]
         con.executemany(
             "INSERT OR IGNORE INTO config(key, value, description) VALUES (?,?,?)",
@@ -1011,6 +1153,43 @@ class SQLiteManager:
             return True
         except Exception as e:
             logger.error(f"Error saving price data: {e}")
+            return False
+
+    def save_intraday_data(self, bars: list, ticker: str = None, interval: str = "1h") -> bool:
+        """Upsert intraday price bars into price_data_intraday."""
+        if not bars:
+            return True
+        try:
+            sql = """
+                INSERT OR REPLACE INTO price_data_intraday
+                    (ticker, datetime, interval, open, high, low, close, volume)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """
+            rows = []
+            for rec in bars:
+                dt_val = rec.get("datetime") or rec.get("date")
+                if hasattr(dt_val, "strftime"):
+                    dt_str = dt_val.strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    dt_str = str(dt_val)[:19]
+                rec_ticker = rec.get("ticker") or ticker or ""
+                rec_interval = rec.get("interval") or interval
+                rows.append((
+                    rec_ticker,
+                    dt_str,
+                    rec_interval,
+                    float(rec.get("open") or 0),
+                    float(rec.get("high") or 0),
+                    float(rec.get("low") or 0),
+                    float(rec.get("close") or 0),
+                    int(rec.get("volume") or 0),
+                ))
+            with self._connect() as con:
+                con.executemany(sql, rows)
+            logger.info(f"Saved {len(rows)} intraday bars ({interval}) for {ticker}")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving intraday data: {e}")
             return False
 
     # ------------------------------------------------------------------

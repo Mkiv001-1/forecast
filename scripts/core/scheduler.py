@@ -239,8 +239,8 @@ async def _order_timeout_task() -> None:
         logger.error(f"scheduler: order_timeout_task error: {e}")
 
 
-# Thread pool for CPU-bound / blocking robot tasks
-_thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="scheduler-robot")
+# Thread pool for CPU-bound / blocking robot tasks (initialized in start_scheduler)
+_thread_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -287,6 +287,8 @@ async def _scheduled_forecast_task() -> None:
     """Run forecast generation in a thread pool (non-blocking)."""
     loop = asyncio.get_event_loop()
     logger.info("scheduler: starting scheduled forecast run")
+    if _thread_pool is None:
+        raise RuntimeError("scheduler: thread pool is not initialized")
     await loop.run_in_executor(_thread_pool, _run_forecast_sync)
     logger.info("scheduler: scheduled forecast run complete")
 
@@ -295,6 +297,8 @@ async def _scheduled_evaluate_task() -> None:
     """Run evaluation of past forecasts in a thread pool (non-blocking)."""
     loop = asyncio.get_event_loop()
     logger.info("scheduler: starting scheduled evaluate run")
+    if _thread_pool is None:
+        raise RuntimeError("scheduler: thread pool is not initialized")
     await loop.run_in_executor(_thread_pool, _run_evaluate_sync)
     logger.info("scheduler: scheduled evaluate run complete")
 
@@ -314,6 +318,8 @@ async def _scheduled_consensus_evaluate_task() -> None:
     """Run evaluation of consensus records in a thread pool (non-blocking)."""
     loop = asyncio.get_event_loop()
     logger.info("scheduler: starting scheduled consensus evaluate run")
+    if _thread_pool is None:
+        raise RuntimeError("scheduler: thread pool is not initialized")
     await loop.run_in_executor(_thread_pool, _run_consensus_evaluate_sync)
     logger.info("scheduler: scheduled consensus evaluate run complete")
 
@@ -353,8 +359,50 @@ async def _scheduled_price_data_task() -> None:
     """Refresh price data for all active tickers in a thread pool (non-blocking)."""
     loop = asyncio.get_event_loop()
     logger.info("scheduler: starting price_data update")
+    if _thread_pool is None:
+        raise RuntimeError("scheduler: thread pool is not initialized")
     await loop.run_in_executor(_thread_pool, _run_price_data_update_sync)
     logger.info("scheduler: price_data update complete")
+
+
+def _run_intraday_update_sync() -> None:
+    """Fetch and save fresh hourly bars for all active tickers."""
+    _ensure_core_path()
+    os.chdir(_PROJECT_ROOT)
+    from scripts.core.sqlite_manager import SQLiteManager
+    from scripts.core.data_loader import fetch_intraday_yfinance
+    db = SQLiteManager(_db_manager.db_file)
+    tickers = db.get_active_tickers() if hasattr(db, "get_active_tickers") else []
+    if not tickers:
+        import sqlite3 as _sq
+        with _sq.connect(_db_manager.db_file) as con:
+            tickers = [r[0] for r in con.execute("SELECT ticker FROM settings WHERE active=1").fetchall()]
+    if not tickers:
+        logger.warning("scheduler: intraday_update — no active tickers")
+        return
+    updated = 0
+    for ticker in tickers:
+        try:
+            bars = fetch_intraday_yfinance(ticker, days=60, interval="1h")
+            if bars:
+                db.save_intraday_data(bars, ticker=ticker, interval="1h")
+                updated += 1
+                logger.info(f"scheduler: intraday updated for {ticker} ({len(bars)} bars)")
+            else:
+                logger.warning(f"scheduler: intraday_update — no data returned for {ticker}")
+        except Exception as e:
+            logger.error(f"scheduler: intraday_update error for {ticker}: {e}")
+    logger.info(f"scheduler: intraday_update done. updated={updated}/{len(tickers)}")
+
+
+async def _scheduled_intraday_task() -> None:
+    """Refresh hourly intraday bars for all active tickers (non-blocking)."""
+    loop = asyncio.get_event_loop()
+    logger.info("scheduler: starting intraday update")
+    if _thread_pool is None:
+        raise RuntimeError("scheduler: thread pool is not initialized")
+    await loop.run_in_executor(_thread_pool, _run_intraday_update_sync)
+    logger.info("scheduler: intraday update complete")
 
 
 async def _expire_queued_orders_task() -> None:
@@ -374,29 +422,78 @@ async def _expire_queued_orders_task() -> None:
         logger.error(f"scheduler: expire_queued_orders error: {e}")
 
 
+def _run_process_pending_orders_sync() -> None:
+    """Process all consensus records in PENDING_ORDER state — activate or expire them."""
+    _ensure_core_path()
+    os.chdir(_PROJECT_ROOT)
+    from scripts.core.sqlite_manager import SQLiteManager
+    from scripts.core.order_manager import activate_consensus_order
+    db = SQLiteManager(_db_manager.db_file)
+    try:
+        with sqlite3.connect(db.db_file) as con:
+            rows = con.execute(
+                "SELECT id, ticker FROM consensus WHERE order_state='PENDING_ORDER' AND trade_id IS NULL"
+            ).fetchall()
+    except Exception as e:
+        logger.error(f"scheduler: pending_orders — DB query failed: {e}")
+        return
+
+    if not rows:
+        return
+
+    logger.info(f"scheduler: pending_orders — processing {len(rows)} candidates")
+    for row_id, ticker in rows:
+        try:
+            result = activate_consensus_order(row_id, db)
+            logger.debug(f"scheduler: pending_orders consensus={row_id} {ticker} → {result['status']}: {result.get('message','')}")
+        except Exception as e:
+            logger.error(f"scheduler: pending_orders error for consensus={row_id} {ticker}: {e}")
+
+
+async def _scheduled_pending_orders_task() -> None:
+    """Activate pending consensus orders (non-blocking)."""
+    loop = asyncio.get_event_loop()
+    if _thread_pool is None:
+        raise RuntimeError("scheduler: thread pool is not initialized")
+    await loop.run_in_executor(_thread_pool, _run_process_pending_orders_sync)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 async def start_scheduler(db_manager) -> None:
     """Start all scheduler tasks. Call from FastAPI lifespan."""
-    global _db_manager, _running
+    global _db_manager, _running, _thread_pool
     _db_manager = db_manager
     _running = True
+
+    max_workers = _cfg_int("SCHEDULER_MAX_WORKERS", 4)
+    if max_workers < 1:
+        max_workers = 4
+    _thread_pool = concurrent.futures.ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix="scheduler-robot",
+    )
+    logger.info(f"scheduler: thread pool initialized with max_workers={max_workers}")
 
     max_retries = _cfg_int("SCHEDULER_MAX_RETRIES", 2)
     forecast_interval = _cfg_int("FORECAST_INTERVAL_MINUTES", 60) * 60
     evaluate_interval = _cfg_int("EVALUATE_INTERVAL_MINUTES", 120) * 60
     price_data_interval = _cfg_int("PRICE_DATA_INTERVAL_MINUTES", 60) * 60
+    intraday_interval = _cfg_int("INTRADAY_UPDATE_INTERVAL_MINUTES", 60) * 60
+    pending_orders_interval = _cfg_int("PENDING_ORDERS_INTERVAL_MINUTES", 1) * 60
 
     task_specs = [
-        ("heartbeat",              _heartbeat_task,                    30,                   True),
-        ("order_timeout_check",    _order_timeout_task,                15,                   False),
-        ("expire_queued_orders",   _expire_queued_orders_task,         300,                  False),
-        ("update_price_data",      _scheduled_price_data_task,         price_data_interval,  False),
-        ("scheduled_forecast",     _scheduled_forecast_task,           forecast_interval,    False),
-        ("scheduled_evaluate",     _scheduled_evaluate_task,           evaluate_interval,    False),
-        ("consensus_evaluate",     _scheduled_consensus_evaluate_task, evaluate_interval,    False),
+        ("heartbeat",              _heartbeat_task,                    30,                     True),
+        ("order_timeout_check",    _order_timeout_task,                15,                     False),
+        ("expire_queued_orders",   _expire_queued_orders_task,         300,                    False),
+        ("process_pending_orders", _scheduled_pending_orders_task,     pending_orders_interval, False),
+        ("update_price_data",      _scheduled_price_data_task,         price_data_interval,    False),
+        ("update_intraday",        _scheduled_intraday_task,           intraday_interval,      False),
+        ("scheduled_forecast",     _scheduled_forecast_task,           forecast_interval,      False),
+        ("scheduled_evaluate",     _scheduled_evaluate_task,           evaluate_interval,      False),
+        ("consensus_evaluate",     _scheduled_consensus_evaluate_task, evaluate_interval,      False),
     ]
 
     for name, factory, interval, run_on_start in task_specs:
@@ -419,7 +516,7 @@ async def start_scheduler(db_manager) -> None:
 
 async def stop_scheduler() -> None:
     """Cancel all scheduler tasks. Call from FastAPI lifespan shutdown."""
-    global _running
+    global _running, _thread_pool
     _running = False
     for name, task in _tasks.items():
         if not task.done():
@@ -430,6 +527,11 @@ async def stop_scheduler() -> None:
                 pass
             logger.info(f"scheduler: task '{name}' stopped")
     _tasks.clear()
+
+    if _thread_pool is not None:
+        _thread_pool.shutdown(wait=False, cancel_futures=True)
+        _thread_pool = None
+
     logger.info("scheduler: all tasks stopped")
 
 

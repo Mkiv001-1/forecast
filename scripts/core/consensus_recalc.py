@@ -213,7 +213,8 @@ def _process_group(
             method_stats[m]["timeframe_hours"] = int(r["timeframe_hours"])
     except Exception as e:
         logger.warning(f"consensus_recalc: could not load method_config: {e}")
-    # Enrich with ema_accuracy from providers
+    # Build model_stats keyed by AI model name (providers.name) for ema_accuracy lookup
+    model_stats = {}
     try:
         with db_manager._connect() as _con:
             _prov = pd.read_sql_query(
@@ -221,10 +222,8 @@ def _process_group(
             )
         for _, r in _prov.iterrows():
             m = str(r["name"])
-            if m not in method_stats:
-                method_stats[m] = {}
             if r["ema_accuracy"] is not None:
-                method_stats[m]["ema_accuracy"] = float(r["ema_accuracy"])
+                model_stats[m] = {"ema_accuracy": float(r["ema_accuracy"])}
     except Exception as e:
         logger.warning(f"consensus_recalc: could not load providers ema_accuracy: {e}")
 
@@ -243,7 +242,7 @@ def _process_group(
 
     # --- Calculate consensus — with run_id for tracking ---
     cons = calculate_consensus(raw_forecasts, method_stats, current_price=current_price, 
-                               run_id=run_id, log_ids=log_ids)
+                               run_id=run_id, log_ids=log_ids, model_stats=model_stats)
 
     # --- Save via save_consensus with override_date and run_id ---
     # If existing record, delete it first so save_consensus can insert fresh

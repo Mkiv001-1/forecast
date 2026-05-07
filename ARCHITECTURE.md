@@ -14,25 +14,52 @@ Client (PyQt6 GUI)
 Server (FastAPI, port 8000)
     │
     ├── scripts/core/              ← бизнес-логика
+    │   ├── forecast_runner.py     ← главный цикл (оркестратор)
     │   ├── scheduler.py            ← централизованный планировщик + heartbeat
-    │   ├── forecast_runner.py     ← главный цикл
     │   ├── forecast_engine.py     ← промпты → OpenRouter → R/R валидация
     │   ├── multi_model_forecaster.py ← запуск N моделей × M методов
     │   ├── consensus.py           ← медианная агрегация + фильтр аномалий
     │   ├── consensus_evaluator.py ← оценка консенсуса постфактум
-    │   ├── consensus_recalc.py    ← ретроспективный пересчет
+    │   ├── consensus_recalc.py    ← ретроспективный пересчет консенсуса
     │   ├── market_regime.py       ← ADX + MA → режим рынка
+    │   ├── market_context.py      ← макро-контекст (SPY, VIX)
     │   ├── indicators.py          ← технические индикаторы
     │   ├── data_loader.py         ← yfinance / Alpha Vantage / Finnhub
+    │   ├── smart_data_loader.py   ← умный выбор источника данных
     │   ├── sqlite_manager.py      ← ORM-обёртка над SQLite (WAL + WriteQueue)
     │   ├── unified_logs_manager.py ← управление таблицей logs
     │   ├── actuals_evaluator.py   ← оценка по High/Low + приоритет стопа
     │   ├── capital_provider.py    ← источник капитала из IB
     │   ├── position_sizer.py      ← расчет позиции от NetLiquidation
-    │   ├── order_manager.py       ← bracket-ордера + атомарность
+    │   ├── order_manager.py       ← bracket-ордера + атомарность + execute-флаги
     │   ├── ib_gateway_client.py   ← IB Gateway: позиции + балансы + спред
     │   ├── circuit_breaker.py     ← защита от сбоев OpenRouter
-    │   └── model_performance_tracker.py ← EMA-веса моделей
+    │   ├── model_performance_tracker.py ← EMA-веса моделей
+    │   ├── ai_client.py           ← клиент OpenRouter (HTTP + retry)
+    │   ├── providers_manager.py   ← управление AI-провайдерами
+    │   ├── prompt_manager.py      ← управление промпт-шаблонами
+    │   ├── data_manager.py        ← абстракция над хранилищем данных
+    │   ├── notification_manager.py ← уведомления (MANUAL_INTERVENTION_REQUIRED)
+    │   ├── single_instance.py     ← PID-защита от дублирования процессов
+    │   ├── migrate.py             ← миграции схемы SQLite
+    │   ├── config.py              ← legacy-константы (fallback)
+    │   ├── alpha_vantage_loader.py ← загрузчик Alpha Vantage
+    │   └── finnhub_loader.py      ← загрузчик Finnhub
+    │
+    │   scripts/server/            ← FastAPI + фоновые задачи
+    │   ├── api.py                 ← REST эндпоинты
+    │   ├── robot.py               ← фоновый runner (thread wrapper)
+    │   ├── config.py              ← server_config.ini парсер
+    │   └── main.py                ← точка входа (uvicorn)
+    │
+    │   scripts/client/            ← PyQt6 GUI
+    │   ├── gui_main.py            ← главное окно + вкладки
+    │   ├── api_client.py          ← HTTP-клиент для API
+    │   ├── config.py              ← client_config.ini парсер
+    │   └── main.py                ← точка входа (QApplication)
+    │
+    │   scripts/shared/            ← общие модели
+    │   └── models.py              ← Pydantic модели для API
     │
     └── trading_robot.db       ← SQLite (единое хранилище)
 ```
@@ -128,9 +155,10 @@ Server (FastAPI, port 8000)
 
 ### Компоненты бизнес-логики
 
-**`main_excel.py`** — оркестратор процесса
+**`forecast_runner.py`** — оркестратор процесса
 - Загружает активные тикеры из `settings`
-- Последовательно вызывает: `data_loader` → `indicators` → `market_regime` → `multi_model_forecaster`
+- Последовательно вызывает: `data_loader` → `indicators` → `market_regime` → `multi_model_forecaster` → `consensus` → `order_manager` (опционально)
+- Создаёт `forecast_run` запись для аудита
 - Сохраняет результаты в `logs` и `consensus`
 
 **`forecast_engine.py`** — генерация прогнозов
@@ -146,8 +174,16 @@ Server (FastAPI, port 8000)
 
 **`consensus.py`** — агрегация сигналов
 - Группирует сигналы по тикеру
-- Взвешенное голосование: `confidence` × `model_reliability_weight`
-- Финальный сигнал: доминирующее направление с усреднённой целью
+- **Двухуровневая точность:** `method_stats` (по методу) и `model_stats` (по AI-модели); `model_stats` имеет приоритет для `ema_accuracy`
+- **Формула веса:** `weight = raw_confidence × win_rate × ema_weight`
+  - `raw_confidence` — 0..1 (нормализованная уверенность модели, не калиброванная)
+  - `ema_weight = max(0.3, min(1.5, ema_accuracy × 2))` — исторический EMA accuracy
+  - `win_rate` — доля прибыльных прогнозов метода за последние 30 дней
+- **Calibrated confidence** — рассчитывается для аналитики (`calibration_factor = ema_acc / 0.5`), НЕ влияет на вес (предотвращает двойной счёт)
+- **`total_weight`** — накапливается только для не-filtered прогнозов (после `continue`)
+- Финальный сигнал: доминирующее направление, медианная цель/стоп
+- Фильтры: аномалии (>15% от цены), разногласие (minority >40%), ожидаемая ценность (`expected_r < 0.5`)
+- `exit_successful` сохраняется в `consensus`: `1` = target first, `0` = stop first, `NULL` = open
 
 **`market_regime.py`** — адаптация к рынку
 - ADX > 25 + цена > MA → трендовые методы (`momentum_trend`, `breakout`)
@@ -218,7 +254,20 @@ Yahoo Finance / Alpha Vantage / Finnhub
 | Дата | Пункт | Статус |
 |------|-------|--------|
 | 2026-05-06 | **Google Sheets (`gspread`) удалён** — legacy-зависимость с устаревшей oauth2client; код (`save_price_data_to_sheet`) и документация очищены | ✅ Выполнено |
+| 2026-05-07 | **`main_excel.py` удалён** — заменён на `forecast_runner.py`; ARCHITECTURE.md и README.md синхронизированы | ✅ Выполнено |
 
 1. **PAUSED статус для ордеров.** Не реализована логика: (a) перевод QUEUED в PAUSED при потере связи с IB, (b) автоматический resubmit в QUEUED при восстановлении, (c) проверка актуальности цен перед resubmit после длительной паузы. Текущее поведение: QUEUED-ордера expire по `ORDER_QUEUE_MAX_AGE_HOURS` (задача `expire_queued_orders` в scheduler.py), ручной resubmit через API `/orders/submit`.
+
+2. **`forecast_runner.py` — God Object.** `process_ticker()` делает загрузку данных, индикаторы, прогнозы, консенсус, ордера (~120 строк). Нужно декомпозировать на pipeline-стадии.
+
+3. **Дублирование `sys.path` манипуляций.** `forecast_runner.py`, `robot.py`, `scheduler.py`, `api.py` — все содержат идентичные блоки `sys.path.insert`. Нужен единый `bootstrap.py` или `PYTHONPATH` в скриптах запуска.
+
+4. **Ad-hoc SQL в `forecast_runner.py` и `scheduler.py`.** Прямые запросы к SQLite вместо методов `sqlite_manager.py`. Нарушает инкапсуляцию и дублирует логику.
+
+5. **Разделение `robot.py` и `forecast_runner.py`.** `robot.py` — thin wrapper вокруг `forecast_runner.py`. Можно объединить или сделать `robot.py` чистым FastAPI-адаптером.
+
+6. **Отсутствие централизованного DI-контейнера.** `db_manager` передаётся через аргументы, но часто создаётся заново внутри функций (`SQLiteManager(db_file)`). Нужен `AppContext` или `Container`.
+
+7. **Типизация.** Большинство core-модулей не используют type hints. Усложняет рефакторинг и поиск ошибок.
 
 ---

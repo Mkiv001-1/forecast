@@ -1,13 +1,23 @@
 """
 Position sizer — calculates safe position size for a given signal.
 
-Logic:
-  1. risk = NetLiquidation × DEFAULT_RISK_PCT
-  2. qty  = risk / |entry - stop_loss|
-  3. Clamp to MAX_POSITION_PCT × NetLiquidation / entry
-  4. Sector correlation check:
-       > MAX_SECTOR_EXPOSURE_PCT  → qty × SECTOR_OVERWEIGHT_FACTOR
-       > MAX_SECTOR_HARD_LIMIT_PCT → reject (SKIPPED_SECTOR_OVERWEIGHT)
+Modes (controlled by RISK_MODE config key):
+
+  percent_of_capital (default / legacy):
+    risk = NetLiquidation × DEFAULT_RISK_PCT
+    qty  = risk / |entry - stop_loss|
+    Clamp to MAX_POSITION_PCT × NetLiquidation / entry
+
+  percent_of_portfolio_on_stop:
+    Portfolio value = NetLiquidation of the account set in RISK_ACCOUNT_ID (from IB).
+    risk = portfolio_value × (RISK_PERCENT_ON_STOP / 100)
+    qty  = risk / |entry - stop_loss|
+    Clamp to MAX_POSITION_PCT × portfolio_value / entry
+    Fail-safe controlled by IB_CAPITAL_FAILSAFE config key.
+
+Both modes apply sector correlation checks:
+  > MAX_SECTOR_EXPOSURE_PCT  → qty × SECTOR_OVERWEIGHT_FACTOR
+  > MAX_SECTOR_HARD_LIMIT_PCT → reject (SKIPPED_SECTOR_OVERWEIGHT)
 """
 
 import logging
@@ -21,6 +31,14 @@ def _cfg(db_manager, key: str, default: float) -> float:
     try:
         v = db_manager.get_config_value(key)
         return float(v) if v is not None and str(v).strip() else default
+    except Exception:
+        return default
+
+
+def _get_str_config(db_manager, key: str, default: str) -> str:
+    try:
+        v = db_manager.get_config_value(key)
+        return str(v).strip() if v is not None and str(v).strip() else default
     except Exception:
         return default
 
@@ -73,13 +91,24 @@ def calculate_position(
     Returns dict with keys:
       quantity        (int, shares)
       risk_amount     (float, USD at risk)
-      risk_pct        (float, fraction of NetLiquidation)
+      risk_pct        (float, fraction of portfolio/capital used for risk)
       position_value  (float, entry × quantity)
       sector          (str)
       sector_exposure_at_signal (float, existing sector exposure USD)
+      capital_source  (str, 'ib' | 'manual_override' | 'provided' | 'legacy')
+      risk_mode       (str, active RISK_MODE value)
       status          (str: OK | SKIPPED_SECTOR_OVERWEIGHT | SKIPPED_ZERO_RISK |
-                            SKIPPED_INVALID_STOP | SKIPPED_NO_CAPITAL)
+                            SKIPPED_INVALID_STOP | SKIPPED_NO_CAPITAL |
+                            SKIPPED_CAPITAL_UNAVAILABLE)
     """
+    risk_mode = _get_str_config(db_manager, "RISK_MODE", "percent_of_capital")
+
+    if risk_mode == "percent_of_portfolio_on_stop":
+        return _calculate_portfolio_risk_mode(
+            ticker, entry_price, stop_loss, db_manager
+        )
+
+    # --- Legacy: percent_of_capital ---
     if net_liquidation is None:
         from capital_provider import get_net_liquidation
         net_liquidation = get_net_liquidation(db_manager)
@@ -130,7 +159,7 @@ def calculate_position(
     actual_risk_pct = risk_amount / net_liquidation
 
     logger.info(
-        f"position_sizer: {ticker} qty={qty} entry={entry_price:.2f} "
+        f"position_sizer [{risk_mode}]: {ticker} qty={qty} entry={entry_price:.2f} "
         f"stop={stop_loss:.2f} risk={risk_amount:.2f} ({actual_risk_pct*100:.2f}%)"
     )
 
@@ -141,6 +170,110 @@ def calculate_position(
         "position_value":            round(position_value, 2),
         "sector":                    sector,
         "sector_exposure_at_signal": round(sector_exposure, 2),
+        "capital_source":            "provided" if net_liquidation else "legacy",
+        "risk_mode":                 risk_mode,
+        "status":                    "OK",
+    }
+
+
+def _calculate_portfolio_risk_mode(
+    ticker: str,
+    entry_price: float,
+    stop_loss: float,
+    db_manager,
+) -> dict:
+    """
+    Position sizing using percent_of_portfolio_on_stop mode.
+
+    qty = (portfolio_value × RISK_PERCENT_ON_STOP/100) / |entry - stop_loss|
+    """
+    from capital_provider import get_portfolio_net_liquidation, CapitalUnavailableError
+
+    risk_mode = "percent_of_portfolio_on_stop"
+
+    try:
+        portfolio_value, capital_source = get_portfolio_net_liquidation(db_manager)
+    except CapitalUnavailableError as e:
+        logger.error(f"position_sizer [{risk_mode}]: {ticker} capital unavailable — {e}")
+        return _reject_with_meta(
+            "SKIPPED_CAPITAL_UNAVAILABLE", ticker, 0, 0, "", 0,
+            capital_source="unavailable", risk_mode=risk_mode
+        )
+
+    if portfolio_value <= 0:
+        return _reject_with_meta(
+            "SKIPPED_NO_CAPITAL", ticker, 0, 0, "", 0,
+            capital_source=capital_source, risk_mode=risk_mode
+        )
+
+    if stop_loss <= 0 or entry_price <= 0:
+        return _reject_with_meta(
+            "SKIPPED_INVALID_STOP", ticker, portfolio_value, 0, "", 0,
+            capital_source=capital_source, risk_mode=risk_mode
+        )
+
+    stop_distance = abs(entry_price - stop_loss)
+    if stop_distance < 0.0001:
+        return _reject_with_meta(
+            "SKIPPED_ZERO_RISK", ticker, portfolio_value, 0, "", 0,
+            capital_source=capital_source, risk_mode=risk_mode
+        )
+
+    risk_pct_cfg      = _cfg(db_manager, "RISK_PERCENT_ON_STOP",      1.0)
+    max_position_pct  = _cfg(db_manager, "MAX_POSITION_PCT",          0.05)
+    soft_limit_pct    = _cfg(db_manager, "MAX_SECTOR_EXPOSURE_PCT",   0.15)
+    hard_limit_pct    = _cfg(db_manager, "MAX_SECTOR_HARD_LIMIT_PCT", 0.25)
+    overweight_factor = _cfg(db_manager, "SECTOR_OVERWEIGHT_FACTOR",  0.5)
+
+    risk_pct_fraction = risk_pct_cfg / 100.0          # e.g. 1.0 → 0.01
+    risk_amount = portfolio_value * risk_pct_fraction
+    qty_by_risk = risk_amount / stop_distance
+
+    max_qty_by_position = (portfolio_value * max_position_pct) / entry_price
+    qty = min(qty_by_risk, max_qty_by_position)
+
+    # --- Sector check ---
+    sector = _get_ticker_sector(db_manager, ticker)
+    sector_exposure = _get_sector_exposure(db_manager, sector) if sector else 0.0
+    sector_exposure_pct = sector_exposure / portfolio_value if portfolio_value > 0 else 0.0
+
+    if sector_exposure_pct > hard_limit_pct:
+        logger.warning(
+            f"position_sizer [{risk_mode}]: {ticker} sector '{sector}' "
+            f"at {sector_exposure_pct*100:.1f}% > hard limit {hard_limit_pct*100:.0f}% → rejected"
+        )
+        return _reject_with_meta(
+            "SKIPPED_SECTOR_OVERWEIGHT", ticker, portfolio_value, risk_amount, sector, sector_exposure,
+            capital_source=capital_source, risk_mode=risk_mode
+        )
+
+    if sector_exposure_pct > soft_limit_pct:
+        logger.info(
+            f"position_sizer [{risk_mode}]: {ticker} sector '{sector}' "
+            f"at {sector_exposure_pct*100:.1f}% > soft limit → qty × {overweight_factor}"
+        )
+        qty *= overweight_factor
+
+    qty = max(0, int(qty))
+    position_value = qty * entry_price
+    actual_risk_pct = risk_amount / portfolio_value
+
+    logger.info(
+        f"position_sizer [{risk_mode}]: {ticker} qty={qty} entry={entry_price:.2f} "
+        f"stop={stop_loss:.2f} stop_distance={stop_distance:.4f} "
+        f"risk={risk_amount:.2f} ({actual_risk_pct*100:.2f}%) "
+        f"portfolio={portfolio_value:,.2f} source={capital_source}"
+    )
+
+    return {
+        "quantity":                  qty,
+        "risk_amount":               round(risk_amount, 2),
+        "risk_pct":                  round(actual_risk_pct, 6),
+        "position_value":            round(position_value, 2),
+        "sector":                    sector,
+        "sector_exposure_at_signal": round(sector_exposure, 2),
+        "capital_source":            capital_source,
+        "risk_mode":                 risk_mode,
         "status":                    "OK",
     }
 
@@ -154,5 +287,32 @@ def _reject(reason: str, ticker: str, net_liq: float, risk_amount: float, sector
         "position_value":            0.0,
         "sector":                    sector,
         "sector_exposure_at_signal": round(sector_exp, 2),
+        "capital_source":            "legacy",
+        "risk_mode":                 "percent_of_capital",
+        "status":                    reason,
+    }
+
+
+def _reject_with_meta(
+    reason: str,
+    ticker: str,
+    net_liq: float,
+    risk_amount: float,
+    sector: str,
+    sector_exp: float,
+    *,
+    capital_source: str,
+    risk_mode: str,
+) -> dict:
+    logger.warning(f"position_sizer [{risk_mode}]: {ticker} rejected — {reason}")
+    return {
+        "quantity":                  0,
+        "risk_amount":               round(risk_amount, 2),
+        "risk_pct":                  0.0,
+        "position_value":            0.0,
+        "sector":                    sector,
+        "sector_exposure_at_signal": round(sector_exp, 2),
+        "capital_source":            capital_source,
+        "risk_mode":                 risk_mode,
         "status":                    reason,
     }

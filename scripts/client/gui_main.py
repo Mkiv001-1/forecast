@@ -3,7 +3,7 @@
 import os
 import sys
 import logging
-from typing import List, Optional
+from typing import Callable, List, Optional, Set
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
@@ -32,6 +32,7 @@ _SIDE_COLORS = {
     "SHORT": QColor("#ffcdd2"),
     "NEUTRAL": QColor("#f5f5f5"),
 }
+_TEST_ROW_COLOR = QColor("#e3f2fd")
 _EVALUATED_DIM = 40
 
 METHODS = [
@@ -536,7 +537,7 @@ class ConsensusTab(QWidget):
         "Date", "Eval Date", "Ticker", "Signal", "Conf%",
         "Target", "Stop", "Entry",
         "Actual Close", "Dir", "Tgt Hit", "Stp Hit", "First Hit", "PnL%", "R", "Status",
-        "Disagree",
+        "Disagree", "Trade ID", "Trade Status", "Action",
     ]
 
     def __init__(self, api: ForecastApiClient, parent=None):
@@ -545,6 +546,7 @@ class ConsensusTab(QWidget):
         self._records: List[ConsensusRecord] = []
         self._visible: List[ConsensusRecord] = []
         self._current_record: Optional[ConsensusRecord] = None
+        self._placing_consensus_ids: Set[int] = set()
         self._build_ui()
 
     def _build_ui(self):
@@ -891,6 +893,45 @@ class ConsensusTab(QWidget):
         self.stat_avg_pnl.setText(f"Avg PnL: {avg_pnl}")
         self.stat_pending.setText(f"Pending: {len(pending)}")
 
+    @staticmethod
+    def _trade_status_text(rec: ConsensusRecord) -> str:
+        order_state = str(rec.order_state or "").upper()
+        try:
+            if rec.trade_id is not None and str(rec.trade_id).strip() != "":
+                return "traded"
+        except Exception:
+            pass
+        if order_state == "ORDER_SUBMITTED":
+            return "traded"
+        if order_state == "PENDING_ORDER":
+            return "pending"
+        if order_state == "EXPIRED":
+            return "expired"
+        if order_state == "ORDER_SKIPPED":
+            return "skipped"
+        return "new"
+
+    def _place_trade_disabled_reason(self, rec: ConsensusRecord) -> str:
+        if rec.id is None:
+            return "No consensus ID"
+        if rec.trade_id is not None and str(rec.trade_id).strip() != "":
+            return "Trade already created"
+        signal = str(rec.signal or "").upper()
+        if signal not in ("LONG", "SHORT"):
+            return "Only LONG/SHORT can be traded"
+        order_state = str(rec.order_state or "").upper()
+        if order_state in ("ORDER_SUBMITTED", "PENDING_ORDER", "EXPIRED"):
+            return f"Order state: {order_state}"
+        try:
+            if int(rec.id) in self._placing_consensus_ids:
+                return "Trade is being placed"
+        except Exception:
+            pass
+        return ""
+
+    def _can_place_trade(self, rec: ConsensusRecord) -> bool:
+        return self._place_trade_disabled_reason(rec) == ""
+
     def _populate_table(self):
         signal_filter = self.signal_combo.currentData() or ""
         eval_filter   = self.eval_combo.currentData() or ""
@@ -923,6 +964,7 @@ class ConsensusTab(QWidget):
             date_str = str(rec.date or "")[:16]
             has_disagreement = rec.high_model_disagreement or (rec.rationale and "disagreement" in rec.rationale.lower())
             eval_status = str(rec.eval_status or "")
+            trade_status = self._trade_status_text(rec)
             eval_date_str = str(rec.eval_target_date or "")[:16]
             cells = [
                 date_str,                    # Date
@@ -942,6 +984,9 @@ class ConsensusTab(QWidget):
                 _fmtp(rec.r_multiple),       # R
                 eval_status,                   # Status
                 "⚠️" if has_disagreement else "", # Disagree
+                str(rec.trade_id or ""),     # Trade ID
+                trade_status,                 # Trade Status
+                "",                          # Action (button widget)
             ]
             for col, val in enumerate(cells):
                 item = QTableWidgetItem(val)
@@ -949,6 +994,18 @@ class ConsensusTab(QWidget):
                 if col == 0:
                     item.setData(Qt.ItemDataRole.UserRole, row_idx)
                 self.table.setItem(row_idx, col, item)
+
+            action_col = self._TABLE_COLS.index("Action")
+            place_btn = QPushButton("Place Trade")
+            place_btn.setProperty("consensus_id", rec.id)
+            place_btn.clicked.connect(lambda _=False, cid=rec.id: self._on_place_trade_clicked(cid))
+            disabled_reason = self._place_trade_disabled_reason(rec)
+            if disabled_reason:
+                place_btn.setEnabled(False)
+                place_btn.setToolTip(disabled_reason)
+            else:
+                place_btn.setToolTip("Create trade record and related orders")
+            self.table.setCellWidget(row_idx, action_col, place_btn)
 
             # Color by signal first, then override eval result column
             signal = str(rec.signal or "").upper()
@@ -978,9 +1035,136 @@ class ConsensusTab(QWidget):
                 elif eval_status == "PENDING":
                     status_item.setForeground(QBrush(QColor("#e65100")))
 
+            trade_status_col = self._TABLE_COLS.index("Trade Status")
+            trade_status_item = self.table.item(row_idx, trade_status_col)
+            if trade_status_item:
+                if trade_status == "traded":
+                    trade_status_item.setForeground(QBrush(QColor("#1b5e20")))
+                elif trade_status == "pending":
+                    trade_status_item.setForeground(QBrush(QColor("#e65100")))
+                elif trade_status in ("expired", "skipped"):
+                    trade_status_item.setForeground(QBrush(QColor("#888888")))
+
         self.table.setSortingEnabled(True)
         self.table.resizeColumnsToContents()
         self.count_label.setText(f"Found: {len(self._visible)}")
+
+    def _on_place_trade_clicked(self, consensus_id):
+        if consensus_id is None:
+            QMessageBox.warning(self, "Place Trade", "Consensus ID is missing.")
+            return
+
+        rec = next((r for r in self._records if r.id == consensus_id), None)
+        if rec is None:
+            QMessageBox.warning(self, "Place Trade", "Consensus record not found in current dataset.")
+            return
+
+        disabled_reason = self._place_trade_disabled_reason(rec)
+        if disabled_reason:
+            QMessageBox.information(self, "Place Trade", f"Trade is unavailable: {disabled_reason}")
+            return
+
+        preview = {}
+        preview_note = ""
+        quantity_text = "N/A"
+        risk_amount_text = "N/A"
+        risk_mode_text = "N/A"
+        capital_source_text = "N/A"
+        try:
+            preview = self.api.preview_consensus_trade(int(consensus_id))
+            preview_status = str(preview.get("status", ""))
+            preview_message = str(preview.get("message", "")).strip()
+            qty = preview.get("quantity")
+            if qty is not None and str(qty).strip() != "":
+                quantity_text = str(qty)
+            risk_amount = preview.get("risk_amount")
+            if risk_amount is not None and str(risk_amount).strip() != "":
+                try:
+                    risk_amount_text = f"{float(risk_amount):.2f}"
+                except Exception:
+                    risk_amount_text = str(risk_amount)
+            risk_mode = preview.get("risk_mode")
+            if risk_mode is not None and str(risk_mode).strip() != "":
+                risk_mode_text = str(risk_mode)
+            capital_source = preview.get("capital_source")
+            if capital_source is not None and str(capital_source).strip() != "":
+                capital_source_text = str(capital_source)
+            if preview_status and preview_status.upper() != "OK":
+                preview_note = f"Preview: {preview_status} {preview_message}".strip()
+        except Exception as e:
+            preview_note = f"Preview unavailable: {e}"
+
+        signal = str(rec.signal or "").upper()
+        entry_action = "BUY" if signal == "LONG" else "SELL"
+        exit_action = "SELL" if signal == "LONG" else "BUY"
+        if rec.entry_limit_price is not None:
+            try:
+                entry_price_text = f"{float(rec.entry_limit_price):.2f}"
+            except Exception:
+                entry_price_text = str(rec.entry_limit_price)
+            entry_order_type = "LMT"
+        else:
+            entry_price_text = "Market"
+            entry_order_type = "MKT"
+
+        try:
+            target_price_text = f"{float(rec.target_price):.2f}" if rec.target_price is not None else "N/A"
+        except Exception:
+            target_price_text = str(rec.target_price)
+        try:
+            stop_price_text = f"{float(rec.stop_loss):.2f}" if rec.stop_loss is not None else "N/A"
+        except Exception:
+            stop_price_text = str(rec.stop_loss)
+
+        details = (
+            f"Ticker: {str(rec.ticker or '')}\n"
+            f"Consensus ID: {consensus_id}\n"
+            f"Signal: {signal}\n"
+            f"Quantity: {quantity_text}\n"
+            f"Risk Amount: {risk_amount_text}\n"
+            f"Risk Mode: {risk_mode_text}\n"
+            f"Capital Source: {capital_source_text}\n"
+            f"\n"
+            f"Prices:\n"
+            f"- Entry: {entry_price_text}\n"
+            f"- Target: {target_price_text}\n"
+            f"- Stop: {stop_price_text}\n"
+            f"\n"
+            f"Orders to place:\n"
+            f"1. ENTRY: {entry_action} {entry_order_type}\n"
+            f"2. TAKE_PROFIT: {exit_action} LMT\n"
+            f"3. STOP_LOSS: {exit_action} STP\n"
+            f"\n"
+            f"{preview_note + chr(10) if preview_note else ''}"
+            f"Continue?"
+        )
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Place Trade",
+            details,
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if confirm != QMessageBox.StandardButton.Ok:
+            return
+
+        consensus_id = int(consensus_id)
+        self._placing_consensus_ids.add(consensus_id)
+        try:
+            result = self.api.activate_consensus(consensus_id)
+            status = str(result.get("status", ""))
+            message = str(result.get("message", "")).strip()
+            if status.upper() in ("SUBMITTED", "ORDER_SUBMITTED"):
+                QMessageBox.information(self, "Place Trade", message or "Trade submitted successfully.")
+            elif status:
+                QMessageBox.information(self, "Place Trade", f"{status}: {message}".strip())
+            else:
+                QMessageBox.information(self, "Place Trade", message or "Request completed.")
+        except Exception as e:
+            QMessageBox.warning(self, "Place Trade", f"Failed to place trade:\n{e}")
+        finally:
+            self._placing_consensus_ids.discard(consensus_id)
+            self.load()
 
     def _on_selection_changed(self):
         row = self.table.currentRow()
@@ -1676,6 +1860,17 @@ class _IBSettingsSubTab(QWidget):
         client_id_row.addStretch()
         conn_layout.addLayout(client_id_row)
 
+        workers_row = QHBoxLayout()
+        workers_row.addWidget(QLabel("Scheduler Max Workers:"))
+        self.scheduler_workers_spin = QSpinBox()
+        self.scheduler_workers_spin.setRange(1, 16)
+        self.scheduler_workers_spin.setValue(4)
+        self.scheduler_workers_spin.setMaximumWidth(120)
+        workers_row.addWidget(self.scheduler_workers_spin)
+        workers_row.addWidget(QLabel("Thread pool size for scheduler background tasks"))
+        workers_row.addStretch()
+        conn_layout.addLayout(workers_row)
+
         layout.addWidget(conn_group)
 
         # Trading Settings
@@ -1763,6 +1958,7 @@ class _IBSettingsSubTab(QWidget):
             "IB_HOST": self.host_edit.text().strip() or "127.0.0.1",
             "IB_PORT": self.port_edit.text().strip() or "7497",
             "IB_CLIENT_ID": self.client_id_edit.text().strip() or "1",
+            "SCHEDULER_MAX_WORKERS": str(self.scheduler_workers_spin.value()),
         }
         errors = []
         for key, value in keys.items():
@@ -1782,6 +1978,11 @@ class _IBSettingsSubTab(QWidget):
             self.host_edit.setText(cfg_map.get("IB_HOST", "127.0.0.1"))
             self.port_edit.setText(cfg_map.get("IB_PORT", "7497"))
             self.client_id_edit.setText(cfg_map.get("IB_CLIENT_ID", "1"))
+            workers = cfg_map.get("SCHEDULER_MAX_WORKERS", "4")
+            try:
+                self.scheduler_workers_spin.setValue(max(1, min(16, int(workers))))
+            except Exception:
+                self.scheduler_workers_spin.setValue(4)
         except Exception:
             pass
 
@@ -3019,7 +3220,7 @@ class SchedulerTab(QWidget):
 class OrdersTab(QWidget):
     """Tab showing all orders from the orders table with cancel support."""
 
-    _COLUMNS = ["ID", "Ticker", "Side", "Qty", "Price", "Status", "Type", "Account", "IB Order ID", "Created At"]
+    _COLUMNS = ["ID", "Ticker", "Action", "Qty", "Price", "Status", "Type", "Role", "Account", "IB Order ID", "Created At"]
     _STATUS_COLORS = {
         "FILLED": QColor("#c8e6c9"),
         "CANCELLED": QColor("#ffcdd2"),
@@ -3028,10 +3229,19 @@ class OrdersTab(QWidget):
         "PENDING": QColor("#fff9c4"),
     }
 
-    def __init__(self, api: ForecastApiClient, parent=None):
+    def __init__(
+        self,
+        api: ForecastApiClient,
+        open_trade_callback: Optional[Callable[[str, Optional[int]], None]] = None,
+        parent=None,
+    ):
         super().__init__(parent)
         self.api = api
+        self._open_trade_callback = open_trade_callback
         self._orders: list = []
+        self._visible_orders: list = []
+        self._linked_parent_id: Optional[int] = None
+        self._last_error = ""
         self._build_ui()
 
     def _build_ui(self):
@@ -3056,9 +3266,21 @@ class OrdersTab(QWidget):
         self.refresh_btn.clicked.connect(self.load)
         filter_row.addWidget(self.refresh_btn)
 
+        self.reset_btn = QPushButton("✕ Reset Filters")
+        self.reset_btn.clicked.connect(self.reset_filters)
+        filter_row.addWidget(self.reset_btn)
+
         self.cancel_btn = QPushButton("❌ Cancel Selected")
         self.cancel_btn.clicked.connect(self._cancel_selected)
         filter_row.addWidget(self.cancel_btn)
+
+        self.export_btn = QPushButton("📥 Export CSV")
+        self.export_btn.clicked.connect(self._export_csv)
+        filter_row.addWidget(self.export_btn)
+
+        self.find_trade_btn = QPushButton("↪ Show In Trades")
+        self.find_trade_btn.clicked.connect(self._open_selected_in_trades)
+        filter_row.addWidget(self.find_trade_btn)
 
         filter_row.addStretch()
         self.total_label = QLabel("Orders: 0")
@@ -3069,11 +3291,25 @@ class OrdersTab(QWidget):
         self.table = QTableWidget(0, len(self._COLUMNS))
         self.table.setHorizontalHeaderLabels(self._COLUMNS)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(10, QHeaderView.ResizeMode.Stretch)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setAlternatingRowColors(True)
+        self.table.itemDoubleClicked.connect(lambda _: self._open_selected_in_trades())
+        self.table.itemSelectionChanged.connect(self._update_details)
         layout.addWidget(self.table, 1)
+
+        self.state_label = QLabel("")
+        self.state_label.setStyleSheet("color: #616161;")
+        layout.addWidget(self.state_label)
+
+        self.details_label = QLabel("Selected order: —")
+        self.details_label.setStyleSheet("color: #424242;")
+        layout.addWidget(self.details_label)
+
+        self.linked_label = QLabel("")
+        self.linked_label.setStyleSheet("color: #1565c0;")
+        layout.addWidget(self.linked_label)
 
     def load(self):
         ticker = self.ticker_filter.text().strip() or None
@@ -3081,58 +3317,536 @@ class OrdersTab(QWidget):
         status = None if status == "All" else status
         try:
             self._orders = self.api.get_orders(ticker=ticker, status=status, limit=500)
+            self._last_error = ""
         except Exception as e:
             logger.warning(f"OrdersTab.load error: {e}")
+            self._last_error = str(e)
             self._orders = []
         self._populate()
 
     def _populate(self):
         orders = self._orders
-        self.table.setRowCount(len(orders))
+        if self._linked_parent_id is not None:
+            orders = [
+                o for o in orders
+                if str(o.get("ib_parent_id", "") or "") == str(self._linked_parent_id)
+            ]
+        self._visible_orders = list(orders)
+        self.table.setRowCount(len(self._visible_orders))
         for row, o in enumerate(orders):
+            is_test = bool(o.get("is_test", 0))
+            test_tag = str(o.get("test_tag", "") or "").strip()
+            ticker_val = str(o.get("ticker", ""))
+            if is_test:
+                ticker_val = f"{ticker_val} [TEST]" if not test_tag else f"{ticker_val} [TEST:{test_tag}]"
             vals = [
                 str(o.get("id", "")),
-                str(o.get("ticker", "")),
-                str(o.get("side", "")),
+                ticker_val,
+                str(o.get("action", "")),
                 str(o.get("quantity", "")),
                 str(o.get("limit_price", "") or ""),
                 str(o.get("status", "")),
                 str(o.get("order_type", "") or ""),
+                str(o.get("order_role", "") or ""),
                 str(o.get("account_type", "") or ""),
                 str(o.get("ib_order_id", "") or ""),
                 str(o.get("created_at", "") or ""),
             ]
             bg = self._STATUS_COLORS.get(o.get("status", ""))
+            if is_test:
+                bg = _TEST_ROW_COLOR
             for col, val in enumerate(vals):
                 item = QTableWidgetItem(val)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 if bg:
                     item.setBackground(QBrush(bg))
                 self.table.setItem(row, col, item)
+
         self.total_label.setText(f"Orders: {len(orders)}")
+        if self._last_error:
+            self.state_label.setStyleSheet("color: #c62828;")
+            self.state_label.setText(f"Orders load error: {self._last_error}")
+        elif not orders:
+            self.state_label.setStyleSheet("color: #616161;")
+            if self._linked_parent_id is not None:
+                self.state_label.setText(f"No orders found for parent #{self._linked_parent_id}.")
+            else:
+                self.state_label.setText("No orders found for selected filters.")
+        else:
+            self.state_label.setText("")
+
+        if self._linked_parent_id is not None:
+            self.linked_label.setText(f"Linked mode: parent #{self._linked_parent_id} from Trades")
+        else:
+            self.linked_label.setText("")
+
+        if orders:
+            self.table.selectRow(0)
+
+    def _open_selected_in_trades(self):
+        if self._open_trade_callback is None:
+            return
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            QMessageBox.information(self, "Info", "Select an order first.")
+            return
+        row = rows[0].row()
+        if row < 0 or row >= len(self._visible_orders):
+            return
+        order = self._visible_orders[row]
+        ticker = str(order.get("ticker", "") or "").strip()
+        if not ticker:
+            QMessageBox.information(self, "Info", "Selected order has no ticker.")
+            return
+        parent_id = order.get("ib_parent_id")
+        try:
+            parent_id = int(parent_id) if parent_id not in (None, "") else None
+        except Exception:
+            parent_id = None
+        self._open_trade_callback(ticker, parent_id)
+
+    def open_from_trade(self, ticker: str, parent_id: Optional[int] = None):
+        self.ticker_filter.setText(str(ticker or ""))
+        self._linked_parent_id = parent_id
+        self.load()
+
+    def reset_filters(self):
+        self.ticker_filter.clear()
+        self.status_filter.setCurrentText("All")
+        self._linked_parent_id = None
+        self.load()
+
+    def _update_details(self):
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            self.details_label.setText("Selected order: —")
+            return
+        row = rows[0].row()
+        if row < 0 or row >= len(self._visible_orders):
+            self.details_label.setText("Selected order: —")
+            return
+        order = self._visible_orders[row]
+        order_id = order.get("id", "")
+        ticker = order.get("ticker", "")
+        status = order.get("status", "")
+        role = order.get("order_role", "")
+        parent_id = order.get("ib_parent_id", "")
+        test_suffix = ""
+        if bool(order.get("is_test", 0)):
+            tag = str(order.get("test_tag", "") or "").strip()
+            test_suffix = "  TEST" if not tag else f"  TEST:{tag}"
+        self.details_label.setText(
+            f"Selected order: #{order_id}  {ticker}  status={status}  role={role}  parent={parent_id}{test_suffix}"
+        )
 
     def _cancel_selected(self):
         rows = self.table.selectionModel().selectedRows()
         if not rows:
-            QMessageBox.information(self, "Info", "Select a row to cancel.")
+            QMessageBox.information(self, "Info", "Select at least one order to cancel.")
             return
-        row = rows[0].row()
-        order_id = int(self.table.item(row, 0).text())
-        status = self.table.item(row, 5).text() if self.table.item(row, 5) else ""
+        
+        # Collect order IDs from selected rows
+        order_ids = []
+        for row_index in rows:
+            row = row_index.row()
+            if 0 <= row < len(self._visible_orders):
+                try:
+                    order_id = int(self._visible_orders[row].get("id", 0))
+                    order_ids.append(order_id)
+                except Exception:
+                    pass
+        
+        if not order_ids:
+            QMessageBox.warning(self, "Warning", "Could not extract valid order IDs from selected rows.")
+            return
+        
+        # Confirmation dialog
+        msg = f"Cancel {len(order_ids)} order(s)?"
+        if len(order_ids) == 1:
+            msg = f"Cancel order #{order_ids[0]}?"
+        
         if QMessageBox.question(
-            self, "Cancel Order",
-            f"Cancel order #{order_id}?",
+            self, "Cancel Orders",
+            msg,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         ) != QMessageBox.StandardButton.Yes:
             return
+        
+        # Cancel all selected orders
+        results = []
+        for order_id in order_ids:
+            try:
+                result = self.api.cancel_order(order_id)
+                ok = result.get("cancelled", False)
+                results.append((order_id, ok))
+            except Exception as e:
+                logger.warning(f"Failed to cancel order {order_id}: {e}")
+                results.append((order_id, False))
+        
+        # Report results
+        succeeded = sum(1 for _, ok in results if ok)
+        total = len(results)
+        summary = f"Cancelled: {succeeded}/{total}"
+        if succeeded == total:
+            summary_color = "✓"
+        else:
+            summary_color = "⚠"
+        
+        msg = f"{summary_color} {summary}"
+        QMessageBox.information(self, "Results", msg)
+        self.load()
+
+    def _export_csv(self):
+        """Export visible orders to CSV file."""
+        import csv
+        from datetime import datetime
+        from pathlib import Path
+        
+        if not self._visible_orders:
+            QMessageBox.information(self, "Info", "No orders to export.")
+            return
+        
+        # Determine file path
+        export_dir = Path.home() / "Downloads"
+        export_dir.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_path = export_dir / f"orders_export_{timestamp}.csv"
+        
         try:
-            result = self.api.cancel_order(order_id)
-            ok = result.get("cancelled", False)
-            msg = f"Order #{order_id}: {'cancelled' if ok else 'cancel failed'}."
-            QMessageBox.information(self, "Result", msg)
-            self.load()
+            with open(file_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(self._COLUMNS)
+                for order in self._visible_orders:
+                    row = [
+                        str(order.get("id", "")),
+                        str(order.get("ticker", "")),
+                        str(order.get("action", "")),
+                        str(order.get("quantity", "")),
+                        str(order.get("limit_price", "") or ""),
+                        str(order.get("status", "")),
+                        str(order.get("order_type", "") or ""),
+                        str(order.get("order_role", "") or ""),
+                        str(order.get("account_type", "") or ""),
+                        str(order.get("ib_order_id", "") or ""),
+                        str(order.get("created_at", "") or ""),
+                    ]
+                    writer.writerow(row)
+            
+            QMessageBox.information(
+                self, "Export Complete",
+                f"Orders exported to:\n{file_path}\n\n({len(self._visible_orders)} rows)"
+            )
         except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
+            QMessageBox.critical(self, "Export Error", str(e))
+
+
+class TradesTab(QWidget):
+    """Tab showing rows from the trades table."""
+
+    _COLUMNS = ["ID", "Ticker", "Signal", "Qty", "Entry", "Exit", "PnL", "R", "Status", "Updated"]
+
+    def __init__(
+        self,
+        api: ForecastApiClient,
+        open_order_callback: Optional[Callable[[str, Optional[int]], None]] = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.api = api
+        self._open_order_callback = open_order_callback
+        self._trades: list = []
+        self._linked_parent_id: Optional[int] = None
+        self._visible_trades: list = []
+        self._last_error = ""
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(6)
+
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Ticker:"))
+        self.ticker_filter = QLineEdit()
+        self.ticker_filter.setPlaceholderText("All")
+        self.ticker_filter.setMaximumWidth(120)
+        filter_row.addWidget(self.ticker_filter)
+
+        filter_row.addWidget(QLabel("Status:"))
+        self.status_filter = QComboBox()
+        self.status_filter.addItems(["All", "OPEN", "CLOSED", "ROLLBACK_COMPLETE", "ROLLBACK_FAILED"])
+        self.status_filter.setMaximumWidth(170)
+        filter_row.addWidget(self.status_filter)
+
+        self.refresh_btn = QPushButton("🔄 Refresh")
+        self.refresh_btn.clicked.connect(self.load)
+        filter_row.addWidget(self.refresh_btn)
+
+        self.reset_btn = QPushButton("✕ Reset Filters")
+        self.reset_btn.clicked.connect(self.reset_filters)
+        filter_row.addWidget(self.reset_btn)
+
+        self.clear_link_btn = QPushButton("✕ Clear Link")
+        self.clear_link_btn.clicked.connect(self.clear_link)
+        filter_row.addWidget(self.clear_link_btn)
+
+        self.find_orders_btn = QPushButton("↩ Show In Orders")
+        self.find_orders_btn.clicked.connect(self._open_selected_in_orders)
+        filter_row.addWidget(self.find_orders_btn)
+
+        self.export_btn = QPushButton("📥 Export CSV")
+        self.export_btn.clicked.connect(self._export_csv)
+        filter_row.addWidget(self.export_btn)
+
+        filter_row.addStretch()
+        self.total_label = QLabel("Trades: 0")
+        filter_row.addWidget(self.total_label)
+        layout.addLayout(filter_row)
+
+        self.table = QTableWidget(0, len(self._COLUMNS))
+        self.table.setHorizontalHeaderLabels(self._COLUMNS)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(9, QHeaderView.ResizeMode.Stretch)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.itemDoubleClicked.connect(lambda _: self._open_selected_in_orders())
+        self.table.itemSelectionChanged.connect(self._update_details)
+        layout.addWidget(self.table, 1)
+
+        self.state_label = QLabel("")
+        self.state_label.setStyleSheet("color: #616161;")
+        layout.addWidget(self.state_label)
+
+        self.details_label = QLabel("Selected trade: —")
+        self.details_label.setStyleSheet("color: #424242;")
+        layout.addWidget(self.details_label)
+
+        self.linked_label = QLabel("")
+        self.linked_label.setStyleSheet("color: #1565c0;")
+        layout.addWidget(self.linked_label)
+
+    def load(self):
+        ticker = self.ticker_filter.text().strip() or None
+        status = self.status_filter.currentText()
+        status = None if status == "All" else status
+        try:
+            self._trades = self.api.get_trades(ticker=ticker, status=status, limit=500)
+            self._last_error = ""
+        except Exception as e:
+            logger.warning(f"TradesTab.load error: {e}")
+            self._last_error = str(e)
+            self._trades = []
+        self._populate()
+
+    def _populate(self):
+        trades = self._trades
+        if self._linked_parent_id is not None:
+            trades = [
+                t for t in trades
+                if str(t.get("ib_parent_id", "") or "") == str(self._linked_parent_id)
+            ]
+        self._visible_trades = list(trades)
+        self.table.setRowCount(len(trades))
+        for row, t in enumerate(trades):
+            is_test = bool(t.get("is_test", 0))
+            test_tag = str(t.get("test_tag", "") or "").strip()
+            ticker_val = str(t.get("ticker", "") or "")
+            if is_test:
+                ticker_val = f"{ticker_val} [TEST]" if not test_tag else f"{ticker_val} [TEST:{test_tag}]"
+            vals = [
+                str(t.get("id", "")),
+                ticker_val,
+                str(t.get("signal", "") or ""),
+                str(t.get("quantity", "") or ""),
+                str(t.get("entry_price", "") or ""),
+                str(t.get("exit_price", "") or ""),
+                str(t.get("realized_pnl", "") or ""),
+                str(t.get("r_multiple", "") or ""),
+                str(t.get("status", "") or ""),
+                str(t.get("updated_at", "") or t.get("created_at", "") or ""),
+            ]
+
+            signal = str(t.get("signal", "")).upper()
+            base_bg = _SIDE_COLORS.get(signal)
+            if is_test:
+                base_bg = _TEST_ROW_COLOR
+
+            pnl_val = t.get("realized_pnl")
+            pnl_fg = None
+            try:
+                if pnl_val is not None and str(pnl_val) != "":
+                    pnl_num = float(pnl_val)
+                    if pnl_num > 0:
+                        pnl_fg = QColor("#2e7d32")
+                    elif pnl_num < 0:
+                        pnl_fg = QColor("#c62828")
+            except Exception:
+                pass
+
+            for col, val in enumerate(vals):
+                item = QTableWidgetItem(val)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if base_bg:
+                    item.setBackground(QBrush(base_bg))
+                if col == 6 and pnl_fg is not None:
+                    item.setForeground(QBrush(pnl_fg))
+                self.table.setItem(row, col, item)
+        self.total_label.setText(f"Trades: {len(trades)}")
+        if self._last_error:
+            self.state_label.setStyleSheet("color: #c62828;")
+            self.state_label.setText(f"Trades load error: {self._last_error}")
+        elif not trades:
+            self.state_label.setStyleSheet("color: #616161;")
+            if self._linked_parent_id is not None:
+                self.state_label.setText(f"No trades found for parent #{self._linked_parent_id}.")
+            else:
+                self.state_label.setText("No trades found for selected filters.")
+        else:
+            self.state_label.setText("")
+
+        if self._linked_parent_id is not None:
+            self.linked_label.setText(f"Linked mode: parent #{self._linked_parent_id} from Orders")
+        else:
+            self.linked_label.setText("")
+
+        if trades:
+            self.table.selectRow(0)
+
+    def open_from_order(self, ticker: str, parent_id: Optional[int] = None):
+        self.ticker_filter.setText(str(ticker or ""))
+        self._linked_parent_id = parent_id
+        self.load()
+
+    def clear_link(self):
+        self._linked_parent_id = None
+        self.load()
+
+    def reset_filters(self):
+        self.ticker_filter.clear()
+        self.status_filter.setCurrentText("All")
+        self._linked_parent_id = None
+        self.load()
+
+    def _open_selected_in_orders(self):
+        if self._open_order_callback is None:
+            return
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            QMessageBox.information(self, "Info", "Select a trade first.")
+            return
+        row = rows[0].row()
+        if row < 0 or row >= len(self._visible_trades):
+            return
+        trade = self._visible_trades[row]
+        ticker = str(trade.get("ticker", "") or "").strip()
+        if not ticker:
+            QMessageBox.information(self, "Info", "Selected trade has no ticker.")
+            return
+        parent_id = trade.get("ib_parent_id")
+        try:
+            parent_id = int(parent_id) if parent_id not in (None, "") else None
+        except Exception:
+            parent_id = None
+        self._open_order_callback(ticker, parent_id)
+
+    def _update_details(self):
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            self.details_label.setText("Selected trade: —")
+            return
+        row = rows[0].row()
+        if row < 0 or row >= len(self._visible_trades):
+            self.details_label.setText("Selected trade: —")
+            return
+        trade = self._visible_trades[row]
+        trade_id = trade.get("id", "")
+        ticker = trade.get("ticker", "")
+        status = trade.get("status", "")
+        signal = trade.get("signal", "")
+        parent_id = trade.get("ib_parent_id", "")
+        test_suffix = ""
+        if bool(trade.get("is_test", 0)):
+            tag = str(trade.get("test_tag", "") or "").strip()
+            test_suffix = "  TEST" if not tag else f"  TEST:{tag}"
+        self.details_label.setText(
+            f"Selected trade: #{trade_id}  {ticker}  signal={signal}  status={status}  parent={parent_id}{test_suffix}"
+        )
+
+    def _export_csv(self):
+        """Export visible trades to CSV file."""
+        import csv
+        from datetime import datetime
+        from pathlib import Path
+        
+        if not self._visible_trades:
+            QMessageBox.information(self, "Info", "No trades to export.")
+            return
+        
+        # Determine file path
+        export_dir = Path.home() / "Downloads"
+        export_dir.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_path = export_dir / f"trades_export_{timestamp}.csv"
+        
+        try:
+            with open(file_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(self._COLUMNS)
+                for trade in self._visible_trades:
+                    row = [
+                        str(trade.get("id", "")),
+                        str(trade.get("ticker", "")),
+                        str(trade.get("signal", "") or ""),
+                        str(trade.get("quantity", "") or ""),
+                        str(trade.get("entry_price", "") or ""),
+                        str(trade.get("exit_price", "") or ""),
+                        str(trade.get("realized_pnl", "") or ""),
+                        str(trade.get("r_multiple", "") or ""),
+                        str(trade.get("status", "") or ""),
+                        str(trade.get("updated_at", "") or trade.get("created_at", "") or ""),
+                    ]
+                    writer.writerow(row)
+            
+            QMessageBox.information(
+                self, "Export Complete",
+                f"Trades exported to:\n{file_path}\n\n({len(self._visible_trades)} rows)"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", str(e))
+
+
+class TradingTab(QWidget):
+    """Main trading tab with Orders and Trades sub-tabs."""
+
+    def __init__(self, api: ForecastApiClient, parent=None):
+        super().__init__(parent)
+        self.api = api
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.sub_tabs = QTabWidget()
+        self.trades_tab = TradesTab(self.api, open_order_callback=self.open_trade_in_orders)
+        self.sub_tabs.addTab(self.trades_tab, "📈 Trades")
+
+        self.orders_tab = OrdersTab(self.api, open_trade_callback=self.open_order_in_trades)
+        self.sub_tabs.addTab(self.orders_tab, "📋 Orders")
+
+        layout.addWidget(self.sub_tabs)
+
+    def load(self):
+        self.trades_tab.load()
+        self.orders_tab.load()
+
+    def open_order_in_trades(self, ticker: str, parent_id: Optional[int] = None):
+        self.sub_tabs.setCurrentWidget(self.trades_tab)
+        self.trades_tab.open_from_order(ticker, parent_id)
+
+    def open_trade_in_orders(self, ticker: str, parent_id: Optional[int] = None):
+        self.sub_tabs.setCurrentWidget(self.orders_tab)
+        self.orders_tab.open_from_trade(ticker, parent_id)
 
 
 class ForecastRunsTab(QWidget):
@@ -3391,7 +4105,7 @@ class _TabLoader:
             ("Price Data",  lambda: w.price_tab.load()),
             ("Indicators",  lambda: w.indicators_tab.load()),
             ("Portfolio",   lambda: w.portfolio_tab.load()),
-            ("Orders",      lambda: w.orders_tab.load()),
+            ("Trading",     lambda: w.trading_tab.load()),
             ("Runs",        lambda: w.forecast_runs_tab.load()),
             ("Scheduler",   lambda: w.scheduler_tab.load()),
             ("Settings",    lambda: w.settings_tab.load()),
@@ -3472,8 +4186,8 @@ class MainWindow(QMainWindow):
         self.portfolio_tab = PortfolioTab(self.api)
         self.tabs.addTab(self.portfolio_tab, "💼 Portfolio")
 
-        self.orders_tab = OrdersTab(self.api)
-        self.tabs.addTab(self.orders_tab, "📋 Orders")
+        self.trading_tab = TradingTab(self.api)
+        self.tabs.addTab(self.trading_tab, "💱 Trading")
 
         self.forecast_runs_tab = ForecastRunsTab(self.api)
         self.tabs.addTab(self.forecast_runs_tab, "🔬 Runs")

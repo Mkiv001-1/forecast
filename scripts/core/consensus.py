@@ -107,13 +107,15 @@ def calculate_consensus(
     disagreement_threshold: float = _DEFAULT_DISAGREEMENT_THRESHOLD,
     run_id: int = None,
     log_ids: dict = None,
+    model_stats: dict = None,
 ) -> dict:
     """
     Aggregate a list of forecast dicts into a consensus signal.
 
     Each forecast dict must have: side, confidence, method, model.
     Optional fields used for price validation: entry_price, exit_target, stop_loss.
-    method_stats: optional dict {method: {win_rate: float, ema_accuracy: float, ...}}
+    method_stats: optional dict {method: {win_rate: float, timeframe_hours: int, ...}}
+    model_stats:  optional dict {model_name: {ema_accuracy: float, ...}} — per-AI-model accuracy
     current_price: used for anomaly filter; skip if 0.
     run_id: optional forecast run ID for linking.
     log_ids: optional dict mapping forecast index to log_id.
@@ -166,22 +168,25 @@ def calculate_consensus(
         method     = str(f.get("method", ""))
         model      = str(f.get("model", ""))
 
-        # --- Confidence Calibration ---
-        # If model historically overconfident (e.g., claims 80% but win_rate=40%),
-        # calibrate down. If underconfident, calibrate up.
-        # Calibration factor = (ema_accuracy_for_model / 0.5) - adjusts relative to baseline
+        # --- Confidence Calibration (analytics only — does NOT affect weight) ---
+        # calibration_factor is stored in link_data for analytics, but weight uses raw confidence
+        # to avoid double-counting: ema_weight (below) already carries historical accuracy signal.
         calibration_factor = 1.0
         ema_acc = None
-        if method_stats and method in method_stats:
+        # Prefer model_stats (keyed by AI model name) over method_stats for ema_accuracy
+        if model_stats and model in model_stats:
+            ema_acc = model_stats[model].get("ema_accuracy")
+        elif method_stats and method in method_stats:
             ema_acc = method_stats[method].get("ema_accuracy")
-            if ema_acc is not None:
-                # ema_acc typically 0.3-0.7, scale to 0.6-1.4 factor
-                calibration_factor = max(0.5, min(1.5, float(ema_acc) / 0.5))
+        if ema_acc is not None:
+            # ema_acc typically 0.3-0.7, scale to 0.6-1.4 factor (analytics reference)
+            calibration_factor = max(0.5, min(1.5, float(ema_acc) / 0.5))
         
         calibrated_confidence = raw_confidence * calibration_factor
         # Clamp to 0-100 range
         calibrated_confidence = max(0.0, min(100.0, calibrated_confidence))
-        confidence = calibrated_confidence / 100.0  # Convert to 0-1 for weight calc
+        # Use raw confidence for weight — ema_weight below already captures model accuracy
+        confidence = raw_confidence / 100.0  # Convert to 0-1 for weight calc
 
         # --- Anomaly filter ---
         is_filtered = False
@@ -202,7 +207,7 @@ def calculate_consensus(
         ema_weight  = 1.0
         if method_stats and method in method_stats:
             win_rate   = float(method_stats[method].get("win_rate", 0.5))
-            ema_acc    = method_stats[method].get("ema_accuracy")
+            # ema_acc already resolved above (from model_stats or method_stats)
             if ema_acc is not None:
                 ema_weight = max(0.3, min(1.5, float(ema_acc) * 2))
 
@@ -273,6 +278,8 @@ def calculate_consensus(
         if is_filtered:
             continue
             
+        total_weight += weight
+
         if side == "LONG":
             weighted_long  += weight
             methods_long.append(f"{method}({f.get('model','?')})")
@@ -482,10 +489,18 @@ def save_consensus(db_manager, ticker: str, consensus: dict, method_stats: dict 
             eval_dt = now + timedelta(days=1)
         eval_target_date = eval_dt.strftime("%Y-%m-%d %H:%M:%S")
 
+        signal_val = consensus["signal"]
+        if signal_val in ("LONG", "SHORT"):
+            order_state = "PENDING_ORDER"
+            order_reason = ""
+        else:
+            order_state = "ORDER_SKIPPED"
+            order_reason = "neutral_signal"
+
         record = {
             "date":                    now.strftime("%Y-%m-%d %H:%M:%S"),
             "ticker":                  ticker,
-            "signal":                  consensus["signal"],
+            "signal":                  signal_val,
             "confidence":              consensus["confidence"],
             "methods_long":            consensus.get("methods_long", ""),
             "methods_short":           consensus.get("methods_short", ""),
@@ -500,6 +515,8 @@ def save_consensus(db_manager, ticker: str, consensus: dict, method_stats: dict 
             "eval_status":             "PENDING",
             "run_id":                  run_id,
             "original_run_id":         original_run_id,
+            "order_state":             order_state,
+            "order_reason":            order_reason,
         }
         
         # Save all forecast links with weights (including filtered)

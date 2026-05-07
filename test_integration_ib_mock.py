@@ -44,8 +44,9 @@ class MockIBGateway:
                            stop_loss_price: float, take_profit_price: float,
                            use_stop_limit: bool = False, stop_limit_offset_pct: float = 0.0005,
                            allow_extended_hours: bool = False,
-                           host: str = "127.0.0.1", port: int = 7497) -> Dict[str, Any]:
-        """Mock bracket order placement."""
+                           host: str = "127.0.0.1", port: int = 7497,
+                           **kwargs) -> Dict[str, Any]:
+        """Mock bracket order placement — accepts extra kwargs added to order_manager."""
         call_record = {
             "method": "place_bracket_order",
             "symbol": symbol,

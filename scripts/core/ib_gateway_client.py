@@ -362,6 +362,7 @@ def place_bracket_order(
     use_stop_limit: bool = False,
     stop_limit_offset_pct: float = 0.0005,
     allow_extended_hours: bool = False,
+    order_ref: str = "",
     host: str = "127.0.0.1",
     port: int = 7497,
     client_id: int = 10,
@@ -403,6 +404,8 @@ def place_bracket_order(
         parent.orderId = oref
         parent.transmit = False
         parent.tif = entry_tif
+        if order_ref:
+            parent.orderRef = order_ref
         if account:
             parent.account = account
         if allow_extended_hours:
@@ -415,6 +418,8 @@ def place_bracket_order(
         target.parentId = oref
         target.transmit = False
         target.tif = take_profit_tif
+        if order_ref:
+            target.orderRef = order_ref
         if account:
             target.account = account
 
@@ -435,6 +440,8 @@ def place_bracket_order(
         stop.parentId = oref
         stop.transmit = True  # transmit all 3
         stop.tif = stop_loss_tif
+        if order_ref:
+            stop.orderRef = order_ref
         if account:
             stop.account = account
 
@@ -483,18 +490,42 @@ def cancel_order(
         return False
 
     ib = IB()
+    errors_for_order = []
+
+    def _on_error(req_id, error_code, error_string, contract):
+        # IB reports many order-level failures asynchronously via errorEvent.
+        if int(req_id or 0) == int(order_id):
+            errors_for_order.append((int(error_code or 0), str(error_string or "")))
+
     try:
         ib.connect(host, port, clientId=client_id, timeout=15)
+        ib.errorEvent += _on_error
+
         order = Order()
         order.orderId = order_id
         ib.cancelOrder(order)
-        ib.sleep(1)
+        ib.sleep(1.0)
+
+        # Common hard failure codes seen in practice for invalid/not-found order IDs.
+        hard_fail_codes = {10147, 201, 202}
+        hard_fail = [e for e in errors_for_order if e[0] in hard_fail_codes]
+        if hard_fail:
+            code, msg = hard_fail[0]
+            logger.warning(
+                f"[IB] cancel_order: orderId={order_id} failed code={code} msg={msg}"
+            )
+            return False
+
         logger.info(f"[IB] cancel_order: orderId={order_id} sent")
         return True
     except Exception as e:
         logger.error(f"[IB] cancel_order {order_id} failed: {e}")
         return False
     finally:
+        try:
+            ib.errorEvent -= _on_error
+        except Exception:
+            pass
         try:
             if ib.isConnected():
                 ib.disconnect()

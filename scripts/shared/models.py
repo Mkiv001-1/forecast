@@ -246,6 +246,12 @@ class ConsensusRecord(BaseModel):
     pnl_pct: Optional[Any] = None
     r_multiple: Optional[Any] = None
     first_hit: Optional[str] = None
+    # Order activation fields
+    order_state: Optional[str] = None
+    order_checked_at: Optional[str] = None
+    order_attempted_at: Optional[str] = None
+    order_reason: Optional[str] = None
+    trade_id: Optional[int] = None
 
 
 class ConsensusResponse(BaseModel):

@@ -417,11 +417,70 @@ async def get_config_all():
 async def update_config(key: str, body: ConfigParam):
     try:
         em = _get_db_manager()
-        em.set_config_value(key, body.value)
-        return ConfigParam(key=key, value=body.value, description=body.description)
+        value = body.value or ""
+        _validate_config_value(key, value)
+        em.set_config_value(key, value)
+        logger.info(f"[API] Config updated: {key} = {value!r}")
+        return ConfigParam(key=key, value=value, description=body.description)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Error updating config")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _validate_config_value(key: str, value: str) -> None:
+    """Raise HTTPException(400) if the value is out of acceptable range."""
+    _FLOAT_RANGES = {
+        # key: (min_inclusive, max_inclusive)
+        "DEFAULT_RISK_PCT":          (0.0001, 0.5),
+        "MAX_POSITION_PCT":          (0.001,  1.0),
+        "MAX_SECTOR_EXPOSURE_PCT":   (0.01,   1.0),
+        "MAX_SECTOR_HARD_LIMIT_PCT": (0.01,   1.0),
+        "SECTOR_OVERWEIGHT_FACTOR":  (0.01,   1.0),
+        "RISK_PERCENT_ON_STOP":      (0.1,   10.0),  # percent, not fraction
+    }
+    _BOOL_KEYS = {"LIVE_TRADING_CONFIRMED", "USE_STOP_LIMIT", "ALLOW_EXTENDED_HOURS",
+                  "AUTO_BLOCK_ON_ROLLBACK_FAIL", "OPENROUTER_FREE_ONLY"}
+    _CHOICE_KEYS = {
+        "RISK_MODE":           {"percent_of_capital", "percent_of_portfolio_on_stop"},
+        "IB_CAPITAL_FAILSAFE": {"manual_only", "deny"},
+        "ORDER_MODE":          {"disabled", "paper", "live"},
+        "PREFERRED_ACCOUNT_TYPE": {"live", "paper"},
+    }
+
+    if key in _FLOAT_RANGES:
+        lo, hi = _FLOAT_RANGES[key]
+        try:
+            v = float(value)
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail=f"{key}: expected a number, got {value!r}")
+        if not (lo <= v <= hi):
+            raise HTTPException(status_code=400, detail=f"{key}: value {v} out of range [{lo}, {hi}]")
+
+    elif key in _BOOL_KEYS:
+        if value.lower() not in ("true", "false", ""):
+            raise HTTPException(status_code=400, detail=f"{key}: expected 'true' or 'false', got {value!r}")
+
+    elif key in _CHOICE_KEYS:
+        choices = _CHOICE_KEYS[key]
+        if value and value not in choices:
+            raise HTTPException(status_code=400, detail=f"{key}: must be one of {sorted(choices)}, got {value!r}")
+
+    elif key == "MANUAL_CAPITAL_OVERRIDE":
+        if value.strip():
+            try:
+                v = float(value)
+                if v <= 0:
+                    raise ValueError
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail=f"{key}: must be a positive number or empty")
+
+    elif key == "RISK_ACCOUNT_ID":
+        # No format constraint — just disallow whitespace-only
+        if value != value.strip():
+            raise HTTPException(status_code=400, detail=f"{key}: must not have leading/trailing whitespace")
+
 
 
 # ---------------------------------------------------------------------------
@@ -1175,6 +1234,8 @@ async def get_forecast_run_detail(run_id: int):
 async def get_orders(
     ticker: Optional[str] = None,
     status: Optional[str] = None,
+    include_test: bool = Query(True, description="Include test rows (is_test=1)"),
+    test_only: bool = Query(False, description="Return only test rows (is_test=1)"),
     limit: int = Query(100, ge=1, le=1000),
 ):
     """Return orders from the orders table."""
@@ -1189,6 +1250,10 @@ async def get_orders(
             if status:
                 clauses.append("UPPER(status)=UPPER(?)")
                 params.append(status)
+            if test_only:
+                clauses.append("COALESCE(is_test, 0)=1")
+            elif not include_test:
+                clauses.append("COALESCE(is_test, 0)=0")
             where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
             params.append(limit)
             rows = con.execute(
@@ -1355,6 +1420,92 @@ async def submit_order_manual(body: OrderSubmitRequest):
         raise
     except Exception as e:
         logger.exception("Error submitting order")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Trades endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/trades", dependencies=[Depends(verify_api_key)])
+async def get_trades(
+    status: Optional[str] = None,
+    ticker: Optional[str] = None,
+    include_test: bool = Query(True, description="Include test rows (is_test=1)"),
+    test_only: bool = Query(False, description="Return only test rows (is_test=1)"),
+    limit: int = 200,
+):
+    """Return trades list from the trades table."""
+    try:
+        _ensure_paths()
+        em = _get_db_manager()
+        where_parts = []
+        params = []
+        if status:
+            where_parts.append("status = ?")
+            params.append(status)
+        if ticker:
+            where_parts.append("UPPER(ticker) = UPPER(?)")
+            params.append(ticker)
+        if test_only:
+            where_parts.append("COALESCE(is_test, 0)=1")
+        elif not include_test:
+            where_parts.append("COALESCE(is_test, 0)=0")
+        where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        with em._connect() as con:
+            rows = con.execute(
+                f"SELECT * FROM trades {where_sql} ORDER BY id DESC LIMIT ?",
+                params + [limit],
+            ).fetchall()
+        return {"trades": [dict(r) for r in rows]}
+    except Exception as e:
+        logger.exception("Error fetching trades")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ib-log", dependencies=[Depends(verify_api_key)])
+async def get_ib_log(ticker: Optional[str] = None, limit: int = 500):
+    """Return recent IB Gateway audit log entries."""
+    try:
+        _ensure_paths()
+        em = _get_db_manager()
+        where_sql = "WHERE ticker = ?" if ticker else ""
+        params = [ticker] if ticker else []
+        with em._connect() as con:
+            rows = con.execute(
+                f"SELECT * FROM ib_gateway_log {where_sql} ORDER BY id DESC LIMIT ?",
+                params + [limit],
+            ).fetchall()
+        return {"log": [dict(r) for r in rows]}
+    except Exception as e:
+        logger.exception("Error fetching ib_gateway_log")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/consensus/{consensus_id}/activate", dependencies=[Depends(verify_api_key)])
+async def activate_consensus(consensus_id: int):
+    """Manually trigger order activation for a specific consensus record."""
+    try:
+        _ensure_paths()
+        em = _get_db_manager()
+        from scripts.core.order_manager import activate_consensus_order
+        result = activate_consensus_order(consensus_id, em)
+        return result
+    except Exception as e:
+        logger.exception("Error activating consensus order")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/consensus/{consensus_id}/preview-trade", dependencies=[Depends(verify_api_key)])
+async def preview_consensus_trade(consensus_id: int):
+    """Return trade preview details (including calculated quantity) for confirmation popup."""
+    try:
+        _ensure_paths()
+        em = _get_db_manager()
+        from scripts.core.order_manager import preview_consensus_order
+        return preview_consensus_order(consensus_id, em)
+    except Exception as e:
+        logger.exception("Error previewing consensus trade")
         raise HTTPException(status_code=500, detail=str(e))
 
 

@@ -154,6 +154,148 @@ def _load_price_data_from_db(db_manager, ticker: str, date_from: str) -> list:
         return []
 
 
+def _load_intraday_from_db(db_manager, ticker: str, dt_from: str, interval: str = "1h") -> list:
+    """Load hourly bars from price_data_intraday for ticker starting at dt_from."""
+    try:
+        with db_manager._connect() as con:
+            rows = con.execute(
+                "SELECT datetime, open, high, low, close, volume FROM price_data_intraday "
+                "WHERE ticker = ? AND interval = ? AND datetime >= ? ORDER BY datetime",
+                (ticker, interval, dt_from),
+            ).fetchall()
+        return [
+            {"datetime": r[0], "open": r[1], "high": r[2], "low": r[3], "close": r[4], "volume": r[5]}
+            for r in rows
+        ]
+    except Exception as e:
+        logger.warning(f"consensus_evaluator: intraday db query failed for {ticker}: {e}")
+        return []
+
+
+def _find_first_hit_intraday(bars: list, signal: str, target_price: Optional[float], stop_loss: Optional[float]):
+    """Scan hourly bars in order; return (first_hit, exit_price, bar) for first target or stop breach."""
+    for bar in bars:
+        high = float(bar.get("high") or 0)
+        low  = float(bar.get("low") or 0)
+        close = float(bar.get("close") or 0)
+        if signal == "LONG":
+            if target_price and high >= target_price:
+                return "target", target_price, bar
+            if stop_loss and low <= stop_loss:
+                return "stop", stop_loss, bar
+        elif signal == "SHORT":
+            if target_price and low <= target_price:
+                return "target", target_price, bar
+            if stop_loss and high >= stop_loss:
+                return "stop", stop_loss, bar
+    return None, None, bars[-1] if bars else None
+
+
+def _evaluate_one_intraday(
+    db_manager,
+    rec_id: int,
+    ticker: str,
+    signal: str,
+    cons_date: str,
+    eval_target_date: str,
+    target_price: Optional[float],
+    stop_loss: Optional[float],
+    entry_limit_price: Optional[float],
+    horizon_hours: int,
+) -> str:
+    """Evaluate a consensus record using hourly bars (horizon < 24h)."""
+    try:
+        target_dt = datetime.fromisoformat(eval_target_date[:19])
+    except Exception:
+        logger.warning(f"consensus_evaluator: bad eval_target_date '{eval_target_date}' for id={rec_id}")
+        _save_eval(db_manager, rec_id, eval_status="NO_DATA")
+        return "NO_DATA"
+
+    # Start loading from cons_date (beginning of the trade window)
+    dt_from = cons_date[:19] if cons_date else eval_target_date[:19]
+
+    bars = _load_intraday_from_db(db_manager, ticker, dt_from)
+    if not bars:
+        logger.warning(f"consensus_evaluator: no intraday bars for {ticker} id={rec_id} from {dt_from}")
+        _save_eval(db_manager, rec_id, eval_status="NO_DATA")
+        return "NO_DATA"
+
+    # Filter bars up to eval_target_date
+    eval_dt_str = eval_target_date[:19]
+    window_bars = [b for b in bars if str(b["datetime"])[:19] <= eval_dt_str]
+    if not window_bars:
+        logger.warning(f"consensus_evaluator: no intraday bars for {ticker} id={rec_id} in window")
+        _save_eval(db_manager, rec_id, eval_status="NO_DATA")
+        return "NO_DATA"
+
+    first_bar  = window_bars[0]
+    last_bar   = window_bars[-1]
+
+    entry_price_actual = entry_limit_price or float(first_bar.get("close") or 0)
+    actual_open  = float(first_bar.get("open") or 0)
+    actual_close = float(last_bar.get("close") or 0)
+    actual_high  = max(float(b.get("high") or 0) for b in window_bars)
+    actual_low   = min(float(b.get("low") or 1e9) for b in window_bars)
+    actual_date  = str(last_bar["datetime"])[:10]
+
+    first_hit, exit_price, _ = _find_first_hit_intraday(window_bars, signal, target_price, stop_loss)
+    if exit_price is None:
+        exit_price = actual_close
+
+    target_hit = first_hit == "target" or (signal == "LONG" and actual_high >= (target_price or 1e18)) or (signal == "SHORT" and actual_low <= (target_price or 0))
+    stop_hit   = first_hit == "stop"  or (signal == "LONG" and actual_low <= (stop_loss or 0)) or (signal == "SHORT" and actual_high >= (stop_loss or 1e18))
+    # Prefer first_hit determination for target_hit/stop_hit when ambiguous
+    if first_hit == "target":
+        target_hit = True
+    elif first_hit == "stop":
+        stop_hit = True
+
+    exit_successful = None
+    if signal in ("LONG", "SHORT"):
+        exit_successful = 1 if first_hit == "target" else (0 if first_hit == "stop" else None)
+
+    direction_correct = False
+    entry = entry_price_actual
+    if entry and entry > 0:
+        if signal == "LONG":
+            direction_correct = actual_close > entry
+        elif signal == "SHORT":
+            direction_correct = actual_close < entry
+
+    pnl_pct = 0.0
+    if entry and entry > 0 and exit_price > 0:
+        if signal == "LONG":
+            pnl_pct = round((exit_price - entry) / entry * 100, 2)
+        elif signal == "SHORT":
+            pnl_pct = round((entry - exit_price) / entry * 100, 2)
+
+    r_multiple = _compute_r_multiple(pnl_pct, entry, stop_loss, signal) if stop_loss else None
+
+    _save_eval(
+        db_manager=db_manager,
+        rec_id=rec_id,
+        eval_status="EVALUATED",
+        actual_date=actual_date,
+        actual_open=actual_open,
+        actual_close=actual_close,
+        actual_high=actual_high,
+        actual_low=actual_low,
+        entry_price_actual=entry_price_actual,
+        target_hit=int(target_hit),
+        stop_hit=int(stop_hit),
+        first_hit=first_hit,
+        direction_correct=int(direction_correct),
+        pnl_pct=pnl_pct,
+        r_multiple=r_multiple,
+    )
+    logger.info(
+        f"consensus_evaluator: [intraday] id={rec_id} {ticker} {signal} → "
+        f"dir={direction_correct} target_hit={target_hit} stop_hit={stop_hit} "
+        f"first_hit={first_hit} pnl={pnl_pct:.2f}% R={r_multiple}"
+    )
+    return "EVALUATED"
+
+
 def _evaluate_one(
     db_manager,
     rec_id: int,
@@ -167,14 +309,20 @@ def _evaluate_one(
     horizon_hours: Optional[int] = None,
 ) -> str:
     """Evaluate one consensus record and persist results. Returns status: 'EVALUATED' or 'NO_DATA'."""
-    # --- Intraday check: daily bars insufficient for horizon < 24h ---
+    # --- Intraday path: horizon < 24h → use hourly bars ---
     if horizon_hours and horizon_hours < 24:
-        logger.warning(
-            f"consensus_evaluator: id={rec_id} intraday horizon ({horizon_hours}h) — "
-            f"cannot evaluate with daily bars only, need intraday data"
+        return _evaluate_one_intraday(
+            db_manager=db_manager,
+            rec_id=rec_id,
+            ticker=ticker,
+            signal=signal,
+            cons_date=cons_date,
+            eval_target_date=eval_target_date,
+            target_price=target_price,
+            stop_loss=stop_loss,
+            entry_limit_price=entry_limit_price,
+            horizon_hours=horizon_hours,
         )
-        _save_eval(db_manager, rec_id, eval_status="NO_DATA_INTRADAY")
-        return "NO_DATA_INTRADAY"
 
     # --- Load price data around eval_target_date ---
     try:
@@ -327,19 +475,30 @@ def _evaluate_one(
     elif stop_hit and not target_hit:
         first_hit = "stop"
 
-    # Stop priority: if stop triggered → failure
-    # direction_correct based on actual_close vs entry
+    # pnl_pct: use first_hit to determine exit price when both levels were touched.
+    # If only one level was hit, or neither, fall back to actual_close.
+    if first_hit == "stop" and stop_loss:
+        exit_price = stop_loss
+    elif first_hit == "target" and target_price:
+        exit_price = target_price
+    else:
+        exit_price = actual_close
+
+    # exit_successful: True only when target was hit first (or only target hit)
+    exit_successful = None
+    if signal in ("LONG", "SHORT"):
+        if first_hit == "target":
+            exit_successful = 1
+        elif first_hit == "stop":
+            exit_successful = 0
+        # else: neither hit (still open) → None
+
+    # direction_correct: based on actual_close vs entry (independent of target/stop)
     direction_correct = False
     if signal == "LONG":
         direction_correct = actual_close > entry
     elif signal == "SHORT":
         direction_correct = actual_close < entry
-
-    # pnl_pct: use stop price if stop triggered, otherwise actual_close
-    if stop_hit and stop_loss:
-        exit_price = stop_loss
-    else:
-        exit_price = actual_close
 
     pnl_pct = 0.0
     if entry and entry > 0 and exit_price and exit_price > 0:
@@ -363,6 +522,7 @@ def _evaluate_one(
         target_hit=int(target_hit),
         stop_hit=int(stop_hit),
         first_hit=first_hit,
+        exit_successful=exit_successful,
         direction_correct=int(direction_correct),
         pnl_pct=pnl_pct,
         r_multiple=r_multiple,

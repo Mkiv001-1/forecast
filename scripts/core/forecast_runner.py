@@ -16,8 +16,9 @@ from actuals_evaluator import fetch_actual_data, evaluate_forecast
 from unified_logs_manager import get_forecasts_to_evaluate, update_forecast_with_actuals
 
 def process_ticker(db_manager, ticker, run_id=None):
-    """Полностью обрабатывает один тикер. Возвращает список log_ids созданных прогнозов."""
+    """Полностью обрабатывает один тикер. Возвращает (log_ids, has_non_neutral_consensus)."""
     log_ids = []
+    has_consensus = False
     try:
         logging.info(f"🚀 Начало обработки {ticker}")
 
@@ -80,7 +81,8 @@ def process_ticker(db_manager, ticker, run_id=None):
                     method_stats[m]["timeframe_hours"] = int(row["timeframe_hours"])
             except Exception as _e:
                 logging.warning(f"forecast_runner: could not load method_config timeframe_hours: {_e}")
-            # Enrich method_stats with ema_accuracy from providers table
+            # Build model_stats keyed by AI model name (providers.name) for ema_accuracy lookup
+            model_stats = {}
             try:
                 import pandas as pd
                 with db_manager._connect() as _con:
@@ -89,57 +91,43 @@ def process_ticker(db_manager, ticker, run_id=None):
                     )
                 for _, row in _prov.iterrows():
                     m = str(row["name"])
-                    if m not in method_stats:
-                        method_stats[m] = {}
                     if row["ema_accuracy"] is not None:
-                        method_stats[m]["ema_accuracy"] = float(row["ema_accuracy"])
+                        model_stats[m] = {"ema_accuracy": float(row["ema_accuracy"])}
             except Exception as _e:
                 logging.warning(f"forecast_runner: could not load providers ema_accuracy: {_e}")
             current_price = price_data[-1]['close'] if price_data else 0.0
-            cons = calculate_consensus(raw_forecasts, method_stats, current_price=current_price, run_id=run_id, log_ids=log_ids)
+            cons = calculate_consensus(raw_forecasts, method_stats, current_price=current_price, run_id=run_id, log_ids=log_ids, model_stats=model_stats)
             save_consensus(db_manager, ticker, cons, method_stats=method_stats, run_id=run_id)
+            has_consensus = cons['signal'] in ('LONG', 'SHORT')
             logging.info(f"📊 Консенсус: {cons['signal']} {cons['confidence']:.1f}%")
 
-            # Автоматическое выставление ордера (если включено)
+            # Immediate activation path (optional, uses shared entrypoint)
+            # Normal flow: scheduler job process_pending_consensus_orders handles activation.
             auto_order = db_manager.get_config_value("AUTO_ORDER_SUBMISSION", "false").lower() == "true"
-            if auto_order and cons['signal'] in ('LONG', 'SHORT') and cons['confidence'] >= CONFIDENCE_THRESHOLD:
-                from position_sizer import calculate_position
-                from order_manager import submit_signal
-                from capital_provider import get_capital
+            if auto_order and has_consensus and cons['confidence'] >= CONFIDENCE_THRESHOLD:
+                try:
+                    from order_manager import activate_consensus_order
+                    # Retrieve the id of the consensus record we just saved
+                    import sqlite3 as _sq
+                    with _sq.connect(db_manager.db_file) as _con:
+                        _row = _con.execute(
+                            "SELECT id FROM consensus WHERE ticker=? ORDER BY id DESC LIMIT 1",
+                            (ticker,)
+                        ).fetchone()
+                    if _row:
+                        result = activate_consensus_order(_row[0], db_manager)
+                        logging.info(f"📤 Активация ордера: {result['status']} - {result.get('message', '')}")
+                except Exception as _e:
+                    logging.warning(f"⚠️ Ошибка немедленной активации ордера: {_e}")
 
-                capital = get_capital(db_manager)
-                if capital['status'] != 'OK':
-                    logging.warning(f"⚠️ Невозможно выставить ордер: {capital['status']}")
-                else:
-                    current_price = price_data[-1]['close']
-                    position = calculate_position(
-                        ticker=ticker,
-                        entry_price=current_price,
-                        stop_loss=cons['stop_loss'],
-                        db_manager=db_manager,
-                        net_liquidation=capital['net_liquidation']
-                    )
-
-                    if position['status'] == 'OK' and position['quantity'] > 0:
-                        log_id = db_manager.get_latest_forecast_log_id(ticker)
-                        result = submit_signal(
-                            ticker=ticker,
-                            consensus=cons,
-                            position_size=position,
-                            db_manager=db_manager,
-                            log_id=log_id or ""
-                        )
-                        logging.info(f"📤 Результат выставления ордера: {result['status']} - {result.get('message', '')}")
-                    else:
-                        logging.warning(f"⚠️ Расчет позиции неудачен: {position.get('status', 'UNKNOWN')}")
 
         logging.info(f"✅ Завершена обработка {ticker}")
-        return log_ids
+        return log_ids, has_consensus
         
     except Exception as e:
         logging.error(f"❌ Критическая ошибка обработки {ticker}: {e}")
         log_error(db_manager, ticker, 'GENERAL', str(e))
-        return log_ids
+        return log_ids, False
 
 def evaluate_past_forecasts(db_manager):
     """Оценивает предыдущие прогнозы и добавляет фактические данные"""
@@ -243,10 +231,9 @@ def run_trading_bot(db_file: str = None, run_id: int = None, db_manager=None):
         consensus_count = 0
         for ticker in active_tickers:
             try:
-                result = process_ticker(db_manager, ticker, run_id=run_id)
+                _log_ids, _has_consensus = process_ticker(db_manager, ticker, run_id=run_id)
                 processed += 1
-                # Проверяем был ли создан консенсус
-                if result and len(result) > 0:
+                if _has_consensus:
                     consensus_count += 1
             except Exception as e:
                 logging.error(f"❌ Ошибка обработки {ticker}: {e}")

@@ -26,7 +26,7 @@
 ### Компоненты
 
 ```
-main_excel.py:62-93      Автоматическая инициация после save_consensus()
+forecast_runner.py:104-121  Автоматическая инициация после save_consensus()
 api.py:997-1121          Ручная инициация через POST /orders/submit
 sqlite_manager.py:853-864  Метод get_latest_forecast_log_id()
 shared/models.py:307-322   Pydantic модели OrderSubmitRequest/Response
@@ -143,7 +143,7 @@ test_manual_order_submit_validation_low_confidence # Отказ low confidence
 ### sqlite_manager.py
 - Добавлен `get_latest_forecast_log_id(ticker)` — возвращает ID последнего прогноза для связи ордера с логом
 
-### main_excel.py
+### forecast_runner.py
 - Интеграция автоматического режима в `process_ticker()` после `save_consensus()`
 - Проверка `AUTO_ORDER_SUBMISSION=true`, валидация сигнала, расчёт позиции, вызов `submit_signal()`
 

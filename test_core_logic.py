@@ -879,6 +879,7 @@ def _make_consensus_db(db_path: str, rows: list):
             actual_high REAL, actual_low REAL,
             entry_price_actual REAL,
             target_hit INTEGER, stop_hit INTEGER, first_hit TEXT,
+            exit_successful INTEGER,
             direction_correct INTEGER, pnl_pct REAL, r_multiple REAL
         )
     """)
@@ -980,6 +981,97 @@ def test_evaluate_consensus_target_hit():
         assert r["pnl_pct"] is not None
 
 
+# ===========================================================================
+# scheduler — configurable worker pool
+# ===========================================================================
+
+def test_scheduler_max_workers_default_is_4(monkeypatch):
+    import asyncio
+    import scheduler
+
+    class FakeDb:
+        def __init__(self, db_file):
+            self.db_file = db_file
+        def get_config_value(self, key):
+            return None
+
+    class DummyPool:
+        created = []
+        def __init__(self, max_workers, thread_name_prefix=None):
+            self.max_workers = max_workers
+            self.thread_name_prefix = thread_name_prefix
+            self.shutdown_called = False
+            DummyPool.created.append(self)
+        def shutdown(self, wait=False, cancel_futures=True):
+            self.shutdown_called = True
+
+    async def _dummy_loop(name, coro_factory, interval_seconds, max_retries=2, run_on_start=False):
+        await asyncio.sleep(0)
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_file = f.name
+    try:
+        monkeypatch.setattr(scheduler, "_run_task_loop", _dummy_loop)
+        monkeypatch.setattr(scheduler.concurrent.futures, "ThreadPoolExecutor", DummyPool)
+
+        db = FakeDb(db_file)
+        asyncio.run(scheduler.start_scheduler(db))
+        asyncio.run(scheduler.stop_scheduler())
+
+        assert DummyPool.created, "ThreadPoolExecutor was not created"
+        assert DummyPool.created[0].max_workers == 4
+        assert DummyPool.created[0].shutdown_called is True
+    finally:
+        try:
+            os.unlink(db_file)
+        except PermissionError:
+            pass
+
+
+def test_scheduler_max_workers_from_config(monkeypatch):
+    import asyncio
+    import scheduler
+
+    class FakeDb:
+        def __init__(self, db_file):
+            self.db_file = db_file
+        def get_config_value(self, key):
+            if key == "SCHEDULER_MAX_WORKERS":
+                return "7"
+            return None
+
+    class DummyPool:
+        created = []
+        def __init__(self, max_workers, thread_name_prefix=None):
+            self.max_workers = max_workers
+            self.thread_name_prefix = thread_name_prefix
+            self.shutdown_called = False
+            DummyPool.created.append(self)
+        def shutdown(self, wait=False, cancel_futures=True):
+            self.shutdown_called = True
+
+    async def _dummy_loop(name, coro_factory, interval_seconds, max_retries=2, run_on_start=False):
+        await asyncio.sleep(0)
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_file = f.name
+    try:
+        monkeypatch.setattr(scheduler, "_run_task_loop", _dummy_loop)
+        monkeypatch.setattr(scheduler.concurrent.futures, "ThreadPoolExecutor", DummyPool)
+
+        db = FakeDb(db_file)
+        asyncio.run(scheduler.start_scheduler(db))
+        asyncio.run(scheduler.stop_scheduler())
+
+        assert DummyPool.created, "ThreadPoolExecutor was not created"
+        assert DummyPool.created[0].max_workers == 7
+    finally:
+        try:
+            os.unlink(db_file)
+        except PermissionError:
+            pass
+
+
 def test_evaluate_consensus_stop_hit():
     """LONG consensus: stop triggered → stop_hit=1, pnl negative."""
     from consensus_evaluator import evaluate_consensus_records
@@ -1075,7 +1167,7 @@ def test_evaluate_consensus_intraday_no_data_intraday():
         r = dict(con2.execute("SELECT * FROM consensus WHERE id=1").fetchone())
         con2.close()
 
-        assert r["eval_status"] == "NO_DATA_INTRADAY", f"Expected NO_DATA_INTRADAY for intraday horizon, got {r['eval_status']}"
+        assert r["eval_status"] == "NO_DATA", f"Expected NO_DATA for intraday horizon with no bars, got {r['eval_status']}"
         # Intraday records should NOT be counted as evaluated
         assert count == 0
 
@@ -1125,7 +1217,12 @@ def test_save_consensus_computes_horizon_hours():
                 target_price REAL, stop_loss REAL, entry_limit_price REAL,
                 high_model_disagreement INTEGER DEFAULT 0,
                 horizon_hours INTEGER, eval_target_date TEXT, eval_status TEXT,
-                run_id INTEGER, original_run_id INTEGER
+                run_id INTEGER, original_run_id INTEGER,
+                order_state TEXT DEFAULT '',
+                order_checked_at TEXT DEFAULT '',
+                order_attempted_at TEXT DEFAULT '',
+                order_reason TEXT DEFAULT '',
+                trade_id INTEGER
             )
         """)
         con.commit()
@@ -1534,6 +1631,181 @@ def test_first_hit_analysis_target_first():
     
     assert dist_to_stop2 < dist_to_target2
     # Therefore stop hit first
+
+
+# ===========================================================================
+# consensus.py — model_stats parameter & total_weight accumulation (ред. 2)
+# ===========================================================================
+
+def test_consensus_model_stats_overrides_method_stats_ema():
+    """model_stats keyed by model name takes precedence over method_stats for ema_accuracy."""
+    from consensus import calculate_consensus
+
+    # Both method_stats and model_stats present for different resolution paths.
+    # model_stats["gpt-4o"] should win over method_stats["m1"] for ema_accuracy.
+    method_stats = {"m1": {"win_rate": 0.5, "ema_accuracy": 0.3}}  # Low accuracy from method
+    model_stats = {"gpt-4o": {"ema_accuracy": 0.7}}                  # High accuracy from model
+
+    forecasts = [
+        {"side": "LONG", "confidence": 60, "method": "m1", "model": "gpt-4o",
+         "log_id": "logA", "target_price": 110.0, "stop_loss": 95.0},
+    ]
+    result = calculate_consensus(
+        forecasts,
+        method_stats=method_stats,
+        model_stats=model_stats,
+        current_price=100.0,
+        run_id=1,
+        log_ids={0: "logA"},
+    )
+    link_data = result["_forecast_link_data"][0]
+    # ema_accuracy should be 0.7 (from model_stats), NOT 0.3 (from method_stats)
+    assert link_data["ema_accuracy"] == 0.7
+    # calibration_factor = 0.7 / 0.5 = 1.4
+    assert link_data["calibration_factor"] == 1.4
+
+
+def test_consensus_model_stats_fallback_to_method_stats():
+    """If model not in model_stats, falls back to method_stats ema_accuracy."""
+    from consensus import calculate_consensus
+
+    method_stats = {"m1": {"win_rate": 0.5, "ema_accuracy": 0.45}}
+    model_stats = {}  # Empty — no model entry
+
+    forecasts = [
+        {"side": "LONG", "confidence": 70, "method": "m1", "model": "unknown-model",
+         "log_id": "logB", "target_price": 110.0, "stop_loss": 95.0},
+    ]
+    result = calculate_consensus(
+        forecasts,
+        method_stats=method_stats,
+        model_stats=model_stats,
+        current_price=100.0,
+        run_id=1,
+        log_ids={0: "logB"},
+    )
+    link_data = result["_forecast_link_data"][0]
+    # Should fall back to method_stats ema_accuracy=0.45
+    assert link_data["ema_accuracy"] == 0.45
+    # calibration_factor = 0.45 / 0.5 = 0.9
+    assert abs(link_data["calibration_factor"] - 0.9) < 0.001
+
+
+def test_consensus_total_weight_accumulates_all_non_filtered():
+    """total_weight must include all non-filtered forecasts regardless of direction."""
+    from consensus import calculate_consensus
+
+    # 2 LONG + 2 SHORT with equal confidence and no stats
+    # total_weight should = 4 × (0.6 × 0.5 × 1.0) = 1.2 (all four weighted)
+    forecasts = [
+        {"side": "LONG",  "confidence": 60, "method": "m1", "model": "A"},
+        {"side": "LONG",  "confidence": 60, "method": "m2", "model": "B"},
+        {"side": "SHORT", "confidence": 60, "method": "m3", "model": "C"},
+        {"side": "SHORT", "confidence": 60, "method": "m4", "model": "D"},
+    ]
+    result = calculate_consensus(forecasts, current_price=100.0)
+    # Equal LONG vs SHORT → high disagreement → NEUTRAL
+    assert result["signal"] == "NEUTRAL"
+    # confidence forced to 0 by disagreement
+    assert result["confidence"] == 0.0
+
+
+def test_consensus_total_weight_not_counting_filtered():
+    """Anomaly-filtered forecasts must NOT add to total_weight."""
+    from consensus import calculate_consensus
+
+    # One extreme forecast (will be filtered) + one valid LONG
+    forecasts = [
+        # This will be filtered: target 50% away from price
+        {"side": "LONG", "confidence": 80, "method": "m1", "model": "A",
+         "target_price": 150.0, "stop_loss": 90.0},
+        # Valid LONG
+        {"side": "LONG", "confidence": 70, "method": "m2", "model": "B",
+         "target_price": 110.0, "stop_loss": 90.0},
+    ]
+    result = calculate_consensus(forecasts, current_price=100.0, max_deviation=0.15)
+    # Only the valid LONG remains → LONG consensus
+    assert result["signal"] == "LONG"
+    assert "1 filtered by anomaly" in result["rationale"]
+
+
+def test_consensus_evaluator_exit_successful_persisted():
+    """exit_successful must be saved to DB when target hit first."""
+    from consensus_evaluator import evaluate_consensus_records
+    from datetime import datetime, timedelta
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+        db_path = os.path.join(tmpdir, "test.db")
+        eval_date = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        cons_date = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
+        ticker = "TEST:EXIT"
+
+        _make_consensus_db(db_path, [{
+            "date": cons_date, "ticker": ticker, "signal": "LONG",
+            "confidence": 75.0, "methods_long": "tech", "methods_short": "",
+            "methods_neutral": "", "rationale": "",
+            "target_price": 105.0, "stop_loss": 95.0,
+            "eval_target_date": eval_date, "eval_status": "PENDING",
+        }])
+        # Entry bar: close=100
+        _add_price_bar(db_path, ticker, cons_date[:10], 100.0, 101.0, 99.0, 100.0)
+        # Eval bar: high=108 (>105 target), low=97 (>95 stop) → only target hit
+        _add_price_bar(db_path, ticker, eval_date[:10], 100.0, 108.0, 97.0, 107.0)
+
+        db = _MockDB(db_path)
+        count = evaluate_consensus_records(db)
+        assert count == 1
+
+        con2 = sqlite3.connect(db_path)
+        con2.row_factory = sqlite3.Row
+        r = dict(con2.execute("SELECT * FROM consensus WHERE id=1").fetchone())
+        con2.close()
+
+        assert r["eval_status"] == "EVALUATED"
+        assert r["target_hit"] == 1
+        assert r["stop_hit"] == 0
+        assert r["first_hit"] == "target"
+        assert r["exit_successful"] == 1  # Must be persisted
+
+
+def test_consensus_evaluator_exit_successful_stop_first():
+    """Both target and stop hit but stop is closer to open → exit_successful=0."""
+    from consensus_evaluator import evaluate_consensus_records
+    from datetime import datetime, timedelta
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+        db_path = os.path.join(tmpdir, "test.db")
+        eval_date = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
+        cons_date = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S")
+        ticker = "TEST:STOP"
+
+        _make_consensus_db(db_path, [{
+            "date": cons_date, "ticker": ticker, "signal": "LONG",
+            "confidence": 70.0, "methods_long": "tech", "methods_short": "",
+            "methods_neutral": "", "rationale": "",
+            "target_price": 115.0,  # 15 points above open=100
+            "stop_loss": 98.0,      # 2 points below open=100 → closer
+            "eval_target_date": eval_date, "eval_status": "PENDING",
+        }])
+        _add_price_bar(db_path, ticker, cons_date[:10], 100.0, 101.0, 99.0, 100.0)
+        # open=100, high=117 (>115 target), low=96 (<98 stop) — both hit
+        # stop=98 is 2 points from open; target=115 is 15 points → stop hit first
+        _add_price_bar(db_path, ticker, eval_date[:10], 100.0, 117.0, 96.0, 100.0)
+
+        db = _MockDB(db_path)
+        count = evaluate_consensus_records(db)
+        assert count == 1
+
+        con2 = sqlite3.connect(db_path)
+        con2.row_factory = sqlite3.Row
+        r = dict(con2.execute("SELECT * FROM consensus WHERE id=1").fetchone())
+        con2.close()
+
+        assert r["eval_status"] == "EVALUATED"
+        assert r["target_hit"] == 1
+        assert r["stop_hit"] == 1
+        assert r["first_hit"] == "stop"
+        assert r["exit_successful"] == 0  # Stop was first
 
 
 if __name__ == "__main__":

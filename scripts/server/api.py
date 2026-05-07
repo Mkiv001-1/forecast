@@ -3,6 +3,7 @@
 import os
 import sys
 import logging
+from datetime import datetime
 from typing import List, Optional
 from contextlib import asynccontextmanager
 
@@ -31,8 +32,10 @@ from scripts.shared.models import (
     ConsensusRecord, ConsensusResponse,
     PositionRecord, PortfolioResponse,
     AccountRecord, AccountsResponse,
-    SystemLogResponse,
+    SystemLogResponse, OrderSubmitRequest, OrderSubmitResponse,
+    ForecastRunLink, ForecastRunRecord, ForecastRunsResponse, ForecastRunDetailResponse,
 )
+from scripts.core.config import CONFIDENCE_THRESHOLD
 from scripts.server.config import ServerConfig
 from scripts.server.robot import RobotRunner
 
@@ -64,7 +67,40 @@ async def lifespan(app: FastAPI):
     logger.info(f"Server started on {_config.host}:{_config.port}")
     logger.info(f"DB file: {_config.db_file}")
     logger.info(f"API Key: {_config.api_key}")
+
+    # Mark any runs stuck as 'running' from a previous server session as failed
+    try:
+        import sqlite3 as _sqlite3
+        with _sqlite3.connect(_config.db_file) as _con:
+            _rows = _con.execute(
+                "UPDATE forecast_runs SET status='failed', completed_at=started_at "
+                "WHERE status='running' AND completed_at IS NULL"
+            ).rowcount
+        if _rows:
+            logger.info(f"startup: marked {_rows} stuck forecast_run(s) as failed")
+    except Exception as e:
+        logger.warning(f"startup: cleanup stuck runs failed: {e}")
+
+    # Start background task scheduler
+    try:
+        _ensure_paths()
+        from scripts.core.scheduler import start_scheduler
+        db = _get_db_manager()
+        await start_scheduler(db)
+        logger.info("Scheduler started")
+    except Exception as e:
+        logger.warning(f"Scheduler startup failed (non-fatal): {e}")
+
     yield
+
+    # Stop scheduler on shutdown
+    try:
+        from scripts.core.scheduler import stop_scheduler
+        await stop_scheduler()
+        logger.info("Scheduler stopped")
+    except Exception as e:
+        logger.warning(f"Scheduler shutdown error: {e}")
+
     logger.info("Server shutting down")
 
 
@@ -100,9 +136,39 @@ def _get_db_manager():
     return SQLiteManager(_config.db_file)
 
 
-def _get_excel_manager():
+def _get_data_manager():
     """Legacy alias — all callers use SQLiteManager now."""
     return _get_db_manager()
+
+
+def _clean_record(record: dict) -> dict:
+    """Convert NaN / numpy types to plain Python for JSON serialisation."""
+    import math
+    out = {}
+    for k, v in record.items():
+        if v is None:
+            out[k] = None
+            continue
+        try:
+            import numpy as np
+            if isinstance(v, np.integer):
+                out[k] = int(v); continue
+            if isinstance(v, np.floating):
+                out[k] = None if math.isnan(float(v)) else float(v); continue
+            if isinstance(v, np.bool_):
+                out[k] = bool(v); continue
+        except ImportError:
+            pass
+        if isinstance(v, float) and math.isnan(v):
+            out[k] = None
+        else:
+            out[k] = v
+    return out
+
+
+def _clean_records(records: list) -> list:
+    """Apply _clean_record to a list of dicts."""
+    return [_clean_record(r) for r in records]
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -110,8 +176,8 @@ async def health_check():
     db_exists = os.path.exists(_config.db_file) if _config else False
     return HealthResponse(
         status="ok",
-        excel_file=_config.db_file if _config else None,
-        excel_exists=db_exists,
+        db_file=_config.db_file if _config else None,
+        db_exists=db_exists,
         server=f"{_config.host}:{_config.port}" if _config else None,
     )
 
@@ -126,7 +192,7 @@ async def get_logs(
     limit: int = Query(500, ge=1, le=5000),
 ):
     try:
-        em = _get_excel_manager()
+        em = _get_data_manager()
         df = em.read_sheet("Logs")
         if df.empty:
             return LogsResponse(items=[], total=0)
@@ -159,7 +225,7 @@ async def get_logs(
 @app.get("/logs/{log_id}", response_model=ForecastLog, dependencies=[Depends(verify_api_key)])
 async def get_log(log_id: str):
     try:
-        em = _get_excel_manager()
+        em = _get_data_manager()
         df = em.read_sheet("Logs")
         if df.empty:
             raise HTTPException(status_code=404, detail="Not found")
@@ -178,7 +244,7 @@ async def get_log(log_id: str):
 @app.get("/tickers", response_model=TickersResponse, dependencies=[Depends(verify_api_key)])
 async def get_tickers():
     try:
-        em = _get_excel_manager()
+        em = _get_data_manager()
         df = em.read_sheet("Settings")
         if df.empty:
             return TickersResponse(items=[])
@@ -309,6 +375,13 @@ async def run_full():
     return RunResponse(status="running", message="Full cycle started", started_at=_runner.started_at)
 
 
+@app.post("/run/price-data", response_model=RunResponse, dependencies=[Depends(verify_api_key)])
+async def run_price_data():
+    if not _runner.start("price_data"):
+        raise HTTPException(status_code=409, detail="Robot is already running")
+    return RunResponse(status="running", message="Price data update started", started_at=_runner.started_at)
+
+
 @app.get("/run/status", response_model=RunResponse, dependencies=[Depends(verify_api_key)])
 async def run_status():
     return RunResponse(
@@ -408,10 +481,12 @@ async def get_price_data(
 async def get_indicators(
     ticker: Optional[str] = None,
     limit: int = Query(200, le=2000),
+    date_from: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
+    date_to: Optional[str] = Query(None, description="End date YYYY-MM-DD"),
 ):
     try:
         em = _get_db_manager()
-        df = em.get_indicators(ticker=ticker, limit=limit)
+        df = em.get_indicators(ticker=ticker, limit=limit, date_from=date_from, date_to=date_to)
         if df.empty:
             return IndicatorsResponse(items=[], total=0)
         df = df.where(df.notna(), None)
@@ -446,6 +521,135 @@ async def get_consensus(
     except Exception as e:
         logger.exception("Error reading consensus")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Consensus evaluate endpoint
+# ---------------------------------------------------------------------------
+
+@app.post("/consensus/evaluate", dependencies=[Depends(verify_api_key)])
+async def evaluate_consensus():
+    """Manually trigger evaluation of pending consensus records.
+
+    Returns detailed result with counts of processed records.
+    This is a synchronous call - waits for evaluation to complete.
+    """
+    logger.info("consensus/evaluate: starting manual evaluation request")
+    try:
+        import sys, os
+        core_dir = os.path.join(_PROJECT_ROOT, "scripts", "core")
+        for p in [_PROJECT_ROOT, core_dir]:
+            if p not in sys.path:
+                sys.path.insert(0, p)
+        from scripts.core.consensus_evaluator import evaluate_consensus_records
+        em = _get_db_manager()
+
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Check pending records - ready vs not ready
+        with em._connect() as con:
+            # Ready for evaluation (target date passed)
+            cur = con.execute(
+                "SELECT COUNT(*) FROM consensus WHERE eval_status = 'PENDING' AND eval_target_date IS NOT NULL AND eval_target_date <= ?",
+                (now_str,)
+            )
+            ready_before = cur.fetchone()[0]
+            # Pending but not ready yet (target date in future)
+            cur = con.execute(
+                "SELECT COUNT(*) FROM consensus WHERE eval_status = 'PENDING' AND eval_target_date IS NOT NULL AND eval_target_date > ?",
+                (now_str,)
+            )
+            not_ready = cur.fetchone()[0]
+            # Pending without target date
+            cur = con.execute(
+                "SELECT COUNT(*) FROM consensus WHERE eval_status = 'PENDING' AND (eval_target_date IS NULL OR eval_target_date = '')"
+            )
+            no_target = cur.fetchone()[0]
+
+        logger.info(f"consensus/evaluate: ready={ready_before}, not_ready={not_ready}, no_target={no_target}")
+
+        count = evaluate_consensus_records(em)
+
+        # Check results after evaluation
+        with em._connect() as con:
+            cur = con.execute(
+                "SELECT COUNT(*) FROM consensus WHERE eval_status = 'PENDING' AND eval_target_date IS NOT NULL AND eval_target_date <= ?",
+                (now_str,)
+            )
+            ready_after = cur.fetchone()[0]
+            cur = con.execute(
+                "SELECT COUNT(*) FROM consensus WHERE eval_status = 'EVALUATED'"
+            )
+            total_evaluated = cur.fetchone()[0]
+
+        logger.info(
+            f"consensus/evaluate: completed. processed={count}, "
+            f"ready_before={ready_before}, ready_after={ready_after}, "
+            f"total_evaluated={total_evaluated}"
+        )
+
+        return {
+            "status": "completed",
+            "message": f"Evaluated {count} consensus records",
+            "processed": count,
+            "ready_before": ready_before,
+            "ready_after": ready_after,
+            "not_ready": not_ready,
+            "no_target": no_target,
+            "total_evaluated": total_evaluated,
+        }
+    except Exception as e:
+        logger.exception(f"consensus/evaluate error: {e}")
+        raise HTTPException(status_code=500, detail=f"Evaluation failed: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# Consensus recalculate endpoint
+# ---------------------------------------------------------------------------
+
+@app.post("/consensus/recalculate", dependencies=[Depends(verify_api_key)])
+async def recalculate_consensus(
+    date_from: str = Query(None, description="Start date YYYY-MM-DD"),
+    date_to: str = Query(None, description="End date YYYY-MM-DD"),
+    force: bool = Query(False, description="If true, overwrite EVALUATED records and reset eval fields"),
+):
+    """Recalculate consensus records from historical forecast logs.
+
+    Groups forecasts by (created_date, ticker), calculates consensus for each group,
+    and creates/updates consensus records.
+    When force=True, overwrites all records including EVALUATED and resets eval fields.
+    """
+    logger.info(f"consensus/recalculate: starting date_from={date_from}, date_to={date_to}, force={force}")
+    try:
+        import sys, os
+        core_dir = os.path.join(_PROJECT_ROOT, "scripts", "core")
+        for p in [_PROJECT_ROOT, core_dir]:
+            if p not in sys.path:
+                sys.path.insert(0, p)
+        from scripts.core.consensus_recalc import recalculate_consensus
+        em = _get_db_manager()
+
+        stats = recalculate_consensus(em, date_from=date_from, date_to=date_to, force=force)
+
+        logger.info(
+            f"consensus/recalculate: completed. "
+            f"created={stats['created']}, updated={stats['updated']}, "
+            f"skipped={stats['skipped']}, errors={stats['errors']}"
+        )
+
+        return {
+            "status": "completed",
+            "message": f"Recalculated {stats['total_groups']} consensus groups",
+            "created": stats["created"],
+            "updated": stats["updated"],
+            "skipped": stats["skipped"],
+            "evaluated": stats.get("evaluated", 0),
+            "errors": stats["errors"],
+            "total_groups": stats["total_groups"],
+        }
+    except Exception as e:
+        logger.exception(f"consensus/recalculate error: {e}")
+        raise HTTPException(status_code=500, detail=f"Recalculation failed: {str(e)}")
 
 
 # ---------------------------------------------------------------------------
@@ -814,4 +1018,728 @@ async def delete_ib_config(config_id: int):
         return {"deleted": config_id}
     except Exception as e:
         logger.exception("Error deleting IB config")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# IB Order Types endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/ib-order-types", dependencies=[Depends(verify_api_key)])
+async def get_ib_order_types(active_only: bool = Query(False)):
+    """Get IB order types. If active_only=True, return only enabled types."""
+    try:
+        em = _get_db_manager()
+        df = em.get_order_types(active_only=active_only)
+        if df.empty:
+            return {"items": [], "total": 0}
+        df = df.where(df.notna(), None)
+        return {"items": df.to_dict("records"), "total": len(df)}
+    except Exception as e:
+        logger.exception("Error reading IB order types")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/ib-order-types/{order_type_code}/active", dependencies=[Depends(verify_api_key)])
+async def set_ib_order_type_active(order_type_code: str, body: dict = Body(...)):
+    """Enable/disable an order type."""
+    try:
+        em = _get_db_manager()
+        active = body.get("active", True)
+        ok = em.set_order_type_active(order_type_code, active)
+        if not ok:
+            raise HTTPException(status_code=404, detail=f"Order type '{order_type_code}' not found")
+        return {"order_type_code": order_type_code, "active": active}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error updating IB order type")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ib-order-types/reset", dependencies=[Depends(verify_api_key)])
+async def reset_ib_order_types():
+    """Reset order types to defaults."""
+    try:
+        em = _get_db_manager()
+        ok = em.reset_order_types()
+        if not ok:
+            raise HTTPException(status_code=500, detail="Failed to reset order types")
+        return {"reset": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error resetting IB order types")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Capital & consensus endpoints (ред. 2)
+# ---------------------------------------------------------------------------
+
+@app.get("/capital", dependencies=[Depends(verify_api_key)])
+async def get_capital():
+    """Return available NetLiquidation from IB or manual override."""
+    try:
+        _ensure_paths()
+        from scripts.core.capital_provider import get_net_liquidation_async
+        em = _get_db_manager()
+        net_liq = await get_net_liquidation_async(em)
+        return {"net_liquidation": net_liq}
+    except Exception as e:
+        logger.exception("Error fetching capital")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/consensus", dependencies=[Depends(verify_api_key)])
+async def get_consensus(ticker: Optional[str] = None, limit: int = Query(50, ge=1, le=500)):
+    """Return recent consensus records, optionally filtered by ticker."""
+    try:
+        import sqlite3
+        em = _get_db_manager()
+        with em._connect() as con:
+            if ticker:
+                rows = con.execute(
+                    "SELECT * FROM consensus WHERE UPPER(ticker)=UPPER(?) ORDER BY date DESC LIMIT ?",
+                    (ticker, limit)
+                ).fetchall()
+            else:
+                rows = con.execute(
+                    "SELECT * FROM consensus ORDER BY date DESC LIMIT ?",
+                    (limit,)
+                ).fetchall()
+        return {"items": [dict(r) for r in rows], "total": len(rows)}
+    except Exception as e:
+        logger.exception("Error fetching consensus")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Forecast Run tracking endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/forecast-runs", dependencies=[Depends(verify_api_key)])
+async def get_forecast_runs(limit: int = Query(50, ge=1, le=200)):
+    """Return recent forecast runs with aggregated statistics."""
+    try:
+        em = _get_db_manager()
+        df = em.get_forecast_runs(limit=limit)
+        items = _clean_records(df.to_dict('records')) if not df.empty else []
+        return {"items": items, "total": len(items)}
+    except Exception as e:
+        logger.exception("Error fetching forecast runs")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/forecast-runs/{run_id}", dependencies=[Depends(verify_api_key)])
+async def get_forecast_run_detail(run_id: int):
+    """Return detailed info for a specific forecast run including all links."""
+    try:
+        em = _get_db_manager()
+
+        run = em.get_forecast_run(run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail=f"Forecast run {run_id} not found")
+
+        links_df = em.get_forecast_run_links(run_id)
+        links = _clean_records(links_df.to_dict('records')) if not links_df.empty else []
+
+        consensus = []
+        try:
+            with em._connect() as con:
+                rows = con.execute(
+                    "SELECT * FROM consensus WHERE run_id = ? ORDER BY date DESC",
+                    (run_id,)
+                ).fetchall()
+                consensus = _clean_records([dict(r) for r in rows])
+        except Exception:
+            pass
+
+        return {
+            "run": _clean_record(run) if isinstance(run, dict) else run,
+            "links": links,
+            "consensus": consensus if consensus else None,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Error fetching forecast run {run_id}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Order management endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/orders", dependencies=[Depends(verify_api_key)])
+async def get_orders(
+    ticker: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=1000),
+):
+    """Return orders from the orders table."""
+    try:
+        em = _get_db_manager()
+        with em._connect() as con:
+            clauses = []
+            params: list = []
+            if ticker:
+                clauses.append("UPPER(ticker)=UPPER(?)")
+                params.append(ticker)
+            if status:
+                clauses.append("UPPER(status)=UPPER(?)")
+                params.append(status)
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            params.append(limit)
+            rows = con.execute(
+                f"SELECT * FROM orders {where} ORDER BY created_at DESC LIMIT ?",
+                params
+            ).fetchall()
+        return {"items": [dict(r) for r in rows], "total": len(rows)}
+    except Exception as e:
+        logger.exception("Error fetching orders")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/orders/{order_id}/cancel", dependencies=[Depends(verify_api_key)])
+async def cancel_order_endpoint(order_id: int):
+    """Cancel an IB order by DB id."""
+    try:
+        _ensure_paths()
+        em = _get_db_manager()
+        with em._connect() as con:
+            row = con.execute(
+                "SELECT ib_order_id, account_type FROM orders WHERE id=?", (order_id,)
+            ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Order not found")
+        ib_id, mode = row["ib_order_id"], row["account_type"]
+        port = 7496 if mode == "live" else 7497
+        from scripts.core.ib_gateway_client import cancel_order
+        import asyncio
+        ok = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: cancel_order(ib_id, port=port)
+        )
+        if ok:
+            with em._connect() as con:
+                con.execute("UPDATE orders SET status='CANCELLED' WHERE id=?", (order_id,))
+        return {"cancelled": ok, "order_id": order_id, "ib_order_id": ib_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error cancelling order")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/orders/submit", response_model=OrderSubmitResponse, dependencies=[Depends(verify_api_key)])
+async def submit_order_manual(body: OrderSubmitRequest):
+    """Manually submit order for ticker based on latest consensus."""
+    try:
+        _ensure_paths()
+        em = _get_db_manager()
+
+        # 1. Get latest consensus
+        with em._connect() as con:
+            row = con.execute(
+                "SELECT * FROM consensus WHERE ticker = ? ORDER BY date DESC LIMIT 1",
+                (body.ticker,)
+            ).fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail=f"No consensus found for {body.ticker}")
+
+        consensus = dict(row)
+        signal = consensus.get("signal", "NEUTRAL")
+        confidence = consensus.get("confidence", 0.0)
+
+        # 2. Validate signal
+        if signal not in ("LONG", "SHORT"):
+            return OrderSubmitResponse(
+                status="SKIPPED_NEUTRAL",
+                order_ids=[],
+                message=f"Signal is {signal}, not LONG/SHORT",
+                consensus_signal=signal,
+                confidence=confidence
+            )
+
+        if confidence < CONFIDENCE_THRESHOLD:
+            return OrderSubmitResponse(
+                status="SKIPPED_LOW_CONFIDENCE",
+                order_ids=[],
+                message=f"Confidence {confidence:.1f}% < {CONFIDENCE_THRESHOLD}%",
+                consensus_signal=signal,
+                confidence=confidence
+            )
+
+        # 3. Override with request params if provided
+        if body.stop_loss is not None:
+            consensus["stop_loss"] = body.stop_loss
+        if body.target_price is not None:
+            consensus["target_price"] = body.target_price
+        if body.entry_limit_price is not None:
+            consensus["entry_limit_price"] = body.entry_limit_price
+
+        # 4. Check required levels
+        if not consensus.get("stop_loss") or not consensus.get("target_price"):
+            return OrderSubmitResponse(
+                status="SKIPPED_MISSING_LEVELS",
+                order_ids=[],
+                message="Missing stop_loss or target_price",
+                consensus_signal=signal,
+                confidence=confidence
+            )
+
+        # 5. Get capital and calculate position
+        from scripts.core.capital_provider import get_capital
+        from scripts.core.position_sizer import calculate_position
+        from scripts.core.order_manager import submit_signal
+
+        capital = get_capital(em)
+        if capital["status"] != "OK":
+            return OrderSubmitResponse(
+                status="SKIPPED_NO_CAPITAL",
+                order_ids=[],
+                message=f"Capital error: {capital['status']}",
+                consensus_signal=signal,
+                confidence=confidence
+            )
+
+        # Get current price from latest price_data
+        with em._connect() as con:
+            price_row = con.execute(
+                "SELECT close FROM price_data WHERE ticker = ? ORDER BY date DESC LIMIT 1",
+                (body.ticker,)
+            ).fetchone()
+        current_price = price_row["close"] if price_row else consensus.get("target_price", 0)
+
+        position = calculate_position(
+            ticker=body.ticker,
+            entry_price=current_price,
+            stop_loss=consensus["stop_loss"],
+            db_manager=em,
+            net_liquidation=capital["net_liquidation"]
+        )
+
+        if position["status"] != "OK" or position["quantity"] <= 0:
+            return OrderSubmitResponse(
+                status=position.get("status", "INVALID_POSITION"),
+                order_ids=[],
+                message=f"Position sizing failed: {position.get('status', 'unknown')}",
+                consensus_signal=signal,
+                confidence=confidence
+            )
+
+        # Override quantity if provided
+        if body.quantity is not None and body.quantity > 0:
+            position["quantity"] = body.quantity
+
+        # 6. Submit order
+        log_id = em.get_latest_forecast_log_id(body.ticker)
+        result = submit_signal(
+            ticker=body.ticker,
+            consensus=consensus,
+            position_size=position,
+            db_manager=em,
+            log_id=log_id or ""
+        )
+
+        return OrderSubmitResponse(
+            status=result["status"],
+            order_ids=result.get("order_ids", []),
+            message=result.get("message", ""),
+            consensus_signal=signal,
+            confidence=confidence
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error submitting order")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Scheduler & circuit breaker status endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/scheduler/status", dependencies=[Depends(verify_api_key)])
+async def get_scheduler_status():
+    """Return running status of scheduler tasks."""
+    try:
+        _ensure_paths()
+        from scripts.core.scheduler import get_task_status
+        return {"tasks": get_task_status()}
+    except Exception as e:
+        return {"tasks": {}, "error": str(e)}
+
+
+@app.get("/scheduler/tasks", dependencies=[Depends(verify_api_key)])
+async def get_scheduler_tasks():
+    """Return all rows from scheduled_tasks table."""
+    try:
+        em = _get_db_manager()
+        with em._connect() as con:
+            rows = con.execute(
+                "SELECT * FROM scheduled_tasks ORDER BY name"
+            ).fetchall()
+        return {"items": [dict(r) for r in rows], "total": len(rows)}
+    except Exception as e:
+        logger.exception("Error fetching scheduler tasks")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/scheduler/tasks/{name}/active", dependencies=[Depends(verify_api_key)])
+async def set_task_active(name: str, body: dict = Body(...)):
+    """Enable or disable a scheduled task (is_active 0 or 1)."""
+    try:
+        active = int(bool(body.get("active", 1)))
+        em = _get_db_manager()
+        with em._connect() as con:
+            cur = con.execute(
+                "UPDATE scheduled_tasks SET is_active=? WHERE name=?",
+                (active, name)
+            )
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail=f"Task '{name}' not found")
+        return {"name": name, "is_active": active}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error updating task active state")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/circuit-breaker/status", dependencies=[Depends(verify_api_key)])
+async def get_circuit_breaker_status():
+    """Return OpenRouter circuit breaker state."""
+    try:
+        _ensure_paths()
+        from scripts.core.circuit_breaker import status as cb_status
+        return cb_status()
+    except Exception as e:
+        return {"state": "UNKNOWN", "error": str(e)}
+
+
+@app.post("/circuit-breaker/reset", dependencies=[Depends(verify_api_key)])
+async def reset_circuit_breaker():
+    """Manually reset circuit breaker to CLOSED."""
+    try:
+        _ensure_paths()
+        from scripts.core.circuit_breaker import reset as cb_reset
+        cb_reset()
+        return {"state": "CLOSED", "reset": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Method config endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/method-config", dependencies=[Depends(verify_api_key)])
+async def get_method_config():
+    """Return method configuration (timeframe_hours, trigger, active)."""
+    try:
+        em = _get_db_manager()
+        with em._connect() as con:
+            rows = con.execute("SELECT * FROM method_config ORDER BY method").fetchall()
+        return {"items": [dict(r) for r in rows], "total": len(rows)}
+    except Exception as e:
+        logger.exception("Error fetching method_config")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/method-config", dependencies=[Depends(verify_api_key)])
+async def create_method_config(body: dict = Body(...)):
+    """Create a new method with its config and empty prompt template."""
+    try:
+        method = body.get("method", "").strip()
+        if not method:
+            raise HTTPException(status_code=400, detail="method name is required")
+        timeframe_hours = int(body.get("timeframe_hours", 24))
+        trigger = body.get("trigger", "both")
+        if trigger not in ("both", "time", "price_level"):
+            raise HTTPException(status_code=400, detail="trigger must be 'both', 'time', or 'price_level'")
+        execute = body.get("execute", "yes")
+        if execute not in ("yes", "no"):
+            execute = "yes"
+
+        em = _get_db_manager()
+        ts = __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with em._connect() as con:
+            existing = con.execute(
+                "SELECT 1 FROM method_config WHERE method=?", (method,)
+            ).fetchone()
+            if existing:
+                raise HTTPException(status_code=409, detail=f"Method '{method}' already exists")
+            con.execute(
+                "INSERT INTO method_config(method, timeframe_hours, trigger, active, execute) VALUES (?,?,?,1,?)",
+                (method, timeframe_hours, trigger, execute),
+            )
+            con.execute(
+                "INSERT OR IGNORE INTO prompt_templates(method, prompt_text, updated_at) VALUES (?,?,?)",
+                (method, "", ts),
+            )
+        logger.info(f"Created new method: {method}")
+        return {"method": method, "timeframe_hours": timeframe_hours, "trigger": trigger, "execute": execute}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error creating method_config")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/method-config/{method}", dependencies=[Depends(verify_api_key)])
+async def update_method_config(method: str, body: dict = Body(...)):
+    """Update timeframe_hours / trigger / active for a method."""
+    try:
+        em = _get_db_manager()
+        allowed = {"timeframe_hours", "trigger", "active"}
+        updates = {k: v for k, v in body.items() if k in allowed}
+        if not updates:
+            raise HTTPException(status_code=400, detail="No valid fields provided")
+        set_parts = ", ".join(f"{k}=?" for k in updates)
+        params = list(updates.values()) + [method]
+        with em._connect() as con:
+            cur = con.execute(
+                f"UPDATE method_config SET {set_parts} WHERE method=?", params
+            )
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail=f"Method '{method}' not found")
+        return {"method": method, "updated": updates}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error updating method_config")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Execute field management endpoints
+# ---------------------------------------------------------------------------
+
+@app.put("/method-config/{method}/execute", dependencies=[Depends(verify_api_key)])
+async def update_method_execute(method: str, execute: str = Body(..., embed=True)):
+    """Update execute flag for a method ('yes' or 'no')."""
+    try:
+        if execute not in ("yes", "no"):
+            raise HTTPException(status_code=400, detail="execute must be 'yes' or 'no'")
+        
+        em = _get_db_manager()
+        with em._connect() as con:
+            cur = con.execute(
+                "UPDATE method_config SET execute=? WHERE method=?", 
+                (execute, method)
+            )
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail=f"Method '{method}' not found")
+        
+        logger.info(f"Updated method {method} execute={execute}")
+        return {"method": method, "execute": execute}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error updating method execute")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/providers/{provider}/execute", dependencies=[Depends(verify_api_key)])
+async def update_provider_execute(provider: str, execute: str = Body(..., embed=True)):
+    """Update execute flag for a provider ('yes' or 'no')."""
+    try:
+        if execute not in ("yes", "no"):
+            raise HTTPException(status_code=400, detail="execute must be 'yes' or 'no'")
+        
+        em = _get_db_manager()
+        with em._connect() as con:
+            cur = con.execute(
+                "UPDATE providers SET execute=? WHERE name=?", 
+                (execute, provider)
+            )
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail=f"Provider '{provider}' not found")
+        
+        logger.info(f"Updated provider {provider} execute={execute}")
+        return {"provider": provider, "execute": execute}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error updating provider execute")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/method-config/{method}", dependencies=[Depends(verify_api_key)])
+async def get_method_config_detail(method: str):
+    """Return detailed configuration for a specific method including execute flag."""
+    try:
+        em = _get_db_manager()
+        with em._connect() as con:
+            row = con.execute(
+                "SELECT * FROM method_config WHERE method=?", 
+                (method,)
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail=f"Method '{method}' not found")
+        return dict(row)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error fetching method config")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/providers/{provider}", dependencies=[Depends(verify_api_key)])
+async def get_provider_detail(provider: str):
+    """Return detailed configuration for a specific provider including execute flag."""
+    try:
+        em = _get_db_manager()
+        with em._connect() as con:
+            row = con.execute(
+                "SELECT * FROM providers WHERE name=?", 
+                (provider,)
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail=f"Provider '{provider}' not found")
+        return dict(row)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error fetching provider config")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat log endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/heartbeat/history", dependencies=[Depends(verify_api_key)])
+async def get_heartbeat_history(limit: int = Query(50, ge=1, le=500)):
+    """Return recent heartbeat log entries."""
+    try:
+        em = _get_db_manager()
+        with em._connect() as con:
+            rows = con.execute(
+                "SELECT * FROM heartbeat_log ORDER BY checked_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return {"items": [dict(r) for r in rows], "total": len(rows)}
+    except Exception as e:
+        logger.exception("Error fetching heartbeat history")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Tickets endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/tickets", dependencies=[Depends(verify_api_key)])
+async def get_tickets(
+    ticker: Optional[str] = None,
+    status: Optional[str] = None,
+    portfolio: Optional[int] = None,
+    limit: int = Query(200, ge=1, le=2000),
+):
+    """Return tickets list with optional filters."""
+    try:
+        em = _get_db_manager()
+        with em._connect() as con:
+            clauses = []
+            params: list = []
+            if ticker:
+                clauses.append("UPPER(ticker)=UPPER(?)")
+                params.append(ticker)
+            if status:
+                clauses.append("UPPER(status)=UPPER(?)")
+                params.append(status)
+            if portfolio is not None:
+                clauses.append("portfolio=?")
+                params.append(portfolio)
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            params.append(limit)
+            rows = con.execute(
+                f"SELECT * FROM tickets {where} ORDER BY created_at DESC LIMIT ?",
+                params,
+            ).fetchall()
+        return {"items": [dict(r) for r in rows], "total": len(rows)}
+    except Exception as e:
+        logger.exception("Error fetching tickets")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tickets", dependencies=[Depends(verify_api_key)])
+async def create_ticket(body: dict = Body(...)):
+    """Create a new ticket. Required: ticker. Optional: action, quantity, price, status, portfolio, notes."""
+    try:
+        em = _get_db_manager()
+        ticker = (body.get("ticker") or "").strip()
+        if not ticker:
+            raise HTTPException(status_code=422, detail="ticker is required")
+        from datetime import datetime, timezone
+        now = datetime.now(tz=timezone.utc).isoformat()
+        row = {
+            "ticker":    ticker,
+            "created_at": now,
+            "action":    body.get("action", ""),
+            "quantity":  float(body.get("quantity") or 0),
+            "price":     float(body.get("price") or 0),
+            "status":    body.get("status", "NEW"),
+            "portfolio": int(body.get("portfolio") or 0),
+            "notes":     body.get("notes", ""),
+        }
+        cols = list(row.keys())
+        ph = ", ".join(["?"] * len(cols))
+        with em._connect() as con:
+            cur = con.execute(
+                f"INSERT INTO tickets ({', '.join(cols)}) VALUES ({ph})",
+                list(row.values()),
+            )
+            new_id = cur.lastrowid
+        return {"id": new_id, **row}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error creating ticket")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/tickets/{ticket_id}", dependencies=[Depends(verify_api_key)])
+async def update_ticket(ticket_id: int, body: dict = Body(...)):
+    """Update ticket fields (status, notes, action, quantity, price, portfolio)."""
+    allowed = {"status", "notes", "action", "quantity", "price", "portfolio"}
+    updates = {k: v for k, v in body.items() if k in allowed}
+    if not updates:
+        raise HTTPException(status_code=422, detail="No valid fields to update")
+    try:
+        em = _get_db_manager()
+        with em._connect() as con:
+            row = con.execute("SELECT id FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Ticket not found")
+            set_parts = ", ".join(f"{k}=?" for k in updates)
+            con.execute(
+                f"UPDATE tickets SET {set_parts} WHERE id=?",
+                list(updates.values()) + [ticket_id],
+            )
+        return {"updated": True, "id": ticket_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error updating ticket")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/tickets/{ticket_id}", dependencies=[Depends(verify_api_key)])
+async def delete_ticket(ticket_id: int):
+    """Delete a ticket by id."""
+    try:
+        em = _get_db_manager()
+        with em._connect() as con:
+            row = con.execute("SELECT id FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Ticket not found")
+            con.execute("DELETE FROM tickets WHERE id=?", (ticket_id,))
+        return {"deleted": True, "id": ticket_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Error deleting ticket")
         raise HTTPException(status_code=500, detail=str(e))

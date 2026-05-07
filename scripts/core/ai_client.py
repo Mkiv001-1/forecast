@@ -66,6 +66,14 @@ class AIClient:
             "max_tokens":  max_tokens,
         }
 
+        # Circuit-breaker guard
+        try:
+            from circuit_breaker import is_open
+            if is_open():
+                raise RuntimeError(f"circuit_breaker: OpenRouter OPEN — {model} call rejected")
+        except ImportError:
+            pass  # circuit_breaker not yet available
+
         last_error = None
         for attempt in range(1, max_retries + 1):
             try:
@@ -79,11 +87,21 @@ class AIClient:
                 data = response.json()
                 content = data["choices"][0]["message"]["content"]
                 logger.debug(f"[{model}] OK, {len(content)} chars")
+                try:
+                    from circuit_breaker import record_success
+                    record_success()
+                except ImportError:
+                    pass
                 return content
 
             except requests.exceptions.Timeout as e:
                 logger.warning(f"[{model}] timeout on attempt {attempt}: {e}")
                 last_error = e
+                try:
+                    from circuit_breaker import record_failure
+                    record_failure()
+                except ImportError:
+                    pass
                 time.sleep(5 * attempt)
 
             except requests.exceptions.HTTPError as e:
@@ -95,8 +113,8 @@ class AIClient:
                     pass
                 logger.error(f"[{model}] HTTP {status} on attempt {attempt}: {body}")
                 last_error = e
-                if status in (401, 403, 404):
-                    break  # non-retryable
+                if status in (401, 402, 403, 404):
+                    break  # non-retryable billing/auth errors — do NOT trip circuit breaker
                 if status == 429:
                     retry_after = 30
                     try:
@@ -109,6 +127,11 @@ class AIClient:
                     logger.warning(f"[{model}] rate-limited (retry_after={retry_after}s) — skipping")
                     raise RateLimitError(model, retry_after)
                 else:
+                    try:
+                        from circuit_breaker import record_failure
+                        record_failure()
+                    except ImportError:
+                        pass
                     time.sleep(5 * attempt)
 
             except RateLimitError:
@@ -117,6 +140,11 @@ class AIClient:
             except Exception as e:
                 logger.error(f"[{model}] error on attempt {attempt}: {e}")
                 last_error = e
+                try:
+                    from circuit_breaker import record_failure
+                    record_failure()
+                except ImportError:
+                    pass
                 time.sleep(5 * attempt)
 
         raise RuntimeError(f"All {max_retries} attempts failed for model '{model}': {last_error}")
@@ -138,8 +166,10 @@ def get_active_ai_models(db_manager) -> list:
     """
     Return list of active AI model dicts from providers table.
     Each dict: {name, model, temperature, max_tokens, rate_limit}
+    If OPENROUTER_FREE_ONLY=true, appends :free suffix to model IDs.
     """
     try:
+        free_only = db_manager.get_config_value("OPENROUTER_FREE_ONLY", "false").strip().lower() == "true"
         df = db_manager.read_sheet("Providers")
         if df.empty:
             return []
@@ -148,13 +178,18 @@ def get_active_ai_models(db_manager) -> list:
             return []
         result = []
         for _, row in ai_df.iterrows():
+            model_id = str(row.get("model", ""))
+            if free_only and model_id and not model_id.endswith(":free"):
+                model_id = model_id + ":free"
             result.append({
                 "name":        str(row.get("name", "")),
-                "model":       str(row.get("model", "")),
+                "model":       model_id,
                 "temperature": float(row.get("temperature", 0.2)),
                 "max_tokens":  int(row.get("max_tokens", 2000)),
                 "rate_limit":  int(row.get("rate_limit", 60)),
             })
+        if free_only:
+            logger.info(f"OPENROUTER_FREE_ONLY=true — using :free model variants")
         return result
     except Exception as e:
         logger.error(f"Error reading AI models: {e}")

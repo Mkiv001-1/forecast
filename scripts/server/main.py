@@ -4,17 +4,27 @@ import os
 import sys
 import logging
 import argparse
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.StreamHandler()],
-)
-logger = logging.getLogger(__name__)
+from logging.handlers import RotatingFileHandler
 
 _SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
 _SCRIPTS_DIR = os.path.dirname(_SERVER_DIR)
 _PROJECT_ROOT = os.path.dirname(_SCRIPTS_DIR)
+
+_log_file = os.path.join(_PROJECT_ROOT, "trading_robot.log")
+_log_fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+
+_root_logger = logging.getLogger()
+_root_logger.setLevel(logging.INFO)
+if not any(isinstance(h, RotatingFileHandler) for h in _root_logger.handlers):
+    _fh = RotatingFileHandler(_log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+    _fh.setFormatter(_log_fmt)
+    _root_logger.addHandler(_fh)
+if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, RotatingFileHandler) for h in _root_logger.handlers):
+    _sh = logging.StreamHandler()
+    _sh.setFormatter(_log_fmt)
+    _root_logger.addHandler(_sh)
+
+logger = logging.getLogger(__name__)
 for _p in [_PROJECT_ROOT, _SCRIPTS_DIR]:
     if _p not in sys.path:
         sys.path.insert(0, _p)

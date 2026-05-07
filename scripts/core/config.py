@@ -10,6 +10,9 @@ PPLX_MODEL = 'sonar-pro'
 PPLX_TEMPERATURE = 0.2
 PPLX_MAX_TOKENS = 2000
 
+# Consensus and order submission thresholds (percent, 0-100)
+CONFIDENCE_THRESHOLD = 55  # Minimum confidence for signal to be valid/order to be submitted
+
 DATA_SOURCE = 'yfinance'
 ALPHA_VANTAGE_RATE_LIMIT = 5
 

@@ -12,7 +12,6 @@ from datetime import datetime, timedelta
 def fetch_price_data_yfinance(ticker, days=250, max_retries=3):
     """
     Загружает исторические данные через yfinance
-    Альтернатива GOOGLEFINANCE
     """
     for attempt in range(max_retries):
         try:
@@ -86,46 +85,35 @@ def fetch_price_data_yfinance(ticker, days=250, max_retries=3):
     
     return []
 
-def fetch_price_data(ticker, days=250, excel_manager=None):
+def fetch_price_data(ticker, days=250, db_manager=None):
     """
     Универсальная функция загрузки данных с кэшированием в Excel
     """
     from config import DATA_SOURCE
     
-    # Сначала пробуем кэш Excel, но не блокируем загрузку из API
-    if excel_manager:
-        try:
-            cached_data = load_cached_data_from_excel(ticker, days, excel_manager)
-            if cached_data:
-                logging.info(f"✅ Загружено {len(cached_data)} дней из кэша Excel для {ticker}")
-                return cached_data
-            else:
-                logging.info(f"ℹ️ В кэше Excel нет данных для {ticker}, пробуем API")
-        except Exception as e:
-            logging.warning(f"⚠️ Ошибка загрузки из кэша Excel: {e}, пробуем API")
-    
-    # Загружаем новые данные
+    # Загружаем данные через умную систему (кэш проверяется внутри smart_data_loader)
     new_data = None
     
     # Используем умную загрузку с активными провайдерами
     try:
         from smart_data_loader import fetch_price_data_smart
-        new_data = fetch_price_data_smart(ticker, days, excel_manager)
+        new_data = fetch_price_data_smart(ticker, days, db_manager)
         if new_data:
             logging.info(f"✅ Загружено {len(new_data)} дней через умную систему")
         else:
             logging.warning("⚠️ Умная система не смогла загрузить данные")
     except ImportError as e:
         logging.warning(f"⚠️ Умная загрузка недоступна: {e}")
-        
-        # Fallback на старую логику
+
+    # Fallback на старую логику если умная система не вернула данные
+    if not new_data:
         logging.info("🔄 Используем резервную логику загрузки")
         
         # Пробуем Alpha Vantage
         try:
             from alpha_vantage_loader import fetch_price_data_alphavantage
             logging.info(f"🔄 Используем Alpha Vantage для {ticker}")
-            new_data = fetch_price_data_alphavantage(ticker, days, excel_manager)
+            new_data = fetch_price_data_alphavantage(ticker, days, db_manager)
             if new_data:
                 logging.info(f"✅ Загружено {len(new_data)} дней через Alpha Vantage")
         except ImportError as e:
@@ -142,10 +130,10 @@ def fetch_price_data(ticker, days=250, excel_manager=None):
     
     return new_data
 
-def load_cached_data_from_excel(ticker, days, excel_manager):
+def load_cached_data_from_excel(ticker, days, db_manager):
     """Загружает кэшированные данные из Excel"""
     try:
-        price_df = excel_manager.read_sheet('PriceData')
+        price_df = db_manager.read_sheet('PriceData')
         if price_df is None or price_df.empty:
             return []
         
@@ -176,43 +164,27 @@ def load_cached_data_from_excel(ticker, days, excel_manager):
             except (ValueError, KeyError) as e:
                 continue
         
+        if not price_data:
+            return []
+
         # Сортируем и ограничиваем
         price_data.sort(key=lambda x: str(x['date']), reverse=True)
+
+        # Проверяем свежесть кэша: последняя дата не должна быть старше 2 дней
+        from datetime import date as _date
+        latest = price_data[0]['date']
+        if hasattr(latest, 'date'):
+            latest = latest.date()
+        elif isinstance(latest, str):
+            latest = datetime.strptime(latest[:10], '%Y-%m-%d').date()
+        staleness = (_date.today() - latest).days
+        if staleness > 2:
+            logging.info(f"ℹ️ Кэш устарел ({staleness} дней), принудительная загрузка через API")
+            return []
+
         return price_data[:days]
         
     except Exception as e:
         logging.error(f"❌ Ошибка загрузки кэша: {e}")
         return []
 
-def save_price_data_to_sheet(sheets_client, price_data):
-    """Сохраняет исторические данные о ценах в Google Sheets"""
-    try:
-        ws = sheets_client.get_worksheet('PriceData')
-        if not ws:
-            logging.error("❌ Лист PriceData не найден")
-            return
-        
-        # Очищаем все данные кроме заголовков
-        if len(ws.get_all_values()) > 1:
-            ws.delete_rows(2, len(ws.get_all_values()))
-        
-        # Добавляем заголовки
-        headers = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
-        ws.append_row(headers)
-        
-        # Добавляем данные
-        for record in price_data:
-            row = [
-                record['date'].strftime('%Y-%m-%d'),
-                record['open'],
-                record['high'],
-                record['low'],
-                record['close'],
-                record['volume']
-            ]
-            ws.append_row(row)
-        
-        logging.info(f"✅ Сохранено {len(price_data)} записей в PriceData")
-        
-    except Exception as e:
-        logging.error(f"❌ Ошибка сохранения данных в PriceData: {e}")

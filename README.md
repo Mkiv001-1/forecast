@@ -8,18 +8,25 @@
 forecast/
 ├── scripts/
 │   ├── core/                 # Базовый функционал
-│   │   ├── main_excel.py     # Основной цикл торгового робота
-│   │   ├── indicators.py     # Технические индикаторы (RSI, MACD, Bollinger Bands и др.)
-│   │   ├── forecast_engine.py # Генерация прогнозов через AI
-│   │   ├── multi_model_forecaster.py # Мульти-модельный прогноз
-│   │   ├── consensus.py      # Консенсус-агрегация прогнозов
-│   │   ├── market_regime.py  # Детекция рыночного режима
-│   │   ├── market_context.py # Контекст рынка
-│   │   ├── data_loader.py    # Загрузка исторических данных
-│   │   ├── sqlite_manager.py # SQLite хранилище (замена Excel)
-│   │   ├── unified_logs_manager.py # Управление таблицей Logs
-│   │   ├── actuals_evaluator.py # Оценка прошлых прогнозов
-│   │   └── ...
+│   │   ├── forecast_runner.py      # Основной цикл торгового робота
+│   │   ├── forecast_engine.py      # Генерация прогнозов через AI + R/R валидация
+│   │   ├── multi_model_forecaster.py # Мульти-модельный прогноз (N моделей × M методов)
+│   │   ├── consensus.py            # Консенсус-агрегация + медиана + фильтр аномалий
+│   │   ├── consensus_evaluator.py  # Оценка консенсус-прогнозов постфактум
+│   │   ├── consensus_recalc.py   # Ретроспективный пересчет консенсуса
+│   │   ├── market_regime.py      # Детекция рыночного режима (ADX + MA)
+│   │   ├── indicators.py         # Технические индикаторы (RSI, MACD, BB, ATR, ADX, OBV, Stoch RSI)
+│   │   ├── data_loader.py        # Загрузка исторических данных (yfinance, Alpha Vantage, Finnhub)
+│   │   ├── sqlite_manager.py     # SQLite хранилище (WAL-режим)
+│   │   ├── unified_logs_manager.py # Управление таблицей logs
+│   │   ├── actuals_evaluator.py  # Оценка прошлых прогнозов по High/Low
+│   │   ├── scheduler.py          # Централизованный планировщик задач + heartbeat
+│   │   ├── capital_provider.py   # Источник капитала из IB
+│   │   ├── position_sizer.py     # Расчет размера позиции (risk-based)
+│   │   ├── order_manager.py      # Bracket-ордера + атомарность + откат
+│   │   ├── ib_gateway_client.py # Интеграция с Interactive Brokers
+│   │   ├── circuit_breaker.py    # Защита от сбоев OpenRouter
+│   │   └── model_performance_tracker.py # EMA-веса моделей
 │   │
 │   ├── server/               # FastAPI сервер
 │   │   ├── api.py            # REST API эндпоинты
@@ -67,16 +74,141 @@ forecast/
 - **Хранение данных**: SQLite для всех результатов
 - **Мульти-модельный подход**: Комбинирование прогнозов нескольких AI-моделей
 - **Консенсус-алгоритм**: Взвешенная агрегация сигналов
-- **Оценка результатов**: Автоматическая оценка точности прошлых прогнозов
+- **Оценка результатов**: Автоматическая оценка точности прошлых прогнозов и консенсуса
+- **Риск-менеджмент**: Стоп-лосс, R/R-фильтр, расчет позиции от NetLiquidation
+- **Исполнение ордеров**: Bracket-ордера (Entry + Take Profit + Stop Loss) в IB
+- **Мониторинг**: Circuit breaker, heartbeat, планировщик задач
 
-## Методы анализа (6 AI-моделей)
+## Методы анализа (6 AI-методов)
 
-1. `momentum_trend` — Анализ тренда и импульса
-2. `price_action` — Анализ позиции в Bollinger Bands
-3. `relative_strength` — Сравнение с рынком
-4. `volatility` — Оценка волатильности по ATR
-5. `mean_reversion` — Анализ отклонения от среднего
-6. `volume_breakout` — Анализ объемов и пробоев
+Каждый метод анализирует рынок с уникального ракурса и имеет свой горизонт оценки. AI-модель получает специализированные индикаторы для каждого метода.
+
+| Метод | Описание | Ключевые индикаторы | Горизонт (часов) | Триггер оценки |
+|-------|----------|---------------------|------------------|---------------|
+| `momentum_trend` | Тренд и импульс | MA20/50/200, EMA9/21, ADX, MACD, RSI, OBV | 24 | `both` |
+| `price_action` | Позиция в Bollinger Bands | BB upper/lower, Stoch RSI, ценовая динамика 5д/20д | 8 | `price_level` |
+| `relative_strength` | Относительная сила | RSI, ADX, динамика 5/10/20/50д, объемный коэффициент | 48 | `time` |
+| `volatility` | Волатильность и пробои | ATR, BB ширина, RSI, ADX | 4 | `price_level` |
+| `mean_reversion` | Возврат к среднему | Отклонение от MA20/50, RSI, Stoch RSI | 72 | `price_level` |
+| `volume_breakout` | Объемный импульс | Объем (текущий vs средний), OBV тренд, ATR, ADX | 2 | `price_level` |
+
+### Детали методов
+
+**Momentum Trend** (`momentum_trend`, 24ч)
+- Выравнивание скользящих средних (MA20 vs MA50 vs MA200)
+- ADX для определения силы тренда (>25 = сильный)
+- MACD histogram для импульса
+- Рекомендуется для трендовых рынков
+
+**Price Action** (`price_action`, 8ч)
+- Позиция цены внутри Bollinger Bands
+- Stochastic RSI для перекупленности/перепроданности
+- Свечные паттерны и уровни поддержки/сопротивления
+- Короткий горизонт — подходит для быстрых входов
+
+**Relative Strength** (`relative_strength`, 48ч)
+- Сравнение динамики актива с рынком (SPY)
+- Объемный анализ (текущий объем vs 20-дневный средний)
+- Долгосрочная перспектива (2 дня)
+
+**Volatility Breakout** (`volatility`, 4ч)
+- ATR как процент от цены (волатильность)
+- Ширина Bollinger Bands
+- Пробой волатильностного конверта
+- Очень короткий горизонт — скальпинг
+
+**Mean Reversion** (`mean_reversion`, 72ч)
+- Отклонение цены от MA20/MA50 в процентах
+- Дивергенции RSI
+- Долгий горизонт — позиционная торговля
+
+**Volume Breakout** (`volume_breakout`, 2ч)
+- Аномальный объем (коэффициент к среднему)
+- OBV тренд (накопление/распределение)
+- Самый короткий горизонт — импульсный вход
+
+## Обработка прогнозов и консенсус
+
+### Поток данных
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  1. ГЕНЕРАЦИЯ ПРОГНОЗОВ (N моделей × M методов)                  │
+│     ├── Каждая AI-модель получает все 6 методов                │
+│     ├── Индикаторы подбираются под метод (специализация)       │
+│     └── Результат: JSON с confidence, side, target, stop, TIF │
+├─────────────────────────────────────────────────────────────────┤
+│  2. ВАЛИДАЦИЯ ОТДЕЛЬНЫХ ПРОГНОЗОВ                              │
+│     ├── R/R фильтр: минимум 1.5 (target - entry) / (entry - stop)│
+│     ├── Логичность стопа (для LONG: стоп < цены)               │
+│     └── Отсеивание с confidence < 50%                          │
+├─────────────────────────────────────────────────────────────────┤
+│  3. АГРЕГАЦИЯ В КОНСЕНСУС                                       │
+│     ├── Группировка по тикеру                                  │
+│     ├── Фильтр аномалий: отклонение target > 15% от цены      │
+│     ├── Калибровка confidence: raw × (ema_accuracy / 0.5)     │
+│     ├── Вес прогноза: calibrated_confidence × win_rate × ema  │
+│     └── Expected Value: (confidence/100) × (reward/risk)      │
+├─────────────────────────────────────────────────────────────────┤
+│  4. РАСЧЕТ ИТОГОВОГО СИГНАЛА                                   │
+│     ├── Медиана target_price среди LONG/SHORT                  │
+│     ├── Медиана stop_loss среди того же направления            │
+│     ├── Если 40%+ веса на противоположном направлении → NEUTRAL│
+│     └── Expected Value < 0.5 → сигнал отклоняется (NEUTRAL)    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Алгоритм консенсуса
+
+**Шаг 1: Фильтрация прогнозов**
+- `CONSENSUS_MAX_DEVIATION` = 15% — отсеиваем галлюцинации LLM (target далеко от текущей цены)
+- Проверка execute-флагов: метод и провайдер должны иметь `execute='yes'`
+
+**Шаг 2: Калибровка уверенности**
+```
+calibration_factor = ema_accuracy / 0.5  # baseline 50%
+calibrated_confidence = raw_confidence × calibration_factor
+# ограничение: 0.5 ≤ calibration_factor ≤ 1.5
+```
+Пример: модель с ema_accuracy=0.7 корректирует 60% → 84%
+
+**Шаг 3: Расчет веса**
+```
+final_weight = calibrated_confidence × win_rate × ema_accuracy
+```
+- `win_rate` — историческая точность метода
+- `ema_accuracy` — текущая точность модели (EMA с α=0.2)
+
+**Шаг 4: Expected Value фильтр**
+```
+expected_r = (confidence / 100) × (reward / risk)
+```
+- Если `expected_r < 0.5` → сигнал превращается в NEUTRAL
+- 70% × R/R 3.0 = 2.1 → ✅ LONG
+- 60% × R/R 0.3 = 0.18 → ❌ NEUTRAL
+
+**Шаг 5: Агрегация уровней**
+- Итоговый `target_price` — медиана всех target доминирующего направления
+- Итоговый `stop_loss` — медиана всех stop того же направления
+- `horizon_hours` — медиана timeframe_hours методов в консенсусе
+
+**Шаг 6: Проверка разногласий**
+- Если >40% суммарного веса приходится на альтернативное направление → `high_model_disagreement=true` → сигнал NEUTRAL
+
+### Сохранение и оценка
+
+**Forecast Run Tracking**
+- Каждый запуск прогнозирования получает `run_id`
+- Все прогнозы сохраняются в `forecast_run_links` с полным snapshot весов
+- Позволяет анализировать постфактум: какие методы давали лучшие веса
+
+**Оценка постфактум**
+- `eval_target_date = consensus_date + horizon_hours`
+- При достижении даты: проверяем `price_data` за eval_target_date
+- `target_hit` — High >= target (LONG) или Low <= target (SHORT)
+- `stop_hit` — Low <= stop (LONG) или High >= stop (SHORT)
+- **Приоритет стопа**: если оба уровня достигнуты в один день — засчитывается stop (консервативная оценка)
+- Расчет: `pnl_pct`, `r_multiple`, `direction_correct`
 
 ## Детекция рыночного режима
 
@@ -177,19 +309,19 @@ curl http://localhost:8000/run/status \
 
 ```bash
 # Инициализация базы данных
-python scripts/core/main_excel.py --init
+python scripts/core/forecast_runner.py --init
 
 # Тестовый запуск на одном тикере
-python scripts/core/main_excel.py --test NASDAQ:NVDA
+python scripts/core/forecast_runner.py --test NASDAQ:NVDA
 
 # Обычный запуск
-python scripts/core/main_excel.py
+python scripts/core/forecast_runner.py
 
 # Оценка предыдущих прогнозов
-python scripts/core/main_excel.py --evaluate
+python scripts/core/forecast_runner.py --evaluate
 
 # Очистка данных
-python scripts/core/main_excel.py --clear
+python scripts/core/forecast_runner.py --clear
 ```
 
 ### Использование через GUI клиент
@@ -204,8 +336,11 @@ python scripts/core/main_excel.py --clear
 ## REST API Эндпоинты
 
 ### Системные
-- `GET /health` — проверка здоровья сервера
+- `GET /health` — проверка здоровья сервера + circuit breaker
 - `GET /system-log` — чтение системного лога
+- `GET /scheduler/status` — статус планировщика
+- `GET /circuit-breaker/status` — статус circuit breaker
+- `POST /circuit-breaker/reset` — сброс circuit breaker
 
 ### Прогнозы
 - `POST /run/forecast` — запуск прогнозирования
@@ -213,11 +348,17 @@ python scripts/core/main_excel.py --clear
 - `POST /run/full` — полный цикл
 - `GET /run/status` — статус выполнения
 
+### Forecast Runs (аудит весов)
+- `GET /forecast-runs` — список запусков прогнозирования
+- `GET /forecast-runs/{id}` — детали запуска со всеми весами
+
 ### Данные
 - `GET /logs` — список прогнозов (Logs)
 - `GET /indicators` — технические индикаторы
 - `GET /price-data` — исторические цены
 - `GET /consensus` — консенсус-прогнозы
+- `POST /consensus/evaluate` — оценить консенсус-записи
+- `POST /consensus/recalculate` — пересчитать консенсус ретроспективно
 
 ### Настройки
 - `GET /tickers` — список тикеров
@@ -228,30 +369,61 @@ python scripts/core/main_excel.py --clear
 ### AI Модели
 - `GET /providers` — список провайдеров
 - `PUT /providers/{name}` — обновить провайдера
+- `PUT /providers/{name}/execute` — обновить execute флаг
 - `GET /model-catalog` — каталог моделей OpenRouter
 - `POST /model-catalog/refresh` — обновить список моделей
+- `GET /method-config/{method}` — получить конфиг метода
+- `PUT /method-config/{method}/execute` — обновить execute флаг метода
 
 ### Конфигурация
 - `GET /config` — все параметры
 - `PUT /config/{key}` — обновить параметр
+
+### Capital & Orders
+- `GET /capital` — текущий капитал и источник
+- `POST /orders/submit` — выставить ордер по консенсусу
+- `GET /orders` — список ордеров
+- `POST /orders/{id}/cancel` — отменить ордер
 
 ### Prompt Templates
 - `GET /prompt-templates` — все шаблоны
 - `PUT /prompt-templates/{method}` — сохранить шаблон
 - `POST /prompt-templates/{method}/reset` — сбросить шаблон
 
+### IB Gateway
+- `POST /ib/test-connection` — тест подключения к IB
+- `POST /ib/sync-accounts` — синхронизировать счета
+- `POST /ib/sync-portfolio` — синхронизировать позиции
+- `GET /ib/accounts` — список счетов
+- `GET /ib/portfolio` — позиции портфеля
+
 ## Структура базы данных SQLite
 
-- **settings** — список тикеров (ticker, active, comment)
+### Основные таблицы
+- **settings** — список тикеров (ticker, active, comment, sector, trading_blocked)
 - **price_data** — исторические цены (ticker, date, open, high, low, close, volume)
 - **indicators** — рассчитанные индикаторы
-- **logs** — единая таблица прогнозов и оценок
-- **consensus** — консенсус-прогнозы
+- **logs** — единая таблица прогнозов и оценок (включая stop_loss, R/R, bracket-поля)
+- **consensus** — консенсус-прогнозы с полями оценки (target_hit, stop_hit, pnl_pct, r_multiple)
 - **config** — параметры конфигурации
-- **providers** — настройки AI-провайдеров
+- **providers** — настройки AI-провайдеров (ema_accuracy, ema_updated_at, execute)
+- **method_config** — параметры методов анализа (timeframe_hours, execute)
 - **prompts** — сохраненные промпты
-- **model_catalog** — каталог моделей OpenRouter
 - **prompt_templates** — шаблоны промптов по методам
+
+### IB Integration
+- **accounts** — счета IB (net_liquidation, buying_power, available_funds, type)
+- **portfolio** — позиции IB (quantity, market_value, unrealized_pnl, type)
+- **ib_config** — настройки подключения к IB Gateway
+
+### Orders & Execution
+- **orders** — ордера (bracket-группы: entry, take_profit, stop_loss; статусы, execution_latency_ms)
+
+### Audit & Tracking
+- **forecast_runs** — аудит запусков прогнозирования
+- **forecast_run_links** — связь прогнозов с весами (raw_confidence, win_rate, ema_accuracy, final_weight)
+- **scheduled_tasks** — задачи планировщика
+- **heartbeat_log** — служебные записи для проверки SQLite
 
 ## Workflow
 
@@ -281,7 +453,6 @@ python scripts/core/main_excel.py --clear
 ## Зависимости
 
 **Основные:**
-- `gspread`, `oauth2client` — работа с Google Sheets (legacy)
 - `yfinance`, `alpha_vantage`, `finnhub` — загрузка цен
 - `pandas`, `numpy` — обработка данных
 - `requests` — HTTP-запросы
@@ -294,6 +465,23 @@ python scripts/core/main_excel.py --clear
 **Клиент:**
 - `PyQt6` — GUI
 - `requests` — API клиент
+
+## Справочник настроек (таблица `config`)
+
+| Ключ | Дефолт | Описание |
+|---|---|---|
+| `ORDER_MODE` | `disabled` | Режим ордеров: `disabled` / `paper` / `live` |
+| `LIVE_TRADING_CONFIRMED` | `false` | Явное подтверждение live-торговли |
+| `DEFAULT_RISK_PCT` | 0.01 | Риск на сделку (1% капитала) |
+| `MAX_POSITION_PCT` | 0.05 | Максимальная доля одной позиции (5%) |
+| `MAX_SECTOR_EXPOSURE_PCT` | 0.15 | Мягкий лимит секторной экспозиции |
+| `MAX_SECTOR_HARD_LIMIT_PCT` | 0.25 | Жёсткий лимит — отклонение сигнала |
+| `CAPITAL_STALENESS_MINUTES` | 15 | Порог устаревания данных IB |
+| `MAX_SPREAD_PCT` | 0.005 | Максимальный допустимый спред (Slippage Guard) |
+| `MAX_OPEN_ORDERS` | 5 | Лимит активных ордеров |
+| `CONSENSUS_MAX_DEVIATION` | 0.15 | Максимальное отклонение target от цены |
+| `MODEL_WEIGHT_EMA_ALPHA` | 0.2 | Коэффициент сглаживания EMA весов |
+| `FORECAST_INTERVAL_MINUTES` | 60 | Интервал основного цикла |
 
 ## Логирование
 

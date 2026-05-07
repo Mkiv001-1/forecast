@@ -4,15 +4,15 @@
 
 import logging
 
-def fetch_price_data_smart(ticker, days=250, excel_manager=None):
+def fetch_price_data_smart(ticker, days=250, db_manager=None):
     """
     Умная загрузка данных с поддержкой нескольких активных провайдеров
     """
     # Сначала пробуем кэш
-    if excel_manager:
+    if db_manager:
         try:
             from data_loader import load_cached_data_from_excel
-            cached_data = load_cached_data_from_excel(ticker, days, excel_manager)
+            cached_data = load_cached_data_from_excel(ticker, days, db_manager)
             if cached_data:
                 logging.info(f"✅ Загружено {len(cached_data)} дней из кэша Excel для {ticker}")
                 return cached_data
@@ -20,7 +20,7 @@ def fetch_price_data_smart(ticker, days=250, excel_manager=None):
             logging.warning(f"⚠️ Ошибка загрузки из кэша: {e}")
     
     # Получаем активных провайдеров
-    active_providers = get_active_providers(excel_manager)
+    active_providers = get_active_providers(db_manager)
     
     if not active_providers:
         logging.warning("⚠️ Нет активных провайдеров")
@@ -33,11 +33,11 @@ def fetch_price_data_smart(ticker, days=250, excel_manager=None):
             
             if provider == 'finnhub':
                 from finnhub_loader import fetch_price_data_finnhub
-                data = fetch_price_data_finnhub(ticker, days, excel_manager)
+                data = fetch_price_data_finnhub(ticker, days, db_manager)
                 
             elif provider == 'alpha_vantage':
                 from alpha_vantage_loader import fetch_price_data_alphavantage
-                data = fetch_price_data_alphavantage(ticker, days, excel_manager)
+                data = fetch_price_data_alphavantage(ticker, days, db_manager)
                 
             elif provider == 'yfinance':
                 from data_loader import fetch_price_data_yfinance
@@ -72,16 +72,18 @@ def fetch_price_data_smart(ticker, days=250, excel_manager=None):
     logging.error(f"❌ Ни один провайдер не смог загрузить данные для {ticker}")
     return []
 
-def get_active_providers(excel_manager):
+def get_active_providers(db_manager):
     """Получает список активных провайдеров"""
     try:
         # Читаем всех провайдеров
-        providers_df = excel_manager.read_sheet('Providers')
+        providers_df = db_manager.read_sheet('Providers')
         if providers_df is None or providers_df.empty:
             return []
         
-        # Фильтруем активных
-        active_providers = providers_df[providers_df['active'] == 1]['name'].tolist()
+        # Фильтруем активных провайдеров рыночных данных (type == 'data')
+        active_providers = providers_df[
+            (providers_df['active'] == 1) & (providers_df['type'] == 'data')
+        ]['name'].tolist()
         
         logging.info(f"📊 Активные провайдеры: {active_providers}")
         return active_providers

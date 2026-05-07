@@ -70,7 +70,13 @@ CREATE TABLE IF NOT EXISTS logs (
     stop_hit          INTEGER,
     pnl_pct           REAL,
     direction_correct INTEGER,
-    exit_successful   INTEGER
+    exit_successful   INTEGER,
+    entry_order_type  TEXT    DEFAULT 'LMT',
+    entry_limit_price REAL,
+    entry_tif         TEXT    DEFAULT 'DAY',
+    target_price      REAL,
+    take_profit_tif   TEXT    DEFAULT 'GTC',
+    stop_loss_tif     TEXT    DEFAULT 'GTC'
 );
 CREATE INDEX IF NOT EXISTS idx_logs_ticker  ON logs(ticker);
 CREATE INDEX IF NOT EXISTS idx_logs_status  ON logs(status);
@@ -102,6 +108,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     cash                REAL DEFAULT 0,
     maintenance_margin  REAL DEFAULT 0,
     last_update         TEXT DEFAULT '',
+    type                TEXT DEFAULT '',
     UNIQUE(broker, account_id)
 );
 CREATE INDEX IF NOT EXISTS idx_accounts_broker ON accounts(broker);
@@ -183,17 +190,137 @@ CREATE TABLE IF NOT EXISTS prompt_templates (
     prompt_text TEXT DEFAULT '',
     updated_at  TEXT DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS ib_order_types (
+    order_type_code TEXT PRIMARY KEY,
+    name            TEXT NOT NULL,
+    description     TEXT DEFAULT '',
+    required_params TEXT DEFAULT '',
+    optional_params TEXT DEFAULT '',
+    tif_supported   TEXT DEFAULT '',
+    active          INTEGER DEFAULT 1,
+    notes           TEXT DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS method_config (
+    method          TEXT PRIMARY KEY,
+    timeframe_hours INTEGER NOT NULL,
+    trigger         TEXT    DEFAULT 'both',
+    active          INTEGER DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS orders (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    log_id                  TEXT    DEFAULT '',
+    ticker                  TEXT    NOT NULL,
+    ib_order_id             INTEGER DEFAULT 0,
+    ib_parent_id            INTEGER DEFAULT 0,
+    order_role              TEXT    DEFAULT '',
+    order_type              TEXT    DEFAULT '',
+    action                  TEXT    DEFAULT '',
+    quantity                REAL    DEFAULT 0,
+    limit_price             REAL    DEFAULT NULL,
+    stop_price              REAL    DEFAULT NULL,
+    status                  TEXT    DEFAULT 'QUEUED',
+    account_type            TEXT    DEFAULT '',
+    created_at              TEXT    DEFAULT '',
+    submitted_at            TEXT    DEFAULT '',
+    filled_at               TEXT    DEFAULT '',
+    filled_price            REAL    DEFAULT NULL,
+    execution_latency_ms    INTEGER DEFAULT NULL,
+    spread_at_submission    REAL    DEFAULT NULL,
+    error_message           TEXT    DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_orders_ticker     ON orders(ticker);
+CREATE INDEX IF NOT EXISTS idx_orders_status     ON orders(status);
+CREATE INDEX IF NOT EXISTS idx_orders_ib_parent  ON orders(ib_parent_id);
+
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+    name                TEXT PRIMARY KEY,
+    schedule_type       TEXT    DEFAULT 'interval',
+    schedule_value      TEXT    DEFAULT '',
+    is_active           INTEGER DEFAULT 1,
+    last_run_at         TEXT    DEFAULT '',
+    last_run_status     TEXT    DEFAULT '',
+    last_error          TEXT    DEFAULT '',
+    run_count           INTEGER DEFAULT 0,
+    error_count         INTEGER DEFAULT 0,
+    next_run_at         TEXT    DEFAULT '',
+    skip_outside_market INTEGER DEFAULT 0,
+    max_duration_sec    INTEGER DEFAULT 300
+);
+
+CREATE TABLE IF NOT EXISTS heartbeat_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    checked_at  TEXT    NOT NULL,
+    ib_ok       INTEGER DEFAULT 0,
+    openrouter_ok INTEGER DEFAULT 0,
+    sqlite_ok     INTEGER DEFAULT 0,
+    notes       TEXT    DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS tickets (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker      TEXT    NOT NULL,
+    created_at  TEXT    DEFAULT '',
+    action      TEXT    DEFAULT '',
+    quantity    REAL    DEFAULT 0,
+    price       REAL    DEFAULT 0,
+    status      TEXT    DEFAULT 'NEW',
+    portfolio   INTEGER DEFAULT 0,
+    notes       TEXT    DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_tickets_ticker ON tickets(ticker);
+CREATE INDEX IF NOT EXISTS idx_tickets_portfolio ON tickets(portfolio);
 """
 
 _DEFAULT_CONFIG = [
-    ("OPENROUTER_API_KEY",   "",           "OpenRouter API key (https://openrouter.ai)"),
-    ("ALPHA_VANTAGE_API_KEY","",           "Alpha Vantage API key"),
-    ("DATA_SOURCE",          "yfinance",   "Primary price data source: yfinance | alpha_vantage | finnhub"),
-    ("SCHEDULE_FORECAST",    "21:30",      "Daily forecast time UTC (HH:MM), empty = disabled"),
-    ("SCHEDULE_EVALUATE",    "14:30",      "Daily evaluation time UTC (HH:MM), empty = disabled"),
-    ("MAX_RISK_PER_TRADE",   "2.0",        "Max risk per trade % of account"),
-    ("MAX_POSITIONS",        "3",          "Max simultaneous open positions"),
-    ("DEFAULT_HORIZON_DAYS", "1",          "Default forecast horizon in trading days"),
+    ("OPENROUTER_API_KEY",           "",           "OpenRouter API key (https://openrouter.ai)"),
+    ("OPENROUTER_FREE_ONLY",         "false",      "Use only free OpenRouter models (appends :free suffix to model IDs)"),
+    ("ALPHA_VANTAGE_API_KEY",        "",           "Alpha Vantage API key"),
+    ("DATA_SOURCE",                  "yfinance",   "Primary price data source: yfinance | alpha_vantage | finnhub"),
+    ("SCHEDULE_FORECAST",            "21:30",      "Daily forecast time UTC (HH:MM), empty = disabled"),
+    ("SCHEDULE_EVALUATE",            "14:30",      "Daily evaluation time UTC (HH:MM), empty = disabled"),
+    ("MAX_RISK_PER_TRADE",           "2.0",        "Max risk per trade % of account"),
+    ("MAX_POSITIONS",                "3",          "Max simultaneous open positions"),
+    ("DEFAULT_HORIZON_DAYS",         "1",          "Default forecast horizon in trading days"),
+    # Risk & position sizing
+    ("DEFAULT_RISK_PCT",             "0.01",       "Risk per trade as fraction of NetLiquidation (1%)"),
+    ("MAX_POSITION_PCT",             "0.05",       "Max single position as fraction of NetLiquidation (5%)"),
+    ("MAX_SECTOR_EXPOSURE_PCT",      "0.15",       "Soft sector exposure limit (15%)"),
+    ("MAX_SECTOR_HARD_LIMIT_PCT",    "0.25",       "Hard sector exposure limit — signal rejected (25%)"),
+    ("SECTOR_OVERWEIGHT_FACTOR",     "0.5",        "Position size multiplier when sector soft limit exceeded"),
+    # Capital provider
+    ("CAPITAL_STALENESS_MINUTES",    "15",         "IB data staleness threshold in minutes"),
+    ("PRICE_STALENESS_HOURS",        "6",          "Price data staleness threshold in hours"),
+    ("PRICE_STALENESS_BUSINESS_DAYS", "2",         "Price data staleness threshold for daily candles (business days)"),
+    ("PREFERRED_ACCOUNT_TYPE",       "live",       "Preferred IB account type: live | paper"),
+    ("MANUAL_CAPITAL_OVERRIDE",      "",           "Manual capital override (leave empty to use IB)"),
+    # Order management
+    ("ORDER_MODE",                   "disabled",   "Order mode: disabled | paper | live"),
+    ("LIVE_TRADING_CONFIRMED",       "false",      "Must be 'true' to enable live trading"),
+    ("ENTRY_SLIPPAGE_PCT",           "0.001",      "Allowed entry slippage fraction (0.1%)"),
+    ("MAX_SPREAD_PCT",               "0.005",      "Max bid/ask spread for Market orders (Slippage Guard)"),
+    ("USE_STOP_LIMIT",               "false",      "Use Stop-Limit instead of Stop for stop-loss orders"),
+    ("STOP_LIMIT_OFFSET_PCT",        "0.0005",     "Offset for Stop-Limit orders"),
+    ("ALLOW_EXTENDED_HOURS",         "false",      "Allow trading outside regular market hours"),
+    ("PRE_MARKET_MINUTES",           "5",          "Minutes before market open to submit QUEUED orders"),
+    ("ORDER_QUEUE_MAX_AGE_HOURS",    "24",         "Hours before QUEUED order becomes EXPIRED"),
+    ("MAX_OPEN_ORDERS",              "5",          "Maximum simultaneous open orders"),
+    ("ORDER_CHILD_TIMEOUT_SEC",      "10",         "Seconds after Entry fill to wait for child orders"),
+    ("ORDER_ROLLBACK_TIMEOUT_SEC",   "30",         "Seconds to wait for rollback confirmation"),
+    ("AUTO_BLOCK_ON_ROLLBACK_FAIL",  "true",       "Block ticker trading on ROLLBACK_FAILED"),
+    ("ALERT_CHANNELS",               "[]",         "Notification channels: push, email, telegram (JSON list)"),
+    # Consensus
+    ("CONSENSUS_MAX_DEVIATION",      "0.15",       "Max target_price deviation from current price (15%)"),
+    # Model weights
+    ("MODEL_WEIGHT_EMA_ALPHA",       "0.2",        "EMA smoothing factor for provider accuracy weights"),
+    # Scheduler
+    ("FORECAST_INTERVAL_MINUTES",    "60",         "Forecast cycle interval in minutes"),
+    ("EVALUATE_INTERVAL_MINUTES",    "120",        "Evaluate past forecasts interval in minutes"),
+    ("PRICE_DATA_INTERVAL_MINUTES",  "60",         "Price data refresh interval in minutes"),
+    ("SCHEDULER_MAX_RETRIES",        "2",          "Max retries for failed scheduled tasks"),
+    ("HEARTBEAT_OPENROUTER_GRACE_SEC","120",        "Grace period before circuit-open triggers degradation"),
 ]
 
 _DEFAULT_PROVIDERS = [
@@ -243,6 +370,24 @@ _DEFAULT_SETTINGS = [
     ("NASDAQ:NVDA", 1, "Nvidia - AI chips"),
     ("NASDAQ:TSLA", 0, "Tesla"),
     ("NASDAQ:AAPL", 0, "Apple"),
+]
+
+_DEFAULT_ORDER_TYPES = [
+    # (order_type_code, name, description, required_params, optional_params, tif_supported, active, notes)
+    ("MKT",       "Market",            "Рыночный ордер по текущей цене", "action, totalQuantity", "tif, account, outsideRth", "DAY, GTC, IOC", 1, ""),
+    ("LMT",       "Limit",             "Лимитный ордер", "action, totalQuantity, lmtPrice", "tif, account, outsideRth", "DAY, GTC, IOC", 1, ""),
+    ("STP",       "Stop",              "Стоп-ордер", "action, totalQuantity, auxPrice", "tif, account", "DAY, GTC", 1, ""),
+    ("STP LMT",   "Stop Limit",        "Стоп-лимит", "action, totalQuantity, lmtPrice, auxPrice", "tif, account", "DAY, GTC", 1, ""),
+    ("TRAIL",     "Trailing Stop",     "Трейлинг-стоп", "action, totalQuantity", "trailingPercent, trailStopPrice, tif, account", "DAY, GTC", 1, "auxPrice для trailStopPrice"),
+    ("TRAIL LMT", "Trailing Stop Limit", "Трейлинг-стоп лимит", "action, totalQuantity, lmtPrice", "trailingPercent, trailStopPrice, tif, account", "DAY, GTC", 1, ""),
+    ("MOC",       "Market on Close",   "Рыночный на закрытии", "action, totalQuantity", "account", "DAY", 1, "Только для акций, не для фьючерсов"),
+    ("LOC",       "Limit on Close",    "Лимитный на закрытии", "action, totalQuantity, lmtPrice", "account", "DAY", 1, "Только для акций"),
+    ("MIT",       "Market if Touched", "Рыночный при касании", "action, totalQuantity, auxPrice", "tif, account", "DAY, GTC", 0, "Исполняется когда цена касается уровня"),
+    ("LIT",       "Limit if Touched",  "Лимитный при касании", "action, totalQuantity, lmtPrice, auxPrice", "tif, account", "DAY, GTC", 0, ""),
+    ("PEG MKT",   "Pegged to Market",  "Привязан к рынку", "action, totalQuantity", "peggedChangeAmount, tif, account", "DAY", 0, "Привязка к национальному BEST bid/ask"),
+    ("PEG LMT",   "Pegged to Limit",   "Привязан к лимиту", "action, totalQuantity, lmtPrice", "peggedChangeAmount, tif, account", "DAY", 0, ""),
+    ("REL",       "Relative",          "Относительный спред", "action, totalQuantity", "percentOffset, tif, account", "DAY, GTC", 0, "Лимит +/- % от последней цены"),
+    ("VWAP",      "VWAP",              "Средневзвешенная цена", "action, totalQuantity", "vwapStartTime, vwapEndTime, account", "DAY", 0, "Алго-ордер, требует подписку"),
 ]
 
 _DEFAULT_PROMPT_TEMPLATES = [
@@ -336,19 +481,21 @@ _DEFAULT_PROMPT_TEMPLATES = [
 # Table name alias: keep Excel sheet names working
 # ---------------------------------------------------------------------------
 _SHEET_TO_TABLE = {
-    "Settings":   "settings",
-    "Providers":  "providers",
-    "Config":     "config",
-    "Logs":       "logs",
-    "PriceData":  "price_data",
-    "Indicators": "indicators",
-    "Prompts":    "prompts",
-    "Consensus":  "consensus",
-    "Portfolio":  "portfolio",
-    "Accounts":   "accounts",
+    "Settings":      "settings",
+    "Providers":     "providers",
+    "Config":        "config",
+    "Logs":          "logs",
+    "PriceData":     "price_data",
+    "Indicators":    "indicators",
+    "Prompts":       "prompts",
+    "Consensus":     "consensus",
+    "Portfolio":     "portfolio",
+    "Accounts":      "accounts",
+    "IBOrderTypes":  "ib_order_types",
+    "Tickets":       "tickets",
     # legacy
-    "Log":        "logs",
-    "Forecasts":  "logs",
+    "Log":           "logs",
+    "Forecasts":     "logs",
 }
 
 
@@ -372,7 +519,14 @@ class SQLiteManager:
         is_new = not os.path.exists(self.db_file)
         con = self._connect()
         try:
-            con.executescript(_CREATE_TABLES)
+            try:
+                con.executescript(_CREATE_TABLES)
+            except sqlite3.OperationalError as e:
+                # If indexes fail on existing tables with different schema, log and continue
+                if "no such column" in str(e).lower():
+                    logger.warning(f"DB schema mismatch (likely test DB with partial tables): {e}")
+                else:
+                    raise
             con.commit()
             if is_new:
                 self._seed_defaults(con)
@@ -406,25 +560,277 @@ class SQLiteManager:
             "INSERT OR IGNORE INTO prompt_templates(method, prompt_text, updated_at) VALUES (?,?,?)",
             [(r[0], r[1], ts) for r in _DEFAULT_PROMPT_TEMPLATES],
         )
+        con.executemany(
+            "INSERT OR IGNORE INTO ib_order_types(order_type_code, name, description, required_params, optional_params, tif_supported, active, notes) VALUES (?,?,?,?,?,?,?,?)",
+            _DEFAULT_ORDER_TYPES,
+        )
+        _METHOD_CONFIG_DEFAULTS = [
+            ("momentum_trend",    24, "both",        1),
+            ("price_action",       8, "price_level",  1),
+            ("relative_strength", 48, "time",         1),
+            ("volatility",         4, "price_level",  1),
+            ("mean_reversion",    72, "price_level",  1),
+            ("volume_breakout",    2, "price_level",  1),
+        ]
+        con.executemany(
+            "INSERT OR IGNORE INTO method_config(method, timeframe_hours, trigger, active) VALUES (?,?,?,?)",
+            _METHOD_CONFIG_DEFAULTS,
+        )
 
     def _migrate_schema(self, con: sqlite3.Connection):
         """Idempotently add columns that may be missing from older DB instances."""
         _MISSING_COLS = [
-            ("logs", "actual_open",       "REAL"),
-            ("logs", "exit_successful",   "INTEGER"),
+            ("logs",      "actual_open",               "REAL"),
+            ("logs",      "exit_successful",           "INTEGER"),
+            ("accounts",  "type",                      "TEXT DEFAULT ''"),
+            # Step 1 additions
+            ("settings",  "sector",                    "TEXT DEFAULT ''"),
+            ("settings",  "trading_blocked",           "INTEGER DEFAULT 0"),
+            ("logs",      "stop_loss",                 "REAL"),
+            ("logs",      "rr_ratio",                  "REAL"),
+            ("logs",      "timeframe_hours",           "INTEGER"),
+            ("logs",      "risk_amount",               "REAL"),
+            ("logs",      "risk_pct",                  "REAL"),
+            ("logs",      "sector",                    "TEXT DEFAULT ''"),
+            ("logs",      "sector_exposure_at_signal", "REAL"),
+            ("providers", "ema_accuracy",              "REAL"),
+            ("providers", "ema_updated_at",            "TEXT DEFAULT ''"),
+            ("providers", "forecast_count",            "INTEGER DEFAULT 0"),
+            ("accounts",  "last_sync",                 "TEXT DEFAULT ''"),
+            ("consensus", "target_price",              "REAL"),
+            ("consensus", "stop_loss",                 "REAL"),
+            # Bracket order fields for logs
+            ("logs",      "entry_order_type",          "TEXT DEFAULT 'LMT'"),
+            ("logs",      "entry_limit_price",         "REAL"),
+            ("logs",      "entry_tif",                 "TEXT DEFAULT 'DAY'"),
+            ("logs",      "target_price",              "REAL"),
+            ("logs",      "take_profit_tif",           "TEXT DEFAULT 'GTC'"),
+            ("logs",      "stop_loss_tif",             "TEXT DEFAULT 'GTC'"),
+            # Execute field additions
+            ("providers", "execute",                   "TEXT DEFAULT 'yes' CHECK (execute IN ('yes', 'no'))"),
+            ("method_config", "execute",               "TEXT DEFAULT 'yes' CHECK (execute IN ('yes', 'no'))"),
+            # Consensus extended fields
+            ("consensus", "entry_limit_price",          "REAL"),
+            ("consensus", "high_model_disagreement",    "INTEGER DEFAULT 0"),
+            # Consensus evaluation fields
+            ("consensus", "horizon_hours",              "INTEGER"),
+            ("consensus", "eval_target_date",           "TEXT DEFAULT ''"),
+            ("consensus", "eval_status",                "TEXT DEFAULT 'PENDING'"),
+            ("consensus", "actual_date",                "TEXT DEFAULT ''"),
+            ("consensus", "actual_open",                "REAL"),
+            ("consensus", "actual_close",               "REAL"),
+            ("consensus", "actual_high",                "REAL"),
+            ("consensus", "actual_low",                 "REAL"),
+            ("consensus", "entry_price_actual",         "REAL"),
+            ("consensus", "target_hit",                 "INTEGER"),
+            ("consensus", "stop_hit",                   "INTEGER"),
+            ("consensus", "first_hit",                  "TEXT"),
+            ("consensus", "direction_correct",          "INTEGER"),
+            ("consensus", "pnl_pct",                    "REAL"),
+            ("consensus", "r_multiple",                 "REAL"),
+            # Forecast run tracking fields
+            ("logs",      "run_id",                     "INTEGER REFERENCES forecast_runs(id)"),
+            ("consensus", "run_id",                     "INTEGER REFERENCES forecast_runs(id)"),
+            ("consensus", "original_run_id",            "INTEGER REFERENCES forecast_runs(id)"),
+            # forecast_run_links extended fields
+            ("forecast_run_links", "calibrated_confidence", "REAL"),
+            ("forecast_run_links", "calibration_factor",    "REAL"),
+            ("forecast_run_links", "entry_price",            "REAL"),
+            ("forecast_run_links", "r_multiple",             "REAL"),
+            ("forecast_run_links", "atr_14",                 "REAL"),
         ]
-        cur = con.execute("PRAGMA table_info(logs)")
-        existing = {row[1] for row in cur.fetchall()}
         for table, col, col_type in _MISSING_COLS:
-            if col not in existing:
-                con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
-                con.commit()
-                logger.info(f"Schema migration: added column {table}.{col}")
+            try:
+                cur = con.execute(f"PRAGMA table_info({table})")
+                existing = {row[1] for row in cur.fetchall()}
+                if col not in existing:
+                    con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+                    con.commit()
+                    logger.info(f"Schema migration: added column {table}.{col}")
+            except Exception as e:
+                logger.warning(f"Schema migration skipped {table}.{col}: {e}")
+
+        # Ensure new tables exist (for DBs created before this migration)
+        con.executescript("""
+            CREATE TABLE IF NOT EXISTS method_config (
+                method          TEXT PRIMARY KEY,
+                timeframe_hours INTEGER NOT NULL,
+                trigger         TEXT    DEFAULT 'both',
+                active          INTEGER DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS orders (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                log_id               TEXT    DEFAULT '',
+                ticker               TEXT    NOT NULL,
+                ib_order_id          INTEGER DEFAULT 0,
+                ib_parent_id         INTEGER DEFAULT 0,
+                order_role           TEXT    DEFAULT '',
+                order_type           TEXT    DEFAULT '',
+                action               TEXT    DEFAULT '',
+                quantity             REAL    DEFAULT 0,
+                limit_price          REAL    DEFAULT NULL,
+                stop_price           REAL    DEFAULT NULL,
+                status               TEXT    DEFAULT 'QUEUED',
+                account_type         TEXT    DEFAULT '',
+                created_at           TEXT    DEFAULT '',
+                submitted_at         TEXT    DEFAULT '',
+                filled_at            TEXT    DEFAULT '',
+                filled_price         REAL    DEFAULT NULL,
+                execution_latency_ms INTEGER DEFAULT NULL,
+                spread_at_submission REAL    DEFAULT NULL,
+                error_message        TEXT    DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_orders_ticker    ON orders(ticker);
+            CREATE INDEX IF NOT EXISTS idx_orders_status    ON orders(status);
+            CREATE INDEX IF NOT EXISTS idx_orders_ib_parent ON orders(ib_parent_id);
+            CREATE TABLE IF NOT EXISTS scheduled_tasks (
+                name                TEXT PRIMARY KEY,
+                schedule_type       TEXT    DEFAULT 'interval',
+                schedule_value      TEXT    DEFAULT '',
+                is_active           INTEGER DEFAULT 1,
+                last_run_at         TEXT    DEFAULT '',
+                last_run_status     TEXT    DEFAULT '',
+                last_error          TEXT    DEFAULT '',
+                run_count           INTEGER DEFAULT 0,
+                error_count         INTEGER DEFAULT 0,
+                next_run_at         TEXT    DEFAULT '',
+                skip_outside_market INTEGER DEFAULT 0,
+                max_duration_sec    INTEGER DEFAULT 300
+            );
+            CREATE TABLE IF NOT EXISTS heartbeat_log (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                checked_at    TEXT    NOT NULL,
+                ib_ok         INTEGER DEFAULT 0,
+                openrouter_ok INTEGER DEFAULT 0,
+                sqlite_ok     INTEGER DEFAULT 0,
+                notes         TEXT    DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS tickets (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker      TEXT    NOT NULL,
+                created_at  TEXT    DEFAULT '',
+                action      TEXT    DEFAULT '',
+                quantity    REAL    DEFAULT 0,
+                price       REAL    DEFAULT 0,
+                status      TEXT    DEFAULT 'NEW',
+                portfolio   INTEGER DEFAULT 0,
+                notes       TEXT    DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_tickets_ticker ON tickets(ticker);
+            CREATE INDEX IF NOT EXISTS idx_tickets_portfolio ON tickets(portfolio);
+
+            -- Forecast run tracking tables
+            CREATE TABLE IF NOT EXISTS forecast_runs (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at          TEXT NOT NULL,
+                completed_at        TEXT,
+                trigger_type        TEXT NOT NULL,  -- 'scheduler' | 'manual' | 'recalc'
+                tickers_planned     INTEGER DEFAULT 0,
+                tickers_processed   INTEGER DEFAULT 0,
+                consensus_count     INTEGER DEFAULT 0,
+                status              TEXT DEFAULT 'running',  -- 'running' | 'completed' | 'failed'
+                error_message       TEXT
+            );
+            CREATE TABLE IF NOT EXISTS forecast_run_links (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id                  INTEGER NOT NULL REFERENCES forecast_runs(id),
+                log_id                  TEXT NOT NULL REFERENCES logs(id),
+                ticker                  TEXT NOT NULL,
+                method                  TEXT NOT NULL,
+                model                   TEXT NOT NULL,
+                signal                  TEXT,  -- 'LONG' | 'SHORT' | 'NEUTRAL'
+                raw_confidence          REAL,
+                calibrated_confidence   REAL,
+                calibration_factor      REAL,
+                win_rate                REAL,
+                ema_accuracy            REAL,
+                final_weight            REAL,  -- confidence × win_rate × ema_accuracy
+                target_price            REAL,
+                stop_loss               REAL,
+                entry_price             REAL,
+                r_multiple              REAL,
+                atr_14                  REAL,
+                included_in_consensus   INTEGER DEFAULT 1,  -- 0 если filtered (anomaly) или отклонён disagreement
+                UNIQUE(run_id, log_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_run_links_run_id ON forecast_run_links(run_id);
+            CREATE INDEX IF NOT EXISTS idx_run_links_ticker ON forecast_run_links(ticker, run_id);
+            CREATE INDEX IF NOT EXISTS idx_run_links_weight ON forecast_run_links(run_id, final_weight DESC);
+        """)
+        con.commit()
+
+        # Seed method_config defaults if empty
+        cur = con.execute("SELECT COUNT(*) FROM method_config")
+        if cur.fetchone()[0] == 0:
+            _METHOD_CONFIG_DEFAULTS = [
+                ("momentum_trend",    24, "both",        1),
+                ("price_action",       8, "price_level",  1),
+                ("relative_strength", 48, "time",         1),
+                ("volatility",         4, "price_level",  1),
+                ("mean_reversion",    72, "price_level",  1),
+                ("volume_breakout",    2, "price_level",  1),
+            ]
+            con.executemany(
+                "INSERT OR IGNORE INTO method_config(method, timeframe_hours, trigger, active) VALUES (?,?,?,?)",
+                _METHOD_CONFIG_DEFAULTS,
+            )
+            con.commit()
+            logger.info("Schema migration: seeded method_config defaults")
+
+        # Add index on accounts.type if missing
+        try:
+            con.execute("CREATE INDEX IF NOT EXISTS idx_accounts_type ON accounts(type)")
+            con.commit()
+        except Exception:
+            pass
+
+        # Seed new config keys for existing databases
+        _NEW_CONFIG_KEYS = [
+            ("DEFAULT_RISK_PCT",             "0.01",   "Risk per trade as fraction of NetLiquidation (1%)"),
+            ("MAX_POSITION_PCT",             "0.05",   "Max single position as fraction of NetLiquidation (5%)"),
+            ("MAX_SECTOR_EXPOSURE_PCT",      "0.15",   "Soft sector exposure limit (15%)"),
+            ("MAX_SECTOR_HARD_LIMIT_PCT",    "0.25",   "Hard sector exposure limit — signal rejected (25%)"),
+            ("SECTOR_OVERWEIGHT_FACTOR",     "0.5",    "Position size multiplier when sector soft limit exceeded"),
+            ("CAPITAL_STALENESS_MINUTES",    "15",     "IB data staleness threshold in minutes"),
+            ("PRICE_STALENESS_HOURS",        "6",      "Price data staleness threshold in hours"),
+            ("PRICE_STALENESS_BUSINESS_DAYS", "2",     "Price data staleness threshold for daily candles (business days)"),
+            ("PREFERRED_ACCOUNT_TYPE",       "live",   "Preferred IB account type: live | paper"),
+            ("MANUAL_CAPITAL_OVERRIDE",      "",       "Manual capital override (leave empty to use IB)"),
+            ("ORDER_MODE",                   "disabled","Order mode: disabled | paper | live"),
+            ("LIVE_TRADING_CONFIRMED",       "false",  "Must be 'true' to enable live trading"),
+            ("ENTRY_SLIPPAGE_PCT",           "0.001",  "Allowed entry slippage fraction (0.1%)"),
+            ("MAX_SPREAD_PCT",               "0.005",  "Max bid/ask spread for Market orders (Slippage Guard)"),
+            ("USE_STOP_LIMIT",               "false",  "Use Stop-Limit instead of Stop for stop-loss orders"),
+            ("STOP_LIMIT_OFFSET_PCT",        "0.0005", "Offset for Stop-Limit orders"),
+            ("ALLOW_EXTENDED_HOURS",         "false",  "Allow trading outside regular market hours"),
+            ("PRE_MARKET_MINUTES",           "5",      "Minutes before market open to submit QUEUED orders"),
+            ("ORDER_QUEUE_MAX_AGE_HOURS",    "24",     "Hours before QUEUED order becomes EXPIRED"),
+            ("MAX_OPEN_ORDERS",              "5",      "Maximum simultaneous open orders"),
+            ("ORDER_CHILD_TIMEOUT_SEC",      "10",     "Seconds after Entry fill to wait for child orders"),
+            ("ORDER_ROLLBACK_TIMEOUT_SEC",   "30",     "Seconds to wait for rollback confirmation"),
+            ("AUTO_BLOCK_ON_ROLLBACK_FAIL",  "true",   "Block ticker trading on ROLLBACK_FAILED"),
+            ("ALERT_CHANNELS",               "[]",     "Notification channels: push, email, telegram (JSON list)"),
+            ("CONSENSUS_MAX_DEVIATION",      "0.15",   "Max target_price deviation from current price (15%)"),
+            ("AUTO_ORDER_SUBMISSION",        "false",  "Auto-submit orders after consensus (true/false)"),
+            ("MODEL_WEIGHT_EMA_ALPHA",       "0.2",    "EMA smoothing factor for provider accuracy weights"),
+            ("FORECAST_INTERVAL_MINUTES",    "60",     "Forecast cycle interval in minutes"),
+            ("EVALUATE_INTERVAL_MINUTES",    "120",    "Evaluate past forecasts interval in minutes"),
+            ("SCHEDULER_MAX_RETRIES",        "2",      "Max retries for failed scheduled tasks"),
+            ("HEARTBEAT_OPENROUTER_GRACE_SEC","120",   "Grace period before circuit-open triggers degradation"),
+        ]
+        con.executemany(
+            "INSERT OR IGNORE INTO config(key, value, description) VALUES (?,?,?)",
+            _NEW_CONFIG_KEYS,
+        )
+        con.commit()
 
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.db_file, timeout=30)
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout=10000")
+        con.execute("PRAGMA synchronous=NORMAL")
+        con.execute("PRAGMA cache_size=-65536")
         return con
 
     # ------------------------------------------------------------------
@@ -532,6 +938,19 @@ class SQLiteManager:
             logger.error(f"Error getting settings: {e}")
             return []
 
+    def get_latest_forecast_log_id(self, ticker: str) -> Optional[str]:
+        """Return the log_id of the most recent forecast for a ticker."""
+        try:
+            with self._connect() as con:
+                row = con.execute(
+                    "SELECT id FROM logs WHERE ticker = ? ORDER BY forecast_date DESC LIMIT 1",
+                    (ticker,)
+                ).fetchone()
+            return row["id"] if row else None
+        except Exception as e:
+            logger.error(f"Error getting latest forecast log id for {ticker}: {e}")
+            return None
+
     def get_cached_price_data(self, ticker: str, days: int = 250):
         """Return cached price data as list of dicts (newest first)."""
         try:
@@ -622,6 +1041,82 @@ class SQLiteManager:
         except Exception as e:
             logger.error(f"Error setting config key '{key}': {e}")
             return False
+
+    # ------------------------------------------------------------------
+    # Price data staleness check
+    # ------------------------------------------------------------------
+
+    def check_price_data_staleness(self, ticker: str) -> tuple[bool, Optional[str], Optional[int]]:
+        """
+        Check if price_data for ticker is stale.
+
+        Returns:
+            (is_stale, last_date, hours_diff): is_stale=True if data is stale or missing,
+            last_date is the latest date string or None,
+            hours_diff is hours since last update or None.
+        """
+        try:
+            # Get staleness threshold
+            staleness_hours_str = self.get_config_value("PRICE_STALENESS_HOURS", "6")
+            staleness_business_days_str = self.get_config_value("PRICE_STALENESS_BUSINESS_DAYS", "2")
+            try:
+                staleness_hours = int(staleness_hours_str)
+            except ValueError:
+                staleness_hours = 6
+            try:
+                staleness_business_days = int(staleness_business_days_str)
+            except ValueError:
+                staleness_business_days = 2
+
+            with self._connect() as con:
+                row = con.execute(
+                    "SELECT MAX(date) as last_date FROM price_data WHERE ticker=?",
+                    (ticker,),
+                ).fetchone()
+
+            if not row or not row["last_date"]:
+                # No data at all — consider stale (will trigger fresh load)
+                return True, None, None
+
+            last_date_str = row["last_date"]
+            from datetime import datetime
+
+            last_date_raw = str(last_date_str).strip()
+            is_date_only = len(last_date_raw) >= 10 and last_date_raw[4] == '-' and last_date_raw[7] == '-' and ':' not in last_date_raw
+
+            # For daily candles (YYYY-MM-DD), compare business-day age instead of hours from midnight.
+            if is_date_only:
+                try:
+                    last_day = datetime.strptime(last_date_raw[:10], '%Y-%m-%d').date()
+                except ValueError:
+                    return True, last_date_str, None
+
+                today = datetime.now().date()
+                if today <= last_day:
+                    return False, last_date_str, 0
+
+                business_days_diff = max(len(pd.bdate_range(start=last_day, end=today)) - 1, 0)
+                is_stale = business_days_diff > staleness_business_days
+                return is_stale, last_date_str, business_days_diff * 24
+
+            # Parse date (handle both ISO format and legacy formats)
+            try:
+                last_date = datetime.fromisoformat(last_date_str.replace('Z', '+00:00'))
+            except ValueError:
+                try:
+                    last_date = datetime.strptime(last_date_str[:10], '%Y-%m-%d')
+                except ValueError:
+                    return True, last_date_str, None
+
+            now = datetime.now(last_date.tzinfo) if last_date.tzinfo else datetime.now()
+            hours_diff = int((now - last_date).total_seconds() / 3600)
+
+            is_stale = hours_diff > staleness_hours
+            return is_stale, last_date_str, hours_diff
+
+        except Exception as e:
+            logger.error(f"Error checking price data staleness for {ticker}: {e}")
+            return True, None, None
 
     # ------------------------------------------------------------------
     # Model catalog
@@ -751,6 +1246,65 @@ class SQLiteManager:
         return self.save_prompt_template(method, default)
 
     # ------------------------------------------------------------------
+    # IB Order Types helpers
+    # ------------------------------------------------------------------
+
+    def get_order_types(self, active_only: bool = False) -> pd.DataFrame:
+        """Return IB order types as DataFrame. If active_only, filter active=1."""
+        try:
+            sql = "SELECT * FROM ib_order_types"
+            params = ()
+            if active_only:
+                sql += " WHERE active = 1"
+            sql += " ORDER BY active DESC, order_type_code"
+            with self._connect() as con:
+                return pd.read_sql_query(sql, con, params=params)
+        except Exception as e:
+            logger.error(f"Error reading order types: {e}")
+            return pd.DataFrame()
+
+    def is_order_type_active(self, order_type_code: str) -> bool:
+        """Check if an order type is active."""
+        try:
+            with self._connect() as con:
+                cur = con.execute(
+                    "SELECT active FROM ib_order_types WHERE order_type_code = ?",
+                    (order_type_code,)
+                )
+                row = cur.fetchone()
+                return bool(row[0]) if row else False
+        except Exception as e:
+            logger.error(f"Error checking order type '{order_type_code}': {e}")
+            return False
+
+    def set_order_type_active(self, order_type_code: str, active: bool) -> bool:
+        """Enable/disable an order type."""
+        try:
+            with self._connect() as con:
+                con.execute(
+                    "UPDATE ib_order_types SET active = ? WHERE order_type_code = ?",
+                    (1 if active else 0, order_type_code)
+                )
+            return True
+        except Exception as e:
+            logger.error(f"Error updating order type '{order_type_code}': {e}")
+            return False
+
+    def reset_order_types(self) -> bool:
+        """Reset all order types to defaults."""
+        try:
+            with self._connect() as con:
+                con.execute("DELETE FROM ib_order_types")
+                con.executemany(
+                    "INSERT INTO ib_order_types(order_type_code, name, description, required_params, optional_params, tif_supported, active, notes) VALUES (?,?,?,?,?,?,?,?)",
+                    _DEFAULT_ORDER_TYPES,
+                )
+            return True
+        except Exception as e:
+            logger.error(f"Error resetting order types: {e}")
+            return False
+
+    # ------------------------------------------------------------------
     # Prompt helpers (log)
     # ------------------------------------------------------------------
 
@@ -810,6 +1364,149 @@ class SQLiteManager:
             return False
 
     # ------------------------------------------------------------------
+    # Forecast Run tracking
+    # ------------------------------------------------------------------
+
+    def create_forecast_run(self, trigger_type: str, tickers_planned: int = 0) -> int:
+        """Create a new forecast run record and return its ID."""
+        try:
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with self._connect() as con:
+                cur = con.execute(
+                    """INSERT INTO forecast_runs (started_at, trigger_type, tickers_planned, status)
+                       VALUES (?, ?, ?, 'running')""",
+                    (now, trigger_type, tickers_planned)
+                )
+                return cur.lastrowid
+        except Exception as e:
+            logger.error(f"Error creating forecast run: {e}")
+            return None
+
+    def complete_forecast_run(self, run_id: int, status: str = 'completed', 
+                              tickers_processed: int = None, consensus_count: int = None,
+                              error_message: str = None) -> bool:
+        """Mark a forecast run as completed or failed."""
+        try:
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            updates = ["completed_at = ?", "status = ?"]
+            params = [now, status]
+            if tickers_processed is not None:
+                updates.append("tickers_processed = ?")
+                params.append(tickers_processed)
+            if consensus_count is not None:
+                updates.append("consensus_count = ?")
+                params.append(consensus_count)
+            if error_message is not None:
+                updates.append("error_message = ?")
+                params.append(error_message)
+            params.append(run_id)
+            sql = f"UPDATE forecast_runs SET {', '.join(updates)} WHERE id = ?"
+            with self._connect() as con:
+                con.execute(sql, params)
+            return True
+        except Exception as e:
+            logger.error(f"Error completing forecast run {run_id}: {e}")
+            return False
+
+    def link_forecast_to_run(self, run_id: int, log_id: str, ticker: str, method: str, model: str,
+                             signal: str, raw_confidence: float, win_rate: float, ema_accuracy: float,
+                             final_weight: float, target_price: float = None, stop_loss: float = None,
+                             included_in_consensus: int = 1,
+                             calibrated_confidence: float = None, calibration_factor: float = None,
+                             entry_price: float = None, r_multiple: float = None, atr_14: float = None) -> bool:
+        """Link a forecast log entry to a run with full weight snapshot."""
+        try:
+            with self._connect() as con:
+                con.execute(
+                    """INSERT OR REPLACE INTO forecast_run_links
+                       (run_id, log_id, ticker, method, model, signal, raw_confidence, calibrated_confidence,
+                        calibration_factor, win_rate, ema_accuracy, final_weight, target_price, stop_loss,
+                        entry_price, r_multiple, atr_14, included_in_consensus)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (run_id, log_id, ticker, method, model, signal, raw_confidence, calibrated_confidence,
+                     calibration_factor, win_rate, ema_accuracy, final_weight, target_price, stop_loss,
+                     entry_price, r_multiple, atr_14, included_in_consensus)
+                )
+            return True
+        except Exception as e:
+            logger.error(f"Error linking forecast {log_id} to run {run_id}: {e}")
+            return False
+
+    def update_log_run_id(self, log_id: str, run_id: int) -> bool:
+        """Update the run_id for a specific log entry."""
+        try:
+            with self._connect() as con:
+                con.execute("UPDATE logs SET run_id = ? WHERE id = ?", (run_id, log_id))
+            return True
+        except Exception as e:
+            logger.error(f"Error updating run_id for log {log_id}: {e}")
+            return False
+
+    def get_forecast_run(self, run_id: int) -> dict:
+        """Get forecast run details with aggregated statistics."""
+        try:
+            with self._connect() as con:
+                con.row_factory = sqlite3.Row
+                # Run meta
+                run = dict(con.execute(
+                    "SELECT * FROM forecast_runs WHERE id = ?", (run_id,)
+                ).fetchone() or {})
+                if not run:
+                    return None
+                # Aggregated stats from links
+                stats = con.execute(
+                    """SELECT 
+                        COUNT(*) as total_forecasts,
+                        COUNT(CASE WHEN included_in_consensus = 1 THEN 1 END) as included_forecasts,
+                        COUNT(DISTINCT ticker) as tickers_count,
+                        COUNT(DISTINCT method) as methods_count,
+                        COUNT(DISTINCT model) as models_count,
+                        AVG(final_weight) as avg_weight,
+                        MAX(final_weight) as max_weight
+                       FROM forecast_run_links WHERE run_id = ?""",
+                    (run_id,)
+                ).fetchone()
+                run.update({k: stats[k] for k in stats.keys()})
+                return run
+        except Exception as e:
+            logger.error(f"Error fetching forecast run {run_id}: {e}")
+            return None
+
+    def get_forecast_run_links(self, run_id: int, ticker: str = None) -> pd.DataFrame:
+        """Get all forecast links for a run, optionally filtered by ticker."""
+        try:
+            sql = "SELECT * FROM forecast_run_links WHERE run_id = ?"
+            params = [run_id]
+            if ticker:
+                sql += " AND ticker = ?"
+                params.append(ticker)
+            sql += " ORDER BY final_weight DESC"
+            with self._connect() as con:
+                return pd.read_sql_query(sql, con, params=params)
+        except Exception as e:
+            logger.error(f"Error fetching forecast run links for run {run_id}: {e}")
+            return pd.DataFrame()
+
+    def get_forecast_runs(self, limit: int = 50) -> pd.DataFrame:
+        """Get list of forecast runs with aggregated stats."""
+        try:
+            sql = """SELECT 
+                        r.*,
+                        COUNT(l.id) as total_forecasts,
+                        COUNT(CASE WHEN l.included_in_consensus = 1 THEN 1 END) as included_forecasts,
+                        COUNT(DISTINCT l.ticker) as tickers_with_forecasts
+                     FROM forecast_runs r
+                     LEFT JOIN forecast_run_links l ON r.id = l.run_id
+                     GROUP BY r.id
+                     ORDER BY r.started_at DESC
+                     LIMIT ?"""
+            with self._connect() as con:
+                return pd.read_sql_query(sql, con, params=[limit])
+        except Exception as e:
+            logger.error(f"Error fetching forecast runs: {e}")
+            return pd.DataFrame()
+
+    # ------------------------------------------------------------------
     # Price / Indicator queries
     # ------------------------------------------------------------------
 
@@ -832,12 +1529,21 @@ class SQLiteManager:
             logger.error(f"Error reading price_data: {e}")
             return pd.DataFrame()
 
-    def get_indicators(self, ticker: str = None, limit: int = 200) -> pd.DataFrame:
+    def get_indicators(
+        self, ticker: str = None, limit: int = 200, date_from: str = None, date_to: str = None
+    ) -> pd.DataFrame:
         try:
             where = []
             params = []
             if ticker:
-                where.append("ticker = ?"); params.append(ticker)
+                where.append("ticker = ?")
+                params.append(ticker)
+            if date_from:
+                where.append("date >= ?")
+                params.append(date_from)
+            if date_to:
+                where.append("date <= ?")
+                params.append(date_to)
             clause = ("WHERE " + " AND ".join(where)) if where else ""
             sql = f"SELECT * FROM indicators {clause} ORDER BY ticker, date DESC LIMIT {limit}"
             with self._connect() as con:

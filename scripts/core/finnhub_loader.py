@@ -121,16 +121,16 @@ class FinnhubLoader:
         
         return raw_data
 
-def fetch_price_data_finnhub(ticker, days=250, excel_manager=None):
+def fetch_price_data_finnhub(ticker, days=250, db_manager=None):
     """
     Основная функция для загрузки данных через Finnhub
     """
-    # Создаем providers_manager из excel_manager
-    if excel_manager:
+    # Создаем providers_manager из db_manager
+    if db_manager:
         from providers_manager import ProvidersManager
-        providers_manager = ProvidersManager(excel_manager)
+        providers_manager = ProvidersManager(db_manager)
     else:
-        raise ValueError("excel_manager не передан")
+        raise ValueError("db_manager не передан")
     
     loader = FinnhubLoader(providers_manager)
     

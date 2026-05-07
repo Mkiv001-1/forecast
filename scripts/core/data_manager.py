@@ -1,5 +1,5 @@
 """
-Работа с локальными Excel файлами
+Работа с локальными данными
 """
 
 import pandas as pd
@@ -7,22 +7,22 @@ import os
 from datetime import datetime
 import logging
 
-class ExcelManager:
-    """Управление локальными Excel файлами"""
+class DataManager:
+    """Управление локальными данными"""
     
-    def __init__(self, excel_file='trading_robot.xlsx'):
-        self.excel_file = excel_file
-        self.initialize_excel()
+    def __init__(self, data_file='trading_robot.xlsx'):
+        self.data_file = data_file
+        self.initialize_storage()
     
-    def initialize_excel(self):
-        """Создает Excel файл с необходимыми листами"""
+    def initialize_storage(self):
+        """Создает файл данных с необходимыми листами"""
         try:
             # Проверяем существует ли файл
-            if not os.path.exists(self.excel_file):
-                logging.info(f"📋 Создание нового Excel файла: {self.excel_file}")
+            if not os.path.exists(self.data_file):
+                logging.info(f"📋 Создание нового файла данных: {self.data_file}")
                 
                 # Создаем Excel writer
-                with pd.ExcelWriter(self.excel_file, engine='openpyxl') as writer:
+                with pd.ExcelWriter(self.data_file, engine='openpyxl') as writer:
                     # Config
                     config_df = pd.DataFrame(columns=['Parameter', 'Value'])
                     config_df.to_excel(writer, sheet_name='Config', index=False)
@@ -51,22 +51,22 @@ class ExcelManager:
                         'provider', 'api_key', 'model', 'temperature', 'max_tokens', 'rate_limit', 'active'
                     ])
                     # Добавляем настройки по умолчанию
-                        default_providers = [
-                            {
-                                'provider': 'perplexity',
-                                'api_key': '',
-                                'model': 'sonar-pro',
-                                'temperature': 0.2,
-                                'max_tokens': 1500,
-                                'rate_limit': 60,
-                                'active': 1
-                            },
-                            {
-                                'provider': 'alpha_vantage',
-                                'api_key': '',
-                                'model': '',
-                                'temperature': '',
-                                'max_tokens': '',
+                    default_providers = [
+                        {
+                            'provider': 'perplexity',
+                            'api_key': '',
+                            'model': 'sonar-pro',
+                            'temperature': 0.2,
+                            'max_tokens': 1500,
+                            'rate_limit': 60,
+                            'active': 1
+                        },
+                        {
+                            'provider': 'alpha_vantage',
+                            'api_key': '',
+                            'model': '',
+                            'temperature': '',
+                            'max_tokens': '',
                             'rate_limit': 5,
                             'active': 1
                         }
@@ -95,18 +95,18 @@ class ExcelManager:
                     ])
                     log_df.to_excel(writer, sheet_name='Logs', index=False)
                 
-                logging.info("✅ Excel файл успешно создан со всеми листами")
+                logging.info("✅ Файл данных успешно создан со всеми листами")
             else:
-                logging.info(f"📋 Используем существующий Excel файл: {self.excel_file}")
+                logging.info(f"📋 Используем существующий файл данных: {self.data_file}")
                 
         except Exception as e:
-            logging.error(f"❌ Ошибка инициализации Excel: {e}")
+            logging.error(f"❌ Ошибка инициализации хранилища: {e}")
             raise
     
     def read_sheet(self, sheet_name):
         """Читает данные из листа"""
         try:
-            df = pd.read_excel(self.excel_file, sheet_name=sheet_name)
+            df = pd.read_excel(self.data_file, sheet_name=sheet_name)
             logging.info(f"📊 Прочитано {len(df)} записей из листа '{sheet_name}'")
             return df
         except Exception as e:
@@ -141,7 +141,7 @@ class ExcelManager:
                     logging.warning(f"⚠️ Колонка '{key}' не существует в листе '{sheet_name}'")
             
             # Сохраняем обновленные данные
-            with pd.ExcelWriter(self.excel_file, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+            with pd.ExcelWriter(self.data_file, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
             
             logging.info(f"✅ Обновлена строка с ID '{row_id}' в листе '{sheet_name}'")
@@ -172,7 +172,7 @@ class ExcelManager:
             combined_df = pd.concat([existing_df, new_df], ignore_index=True)
             
             # Сохраняем в Excel
-            with pd.ExcelWriter(self.excel_file, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+            with pd.ExcelWriter(self.data_file, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
                 combined_df.to_excel(writer, sheet_name=sheet_name, index=False)
             
             logging.info(f"✅ Добавлено {len(new_df)} записей в лист '{sheet_name}'")
@@ -187,15 +187,15 @@ class ExcelManager:
         try:
             if keep_headers:
                 # Читаем заголовки
-                df = pd.read_excel(self.excel_file, sheet_name=sheet_name, nrows=0)
+                df = pd.read_excel(self.data_file, sheet_name=sheet_name, nrows=0)
                 
                 # Сохраняем только заголовки
-                with pd.ExcelWriter(self.excel_file, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+                with pd.ExcelWriter(self.data_file, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
                     df.to_excel(writer, sheet_name=sheet_name, index=False)
             else:
                 # Создаем пустой лист
                 empty_df = pd.DataFrame()
-                with pd.ExcelWriter(self.excel_file, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+                with pd.ExcelWriter(self.data_file, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
                     empty_df.to_excel(writer, sheet_name=sheet_name, index=False)
             
             logging.info(f"✅ Лист '{sheet_name}' очищен")
@@ -297,7 +297,7 @@ class ExcelManager:
             combined_df = combined_df.drop(['date_str', 'unique_key'], axis=1, errors='ignore')
             
             # Сохраняем в Excel
-            with pd.ExcelWriter(self.excel_file, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+            with pd.ExcelWriter(self.data_file, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
                 combined_df.to_excel(writer, sheet_name='PriceData', index=False)
             
             logging.info(f"✅ Добавлено {len(new_records)} новых записей в PriceData")

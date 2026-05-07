@@ -6,12 +6,12 @@ import pandas as pd
 import logging
 from datetime import datetime
 
-def get_prompts_from_excel(excel_manager, ticker=None):
+def get_prompts_from_excel(db_manager, ticker=None):
     """
     Загружает промпты из Excel таблицы
     
     Args:
-        excel_manager: ExcelManager объект
+        db_manager: ExcelManager объект
         ticker: тикер для фильтрации (опционально)
     
     Returns:
@@ -19,7 +19,7 @@ def get_prompts_from_excel(excel_manager, ticker=None):
     """
     try:
         # Читаем лист Prompts
-        df = excel_manager.read_sheet('Prompts')
+        df = db_manager.read_sheet('Prompts')
         
         if df.empty:
             logging.warning("⚠️ Лист Prompts пуст")

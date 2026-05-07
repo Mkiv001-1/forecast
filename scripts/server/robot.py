@@ -1,4 +1,4 @@
-"""Robot runner — wraps main_excel.py business logic in a background thread."""
+"""Robot runner — wraps forecast_runner.py business logic in a background thread."""
 
 import sys
 import os
@@ -83,11 +83,11 @@ class RobotRunner:
             import sys as _sys
             # Drop cached modules so fresh code is loaded from disk each run
             for _mod in list(_sys.modules.keys()):
-                if any(x in _mod for x in ('main_excel', 'unified_logs_manager', 'actuals_evaluator')):
+                if any(x in _mod for x in ('forecast_runner', 'unified_logs_manager', 'actuals_evaluator', 'data_loader', 'sqlite_manager')):
                     _sys.modules.pop(_mod, None)
 
             from scripts.core.sqlite_manager import SQLiteManager
-            from scripts.core.main_excel import run_trading_bot, evaluate_past_forecasts
+            from scripts.core.forecast_runner import run_trading_bot, evaluate_past_forecasts
 
             self._add_log(f"[{datetime.now().strftime('%H:%M:%S')}] Starting mode: {mode}")
             self._add_log(f"[{datetime.now().strftime('%H:%M:%S')}] DB: {self.db_file}")
@@ -98,6 +98,26 @@ class RobotRunner:
                 self._add_log(f"[{datetime.now().strftime('%H:%M:%S')}] Running forecast generation...")
                 run_trading_bot(db_file=self.db_file)
                 self._add_log(f"[{datetime.now().strftime('%H:%M:%S')}] Forecast generation complete.")
+
+            elif mode == "price_data":
+                self._add_log(f"[{datetime.now().strftime('%H:%M:%S')}] Updating price data for active tickers...")
+                from scripts.core.data_loader import fetch_price_data
+                import sqlite3 as _sq
+                with _sq.connect(self.db_file) as _con:
+                    active_tickers = [r[0] for r in _con.execute("SELECT ticker FROM settings WHERE active=1").fetchall()]
+                updated = 0
+                for tkr in active_tickers:
+                    try:
+                        data = fetch_price_data(tkr, days=30, db_manager=db_manager)
+                        if data:
+                            db_manager.save_price_data(data, ticker=tkr)
+                            updated += 1
+                            self._add_log(f"[{datetime.now().strftime('%H:%M:%S')}]   {tkr}: {len(data)} bars saved")
+                        else:
+                            self._add_log(f"[{datetime.now().strftime('%H:%M:%S')}]   {tkr}: no data returned")
+                    except Exception as _e:
+                        self._add_log(f"[{datetime.now().strftime('%H:%M:%S')}]   {tkr}: ERROR {_e}")
+                self._add_log(f"[{datetime.now().strftime('%H:%M:%S')}] Price data update complete. Updated {updated}/{len(active_tickers)} tickers.")
 
             elif mode == "evaluate":
                 self._add_log(f"[{datetime.now().strftime('%H:%M:%S')}] Running evaluation of past forecasts...")

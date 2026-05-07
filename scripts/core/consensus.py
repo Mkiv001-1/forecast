@@ -1,32 +1,138 @@
 """
 Consensus engine: aggregates multi-model multi-method forecasts
 into a single weighted signal for each ticker.
+
+Robustness features (ред. 2):
+- Anomaly filter: drop forecasts where |target - price| / price > CONSENSUS_MAX_DEVIATION
+- Median target_price and stop_loss for the dominant direction
+- Disagreement control: if minority weight > 40% → force HOLD / high_model_disagreement
 """
 
 import logging
-from datetime import datetime
+import statistics
+from datetime import datetime, timedelta
+from typing import Optional
+
+from scripts.core.config import CONFIDENCE_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_MAX_DEVIATION = 0.15
+_DEFAULT_DISAGREEMENT_THRESHOLD = 0.40
 
-def calculate_consensus(forecasts: list, method_stats: dict = None) -> dict:
+
+def calculate_atr(df, period: int = 14) -> Optional[float]:
+    """Calculate Average True Range from price DataFrame.
+    
+    Args:
+        df: DataFrame with 'high', 'low', 'close' columns (chronological order)
+        period: ATR period (default 14)
+    
+    Returns:
+        ATR value or None if insufficient data
+    """
+    import pandas as pd
+    
+    if len(df) < period + 1:
+        return None
+    
+    # Calculate True Range
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    
+    prev_close = close.shift(1)
+    
+    tr1 = high - low
+    tr2 = abs(high - prev_close)
+    tr3 = abs(low - prev_close)
+    
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    
+    # Simple moving average of TR (можно заменить на EMA для более быстрой реакции)
+    atr = tr.rolling(window=period, min_periods=period).mean().iloc[-1]
+    
+    return float(atr) if pd.notna(atr) else None
+
+
+def normalize_r_multiple(r_multiple: float, atr: float, entry_price: float) -> Optional[float]:
+    """Normalize R-multiple by ATR to compare across tickers.
+    
+    Args:
+        r_multiple: Raw R-multiple (reward/risk ratio)
+        atr: ATR(14) value
+        entry_price: Entry price for percentage normalization
+    
+    Returns:
+        Normalized R-multiple or None if inputs invalid
+    """
+    if not atr or not entry_price or atr <= 0 or entry_price <= 0:
+        return None
+    
+    # ATR as percentage of price
+    atr_pct = atr / entry_price
+    
+    # Normalize: R-multiple per 1% ATR
+    # Example: R=2.0, ATR=2% → normalized = 2.0 / 2.0 = 1.0
+    # Example: R=2.0, ATR=5% → normalized = 2.0 / 5.0 = 0.4 (тикер волатильный, сигнал "хуже")
+    normalized = r_multiple / (atr_pct * 100)
+    
+    return round(normalized, 2)
+
+
+def _parse_price(value) -> Optional[float]:
+    """Extract numeric price from a value that may be a string like '$142.50 (+3.2%)'."""
+    import re
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        v = float(value)
+        return v if v > 0 else None
+    nums = re.findall(r'[\d.]+', str(value))
+    for n in nums:
+        try:
+            v = float(n)
+            if v > 0:
+                return v
+        except ValueError:
+            continue
+    return None
+
+
+def calculate_consensus(
+    forecasts: list,
+    method_stats: dict = None,
+    current_price: float = 0.0,
+    max_deviation: float = _DEFAULT_MAX_DEVIATION,
+    disagreement_threshold: float = _DEFAULT_DISAGREEMENT_THRESHOLD,
+    run_id: int = None,
+    log_ids: dict = None,
+) -> dict:
     """
     Aggregate a list of forecast dicts into a consensus signal.
 
     Each forecast dict must have: side, confidence, method, model.
-    method_stats: optional dict {method: {win_rate: float, ...}}
+    Optional fields used for price validation: entry_price, exit_target, stop_loss.
+    method_stats: optional dict {method: {win_rate: float, ema_accuracy: float, ...}}
+    current_price: used for anomaly filter; skip if 0.
+    run_id: optional forecast run ID for linking.
+    log_ids: optional dict mapping forecast index to log_id.
 
     Returns:
-        {signal, confidence, methods_long, methods_short, methods_neutral, rationale}
+        {signal, confidence, methods_long, methods_short, methods_neutral, rationale,
+         target_price, stop_loss, high_model_disagreement}
     """
     if not forecasts:
         return {
-            "signal": "NEUTRAL",
-            "confidence": 0.0,
-            "methods_long": "",
-            "methods_short": "",
-            "methods_neutral": "",
-            "rationale": "No forecasts available",
+            "signal":                 "NEUTRAL",
+            "confidence":             0.0,
+            "methods_long":           "",
+            "methods_short":          "",
+            "methods_neutral":        "",
+            "rationale":              "No forecasts available",
+            "target_price":           None,
+            "stop_loss":              None,
+            "high_model_disagreement": False,
         }
 
     weighted_long  = 0.0
@@ -37,24 +143,154 @@ def calculate_consensus(forecasts: list, method_stats: dict = None) -> dict:
     methods_short   = []
     methods_neutral = []
 
-    for f in forecasts:
+    long_targets  = []
+    long_stops    = []
+    long_entry_prices = []
+    short_targets = []
+    short_stops   = []
+    short_entry_prices = []
+
+    # TIF values — use first available or defaults
+    entry_tif_values = []
+    take_profit_tif_values = []
+    stop_loss_tif_values = []
+
+    filtered_count = 0
+    
+    # Store forecast data for linking (with weights)
+    forecast_link_data = []  # List of dicts with all weight info
+
+    for idx, f in enumerate(forecasts):
         side       = str(f.get("side", "NEUTRAL")).upper()
-        confidence = float(f.get("confidence", 50)) / 100.0
+        raw_confidence = float(f.get("confidence", 50))  # 0-100 scale
         method     = str(f.get("method", ""))
+        model      = str(f.get("model", ""))
 
-        win_rate = 0.5
+        # --- Confidence Calibration ---
+        # If model historically overconfident (e.g., claims 80% but win_rate=40%),
+        # calibrate down. If underconfident, calibrate up.
+        # Calibration factor = (ema_accuracy_for_model / 0.5) - adjusts relative to baseline
+        calibration_factor = 1.0
+        ema_acc = None
         if method_stats and method in method_stats:
-            win_rate = float(method_stats[method].get("win_rate", 0.5))
+            ema_acc = method_stats[method].get("ema_accuracy")
+            if ema_acc is not None:
+                # ema_acc typically 0.3-0.7, scale to 0.6-1.4 factor
+                calibration_factor = max(0.5, min(1.5, float(ema_acc) / 0.5))
+        
+        calibrated_confidence = raw_confidence * calibration_factor
+        # Clamp to 0-100 range
+        calibrated_confidence = max(0.0, min(100.0, calibrated_confidence))
+        confidence = calibrated_confidence / 100.0  # Convert to 0-1 for weight calc
 
-        weight = confidence * win_rate
-        total_weight += weight
+        # --- Anomaly filter ---
+        is_filtered = False
+        if current_price > 0 and side in ("LONG", "SHORT"):
+            entry = _parse_price(f.get("entry_price"))
+            target = _parse_price(f.get("exit_target") or f.get("target_price"))
+            if target and abs(target - current_price) / current_price > max_deviation:
+                logger.debug(
+                    f"consensus: filtered anomaly {method}/{f.get('model','?')} "
+                    f"target={target} vs price={current_price} (>{max_deviation*100:.0f}%)"
+                )
+                filtered_count += 1
+                is_filtered = True
+                methods_neutral.append(f"{method}({f.get('model','?')})[filtered]")
 
+        # --- Weight calculation ---
+        win_rate    = 0.5
+        ema_weight  = 1.0
+        if method_stats and method in method_stats:
+            win_rate   = float(method_stats[method].get("win_rate", 0.5))
+            ema_acc    = method_stats[method].get("ema_accuracy")
+            if ema_acc is not None:
+                ema_weight = max(0.3, min(1.5, float(ema_acc) * 2))
+
+        weight = confidence * win_rate * ema_weight
+
+        # NOTE: total_weight is accumulated only for non-filtered forecasts (below, after continue)
+
+        # --- Collect prices ---
+        target_price = _parse_price(f.get("exit_target") or f.get("target_price"))
+        stop_price   = f.get("stop_loss")
+        if stop_price is not None:
+            try:
+                stop_price = float(stop_price)
+                if stop_price <= 0:
+                    stop_price = None
+            except (TypeError, ValueError):
+                stop_price = None
+
+        # Collect entry_limit_price and TIFs
+        entry_limit = f.get("entry_limit_price")
+        if entry_limit is not None:
+            try:
+                entry_limit = float(entry_limit)
+                if entry_limit <= 0:
+                    entry_limit = None
+            except (TypeError, ValueError):
+                entry_limit = None
+
+        if f.get("entry_tif"):
+            entry_tif_values.append(f.get("entry_tif"))
+        if f.get("take_profit_tif"):
+            take_profit_tif_values.append(f.get("take_profit_tif"))
+        if f.get("stop_loss_tif"):
+            stop_loss_tif_values.append(f.get("stop_loss_tif"))
+
+        # Calculate R-multiple for this forecast if we have levels
+        forecast_r_multiple = None
+        if target_price and stop_price and entry_limit:
+            risk = abs(entry_limit - stop_price)
+            reward = abs(target_price - entry_limit)
+            if risk > 0:
+                forecast_r_multiple = round(reward / risk, 2)
+        
+        # Store link data for all forecasts (including filtered)
+        log_id = log_ids.get(idx) if log_ids else f.get('log_id')
+        if run_id and log_id:
+            forecast_link_data.append({
+                'run_id': run_id,
+                'log_id': log_id,
+                'ticker': f.get('ticker', ''),
+                'method': method,
+                'model': f.get('model', ''),
+                'signal': side,
+                'raw_confidence': raw_confidence,
+                'calibrated_confidence': calibrated_confidence,
+                'calibration_factor': calibration_factor,
+                'win_rate': win_rate,
+                'ema_accuracy': ema_acc if ema_acc is not None else 0.5,
+                'final_weight': weight,
+                'target_price': target_price,
+                'stop_loss': stop_price,
+                'entry_price': entry_limit,
+                'r_multiple': forecast_r_multiple,
+                'atr_14': f.get('atr_14'),  # ATR if available from price data
+                'included_in_consensus': 0 if is_filtered else 1,  # Mark filtered as not included
+            })
+        
+        if is_filtered:
+            continue
+            
         if side == "LONG":
             weighted_long  += weight
             methods_long.append(f"{method}({f.get('model','?')})")
+            if target_price:
+                long_targets.append(target_price)
+            if stop_price:
+                long_stops.append(stop_price)
+            if entry_limit:
+                long_entry_prices.append(entry_limit)
         elif side == "SHORT":
             weighted_short += weight
             methods_short.append(f"{method}({f.get('model','?')})")
+            if target_price:
+                short_targets.append(target_price)
+            if stop_price:
+                short_stops.append(stop_price)
+            if entry_limit:
+                short_entry_prices.append(entry_limit)
         else:
             methods_neutral.append(f"{method}({f.get('model','?')})")
 
@@ -68,41 +304,209 @@ def calculate_consensus(forecasts: list, method_stats: dict = None) -> dict:
         signal     = "SHORT"
         confidence = round(weighted_short / total_weight * 100, 1)
 
-    # Require at least 55% confidence and majority direction to avoid noise
-    if confidence < 55:
-        signal = "NEUTRAL"
+    # --- Disagreement check ---
+    high_disagreement = False
+    if total_weight > 0 and signal != "NEUTRAL":
+        minority_weight = weighted_short if signal == "LONG" else weighted_long
+        if minority_weight / total_weight > disagreement_threshold:
+            high_disagreement = True
+            signal = "NEUTRAL"
+            confidence = 0.0
+            logger.warning(
+                f"consensus: high model disagreement "
+                f"({minority_weight/total_weight*100:.0f}% minority) → forced NEUTRAL"
+            )
 
+    # Require minimum confidence to avoid noise
+    if confidence < CONFIDENCE_THRESHOLD:
+        signal = "NEUTRAL"
+        # Mark all as not included when confidence too low
+        for link_data in forecast_link_data:
+            link_data['included_in_consensus'] = 0
+
+    # --- Median prices for dominant direction ---
+    med_target: Optional[float] = None
+    med_stop:   Optional[float] = None
+    med_entry:  Optional[float] = None
+    if signal == "LONG":
+        if long_targets:
+            med_target = round(statistics.median(long_targets), 4)
+        if long_stops:
+            med_stop = round(statistics.median(long_stops), 4)
+        if long_entry_prices:
+            med_entry = round(statistics.median(long_entry_prices), 4)
+    elif signal == "SHORT":
+        if short_targets:
+            med_target = round(statistics.median(short_targets), 4)
+        if short_stops:
+            med_stop = round(statistics.median(short_stops), 4)
+        if short_entry_prices:
+            med_entry = round(statistics.median(short_entry_prices), 4)
+
+    # --- Expected Value Filter ---
+    # expected_r = (confidence_pct / 100) * (distance_to_target / distance_to_stop)
+    # Filter out signals with expected_r below threshold
+    _DEFAULT_MIN_EXPECTED_R = 0.5
+    expected_r = None
+    if signal in ("LONG", "SHORT") and med_target and med_stop and med_entry:
+        risk = abs(med_entry - med_stop)
+        reward = abs(med_target - med_entry)
+        if risk > 0:
+            expected_r = (confidence / 100.0) * (reward / risk)
+            if expected_r < _DEFAULT_MIN_EXPECTED_R:
+                logger.warning(
+                    f"consensus: expected_r={expected_r:.2f} < {_DEFAULT_MIN_EXPECTED_R} "
+                    f"({signal} conf={confidence:.1f}%, r/r={reward/risk:.2f}) → forced NEUTRAL"
+                )
+                signal = "NEUTRAL"
+                confidence = 0.0
+                # Mark all as not included due to low expected value
+                for link_data in forecast_link_data:
+                    link_data['included_in_consensus'] = 0
+
+    filter_note = f" [{filtered_count} filtered by anomaly]" if filtered_count else ""
+    ev_note = f" [expected_r={expected_r:.2f}]" if expected_r is not None else ""
     rationale = (
         f"LONG: {len(methods_long)} signals, SHORT: {len(methods_short)} signals, "
-        f"NEUTRAL: {len(methods_neutral)} signals. "
+        f"NEUTRAL: {len(methods_neutral)} signals.{filter_note}{ev_note} "
         f"Weighted confidence: {confidence:.1f}%"
+        + (" ⚠️ high_model_disagreement" if high_disagreement else "")
     )
 
-    logger.info(f"📊 Consensus: {signal} {confidence:.1f}% ({len(forecasts)} forecasts)")
+    logger.info(
+        f"\U0001f4ca Consensus: {signal} {confidence:.1f}% "
+        f"({len(forecasts)} forecasts, target={med_target}, stop={med_stop})"
+    )
+    
+    # --- Update included_in_consensus for disagreement ---
+    if high_disagreement and signal == "NEUTRAL" and expected_r is None:
+        for link_data in forecast_link_data:
+            link_data['included_in_consensus'] = 0
+
+    # TIF defaults — use most common or hardcoded defaults
+    entry_tif = entry_tif_values[0] if entry_tif_values else "DAY"
+    take_profit_tif = take_profit_tif_values[0] if take_profit_tif_values else "GTC"
+    stop_loss_tif = stop_loss_tif_values[0] if stop_loss_tif_values else "GTC"
 
     return {
-        "signal":          signal,
-        "confidence":      confidence,
-        "methods_long":    ", ".join(methods_long),
-        "methods_short":   ", ".join(methods_short),
-        "methods_neutral": ", ".join(methods_neutral),
-        "rationale":       rationale,
+        "signal":                  signal,
+        "confidence":              confidence,
+        "methods_long":            ", ".join(methods_long),
+        "methods_short":           ", ".join(methods_short),
+        "methods_neutral":         ", ".join(methods_neutral),
+        "rationale":               rationale,
+        "target_price":            med_target,
+        "stop_loss":               med_stop,
+        "entry_limit_price":       med_entry,
+        "entry_tif":               entry_tif,
+        "take_profit_tif":         take_profit_tif,
+        "stop_loss_tif":           stop_loss_tif,
+        "high_model_disagreement": high_disagreement,
+        "_forecast_link_data":     forecast_link_data,  # Internal use for linking
     }
 
 
-def save_consensus(db_manager, ticker: str, consensus: dict) -> bool:
-    """Save consensus record to the consensus table."""
+def save_consensus(db_manager, ticker: str, consensus: dict, method_stats: dict = None,
+                   override_date: str = None, run_id: int = None, original_run_id: int = None) -> bool:
+    """Save consensus record to the consensus table.
+
+    Computes horizon_hours as the median of timeframe_hours for active methods
+    that participated in the consensus (from method_stats or db_manager.method_config).
+    Derives eval_target_date = consensus_date + horizon_hours.
+
+    override_date: optional YYYY-MM-DD string to use instead of now() — for historical recalc.
+    run_id: optional forecast run ID for linking (the recalc run ID).
+    original_run_id: optional original forecast run ID from the source forecasts — for analytical JOINs.
+    """
     try:
+        now = datetime.strptime(override_date, "%Y-%m-%d") if override_date else datetime.now()
+
+        # Compute horizon_hours from method_stats or method_config
+        horizon_hours = None
+        try:
+            hours_list = []
+            # Only consider methods that contributed to the winning signal direction
+            signal_direction = consensus.get("signal", "NEUTRAL")
+            if signal_direction == "LONG":
+                active_methods_str = consensus.get("methods_long", "")
+            elif signal_direction == "SHORT":
+                active_methods_str = consensus.get("methods_short", "")
+            else:
+                active_methods_str = (
+                    consensus.get("methods_long", "") + "," +
+                    consensus.get("methods_short", "") + "," +
+                    consensus.get("methods_neutral", "")
+                )
+            # Extract bare method names (strip model suffix in parentheses)
+            import re as _re
+            active_method_names = set(
+                _re.sub(r'\(.*?\)', '', m).strip()
+                for m in active_methods_str.split(",")
+                if m.strip()
+            )
+
+            # Prefer method_stats if it contains timeframe_hours
+            if method_stats:
+                for method_name, stats in method_stats.items():
+                    if active_method_names and method_name not in active_method_names:
+                        continue
+                    h = stats.get("timeframe_hours")
+                    if h and int(h) > 0:
+                        hours_list.append(int(h))
+
+            # Fallback: query db directly
+            if not hours_list and db_manager is not None:
+                try:
+                    import pandas as pd
+                    with db_manager._connect() as con:
+                        df = pd.read_sql_query("SELECT timeframe_hours FROM method_config WHERE active = 1", con)
+                    if not df.empty:
+                        hours_list = [int(h) for h in df["timeframe_hours"].dropna().tolist() if int(h) > 0]
+                except Exception:
+                    pass
+
+            if hours_list:
+                horizon_hours = int(statistics.median(hours_list))
+        except Exception as e:
+            logger.warning(f"save_consensus: could not compute horizon_hours: {e}")
+
+        # Default horizon if no method config data available
+        if not horizon_hours:
+            horizon_hours = 24  # Default: evaluate after 24 hours
+            logger.debug(f"save_consensus: using default horizon_hours={horizon_hours} (no method config data)")
+
+        # Ensure eval_target_date is at least the next calendar day
+        # (daily bars: entry and actual must be from different days)
+        eval_dt = now + timedelta(hours=horizon_hours)
+        if eval_dt.date() <= now.date():
+            eval_dt = now + timedelta(days=1)
+        eval_target_date = eval_dt.strftime("%Y-%m-%d %H:%M:%S")
+
         record = {
-            "date":            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "ticker":          ticker,
-            "signal":          consensus["signal"],
-            "confidence":      consensus["confidence"],
-            "methods_long":    consensus["methods_long"],
-            "methods_short":   consensus["methods_short"],
-            "methods_neutral": consensus["methods_neutral"],
-            "rationale":       consensus["rationale"],
+            "date":                    now.strftime("%Y-%m-%d %H:%M:%S"),
+            "ticker":                  ticker,
+            "signal":                  consensus["signal"],
+            "confidence":              consensus["confidence"],
+            "methods_long":            consensus.get("methods_long", ""),
+            "methods_short":           consensus.get("methods_short", ""),
+            "methods_neutral":         consensus.get("methods_neutral", ""),
+            "rationale":               consensus.get("rationale", ""),
+            "target_price":            consensus.get("target_price"),
+            "stop_loss":               consensus.get("stop_loss"),
+            "entry_limit_price":       consensus.get("entry_limit_price"),
+            "high_model_disagreement": int(bool(consensus.get("high_model_disagreement", False))),
+            "horizon_hours":           horizon_hours,
+            "eval_target_date":        eval_target_date,
+            "eval_status":             "PENDING",
+            "run_id":                  run_id,
+            "original_run_id":         original_run_id,
         }
+        
+        # Save all forecast links with weights (including filtered)
+        link_data_list = consensus.get("_forecast_link_data", [])
+        for link_data in link_data_list:
+            db_manager.link_forecast_to_run(**link_data)
+        
         return db_manager.save_consensus(record)
     except Exception as e:
         logger.error(f"Error saving consensus for {ticker}: {e}")

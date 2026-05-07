@@ -7,8 +7,8 @@ import logging
 from typing import Dict, Optional
 
 class ProvidersManager:
-    def __init__(self, excel_manager):
-        self.excel_manager = excel_manager
+    def __init__(self, db_manager):
+        self.db_manager = db_manager
         self._providers_cache = None
     
     def get_provider_config(self, provider_name: str) -> Optional[Dict]:
@@ -33,7 +33,7 @@ class ProvidersManager:
             # Конвертируем в нужный формат
             result_config = {
                 'provider': config['name'],
-                'api_key': config['api'],
+                'api_key': config.get('api_key') or config.get('api', ''),
                 'active': config['active'],
                 'model': 'sonar-pro',  # значения по умолчанию
                 'temperature': 0.2,
@@ -50,7 +50,7 @@ class ProvidersManager:
     def _load_providers(self):
         """Загружает данные провайдеров из Excel"""
         try:
-            self._providers_cache = self.excel_manager.read_sheet('Providers')
+            self._providers_cache = self.db_manager.read_sheet('Providers')
             if self._providers_cache is None or self._providers_cache.empty:
                 logging.error("❌ Таблица Providers пуста или не найдена")
                 self._providers_cache = pd.DataFrame()
@@ -91,7 +91,7 @@ class ProvidersManager:
                     self._providers_cache.at[idx, key] = value
             
             # Сохраняем в Excel
-            success = self.excel_manager.update_sheet('Providers', self._providers_cache)
+            success = self.db_manager.update_sheet('Providers', self._providers_cache)
             
             if success:
                 logging.info(f"✅ Конфигурация провайдера {provider_name} обновлена")

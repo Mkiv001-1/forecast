@@ -58,6 +58,12 @@ class ForecastApiClient:
         resp.raise_for_status()
         return resp.json()
 
+    def _patch(self, path: str, json: dict = None):
+        url = f"{self.server_url}{path}"
+        resp = self._session.patch(url, json=json, timeout=self.timeout)
+        resp.raise_for_status()
+        return resp.json()
+
     def health(self) -> HealthResponse:
         data = self._session.get(f"{self.server_url}/health", timeout=self.timeout).json()
         return HealthResponse(**data)
@@ -119,6 +125,10 @@ class ForecastApiClient:
 
     def run_full(self) -> RunResponse:
         data = self._post("/run/full")
+        return RunResponse(**data)
+
+    def run_price_data(self) -> RunResponse:
+        data = self._post("/run/price-data")
         return RunResponse(**data)
 
     def run_status(self) -> RunResponse:
@@ -197,9 +207,13 @@ class ForecastApiClient:
         self,
         ticker: Optional[str] = None,
         limit: int = 200,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
     ) -> IndicatorsResponse:
         params = {"limit": limit}
         if ticker: params["ticker"] = ticker
+        if date_from: params["date_from"] = date_from
+        if date_to: params["date_to"] = date_to
         data = self._get("/indicators", params=params)
         return IndicatorsResponse(**data)
 
@@ -207,11 +221,30 @@ class ForecastApiClient:
         self,
         ticker: Optional[str] = None,
         limit: int = 100,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
     ) -> ConsensusResponse:
         params = {"limit": limit}
         if ticker: params["ticker"] = ticker
+        if date_from: params["date_from"] = date_from
+        if date_to: params["date_to"] = date_to
         data = self._get("/consensus", params=params)
         return ConsensusResponse(**data)
+
+    def evaluate_consensus(self) -> dict:
+        """Trigger evaluation of pending consensus records."""
+        return self._post("/consensus/evaluate")
+
+    def recalculate_consensus(self, date_from: str = None, date_to: str = None, force: bool = False) -> dict:
+        """Recalculate consensus from historical forecast logs."""
+        params = {}
+        if date_from:
+            params["date_from"] = date_from
+        if date_to:
+            params["date_to"] = date_to
+        if force:
+            params["force"] = "true"
+        return self._post("/consensus/recalculate", params=params)
 
     def get_system_log(
         self,
@@ -288,3 +321,101 @@ class ForecastApiClient:
     def delete_ib_config(self, config_id: int) -> dict:
         """Delete IB Gateway configuration."""
         return self._delete(f"/ib-config/{config_id}")
+
+    def get_scheduler_tasks(self) -> list:
+        """Return all rows from scheduled_tasks."""
+        data = self._get("/scheduler/tasks")
+        return data.get("items", [])
+
+    def set_task_active(self, name: str, active: int) -> dict:
+        """Enable (1) or disable (0) a scheduled task."""
+        return self._patch(f"/scheduler/tasks/{name}/active", json={"active": active})
+
+    def get_heartbeat_history(self, limit: int = 20) -> list:
+        """Return recent heartbeat_log entries."""
+        data = self._get("/heartbeat/history", params={"limit": limit})
+        return data.get("items", [])
+
+    def get_orders(
+        self,
+        ticker: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 200,
+    ) -> list:
+        """Return orders from the server."""
+        params = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        if status:
+            params["status"] = status
+        data = self._get("/orders", params=params)
+        return data.get("items", [])
+
+    def cancel_order(self, order_id: int) -> dict:
+        """Cancel an IB order by DB id."""
+        return self._post(f"/orders/{order_id}/cancel")
+
+    def get_tickets(
+        self,
+        ticker: Optional[str] = None,
+        status: Optional[str] = None,
+        portfolio: Optional[int] = None,
+        limit: int = 500,
+    ) -> list:
+        """Return tickets list."""
+        params: dict = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        if status:
+            params["status"] = status
+        if portfolio is not None:
+            params["portfolio"] = portfolio
+        data = self._get("/tickets", params=params)
+        return data.get("items", [])
+
+    def create_ticket(self, ticker: str, **kwargs) -> dict:
+        """Create a new ticket."""
+        return self._post("/tickets", {"ticker": ticker, **kwargs})
+
+    def update_ticket(self, ticket_id: int, **kwargs) -> dict:
+        """Update ticket fields."""
+        return self._patch(f"/tickets/{ticket_id}", kwargs)
+
+    def delete_ticket(self, ticket_id: int) -> dict:
+        """Delete a ticket."""
+        return self._delete(f"/tickets/{ticket_id}")
+
+    def create_method(self, method: str, timeframe_hours: int = 24,
+                      trigger: str = "both", execute: str = "yes") -> dict:
+        """Create a new method configuration."""
+        return self._post("/method-config", json={
+            "method": method,
+            "timeframe_hours": timeframe_hours,
+            "trigger": trigger,
+            "execute": execute,
+        })
+
+    def get_method_configs(self) -> list:
+        """Return all method configurations."""
+        data = self._get("/method-config")
+        return data.get("items", [])
+
+    def get_method_config(self, method: str) -> dict:
+        """Return detailed configuration for a specific method."""
+        return self._get(f"/method-config/{method}")
+
+    def update_method_execute(self, method: str, execute: str) -> dict:
+        """Update execute flag for a method ('yes' or 'no')."""
+        return self._put(f"/method-config/{method}/execute", json={"execute": execute})
+
+    def update_provider_execute(self, provider: str, execute: str) -> dict:
+        """Update execute flag for a provider ('yes' or 'no')."""
+        return self._put(f"/providers/{provider}/execute", json={"execute": execute})
+
+    def get_forecast_runs(self, limit: int = 50) -> dict:
+        """Return list of forecast runs with aggregated stats."""
+        return self._get("/forecast-runs", params={"limit": limit})
+
+    def get_forecast_run(self, run_id: int) -> dict:
+        """Return details of a specific forecast run including links."""
+        return self._get(f"/forecast-runs/{run_id}")

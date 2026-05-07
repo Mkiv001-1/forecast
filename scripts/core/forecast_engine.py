@@ -86,15 +86,24 @@ _PROMPT_FOOTER = """
 {
     "confidence": число от 0 до 100,
     "side": "LONG" или "SHORT" или "NEUTRAL",
-    "entry_price": "$xxx.xx",
-    "entry_conditions": ["условие1", "условие2"],
-    "exit_target": "$xxx.xx (+x.x%)",
-    "exit_stop": "$xxx.xx (-x.x%)",
+    "entry_order_type": "LMT",
+    "entry_limit_price": число (цена лимитного входа, например 150.50),
+    "entry_tif": "DAY",
+    "target_price": число (цена тейк-профита, например 160.00),
+    "take_profit_tif": "GTC",
+    "stop_loss": число (цена стоп-лосса, например 145.00),
+    "stop_loss_tif": "GTC",
+    "timeframe_hours": целое число (ожидаемый горизонт в часах, например 24),
     "rationale": "подробное обоснование прогноза"
 }
 
-Требования: confidence реалистичный (не более 80 без явных сигналов),
-entry_price — цена вашего входа в сделку, rationale — детальный анализ."""
+Требования:
+- confidence реалистичный (не более 80 без явных сигналов)
+- entry_limit_price — чёткая цена входа (для LONG: ниже текущей, для SHORT: выше текущей)
+- target_price — чёткая цена тейк-профита (минимум 1.5x R/R от стопа)
+- stop_loss — чёткая цена стоп-лосса (ниже ближайшей поддержки для LONG)
+- timeframe_hours — реалистичный горизонт для данного метода анализа
+- rationale — детальный анализ с обоснованием уровней"""
 
 
 def build_prompt(db_manager, ticker, ind, method):
@@ -109,9 +118,10 @@ def build_prompt(db_manager, ticker, ind, method):
     if not template:
         return build_prompt_fallback(ticker, ind, method, db_manager=db_manager)
 
-    from multi_model_forecaster import _METHOD_HORIZON
-    horizon = _METHOD_HORIZON.get(method, 1)
-    forecast_date = (datetime.now() + timedelta(days=horizon)).strftime('%Y-%m-%d')
+    from multi_model_forecaster import _METHOD_HORIZON_HOURS
+    horizon_hours = _METHOD_HORIZON_HOURS.get(method, 24)
+    horizon = max(1, round(horizon_hours / 24))
+    forecast_date = (datetime.now() + timedelta(hours=horizon_hours)).strftime('%Y-%m-%d')
 
     atr_percent = (ind['atr14'] / ind['price'] * 100) if ind.get('price') else 0
     bb = ind.get('bb', {})
@@ -196,9 +206,10 @@ def build_prompt(db_manager, ticker, ind, method):
 
 def build_prompt_fallback(ticker, ind, method, db_manager=None):
     """Build enriched forecast prompt with extended indicators and market context."""
-    from multi_model_forecaster import _METHOD_HORIZON
-    horizon = _METHOD_HORIZON.get(method, 1)
-    forecast_date = (datetime.now() + timedelta(days=horizon)).strftime('%Y-%m-%d')
+    from multi_model_forecaster import _METHOD_HORIZON_HOURS
+    horizon_hours = _METHOD_HORIZON_HOURS.get(method, 24)
+    horizon = max(1, round(horizon_hours / 24))
+    forecast_date = (datetime.now() + timedelta(hours=horizon_hours)).strftime('%Y-%m-%d')
 
     atr_percent = (ind['atr14'] / ind['price'] * 100) if ind.get('price') else 0
     bb = ind.get('bb', {})
@@ -273,23 +284,7 @@ def build_prompt_fallback(ticker, ind, method, db_manager=None):
 
     method_instructions = get_method_instructions(method, ind, atr_percent)
 
-    footer = """
-ОТВЕТЬ СТРОГО В ФОРМАТЕ JSON:
-{
-    "confidence": число от 0 до 100,
-    "side": "LONG" или "SHORT" или "NEUTRAL",
-    "entry_price": "$xxx.xx",
-    "entry_conditions": ["условие1", "условие2"],
-    "exit_target": "$xxx.xx (+x.x%)",
-    "exit_stop": "$xxx.xx (-x.x%)",
-    "rationale": "подробное обоснование прогноза"
-}
-
-Требования: confidence реалистичный (не более 80 без явных сигналов),
-entry_price — цена вашего входа в сделку, rationale — детальный анализ.
-"""
-
-    return base_prompt + method_instructions + footer
+    return base_prompt + method_instructions + _PROMPT_FOOTER
 
 def call_ai_model(db_manager, model_cfg: dict, prompt: str) -> str:
     """
@@ -312,7 +307,7 @@ def call_ai_model(db_manager, model_cfg: dict, prompt: str) -> str:
 def call_perplexity_api(prompt, providers_manager):
     """Legacy wrapper — routes through OpenRouter via AIClient."""
     try:
-        db_manager = providers_manager.excel_manager
+        db_manager = providers_manager.db_manager
         models = []
         try:
             from ai_client import get_active_ai_models
@@ -360,6 +355,54 @@ def parse_json_response(text):
             if field not in data:
                 logging.error(f"❌ Отсутствует поле: {field}")
                 return None
+
+        # Ensure numeric stop_loss — fall back to parsing exit_stop string
+        if 'stop_loss' not in data or data.get('stop_loss') is None:
+            exit_stop = str(data.get('exit_stop', ''))
+            nums = re.findall(r'[\d.]+', exit_stop)
+            if nums:
+                try:
+                    data['stop_loss'] = float(nums[-1])
+                except ValueError:
+                    data['stop_loss'] = None
+            else:
+                data['stop_loss'] = None
+        else:
+            try:
+                data['stop_loss'] = float(data['stop_loss'])
+            except (TypeError, ValueError):
+                data['stop_loss'] = None
+
+        # Ensure numeric entry_limit_price
+        if 'entry_limit_price' in data and data.get('entry_limit_price') is not None:
+            try:
+                data['entry_limit_price'] = float(data['entry_limit_price'])
+            except (TypeError, ValueError):
+                data['entry_limit_price'] = None
+
+        # Ensure numeric target_price — fall back to parsing exit_target string
+        if 'target_price' not in data or data.get('target_price') is None:
+            exit_target = str(data.get('exit_target', ''))
+            nums = re.findall(r'[\d.]+', exit_target)
+            if nums:
+                try:
+                    data['target_price'] = float(nums[-1])
+                except ValueError:
+                    data['target_price'] = None
+            else:
+                data['target_price'] = None
+        else:
+            try:
+                data['target_price'] = float(data['target_price'])
+            except (TypeError, ValueError):
+                data['target_price'] = None
+
+        # Set defaults for bracket order fields
+        data.setdefault('entry_order_type', 'LMT')
+        data.setdefault('entry_tif', 'DAY')
+        data.setdefault('take_profit_tif', 'GTC')
+        data.setdefault('stop_loss_tif', 'GTC')
+
         return data
     except json.JSONDecodeError as e:
         logging.error(f"❌ Ошибка парсинга JSON: {e}")
@@ -369,6 +412,64 @@ def parse_json_response(text):
         logging.error(f"❌ Ошибка парсинга JSON: {e}")
         logging.error(f"❌ Сырой ответ: {text[:500]}")
         return None
+
+
+def validate_signal_rr(forecast: dict, current_price: float, min_rr: float = 2.0) -> tuple:
+    """Validate R/R ratio and stop-loss direction.
+
+    Returns (is_valid: bool, reason: str).
+    Rejects signals with:
+    - Missing stop_loss
+    - Stop on wrong side (LONG: stop >= entry; SHORT: stop <= entry)
+    - R/R < min_rr
+    - Invalid entry_limit_price (must be between current price and stop)
+    """
+    side = str(forecast.get('side', 'NEUTRAL')).upper()
+    if side == 'NEUTRAL':
+        return True, 'NEUTRAL'
+
+    stop_loss = forecast.get('stop_loss')
+    if stop_loss is None or stop_loss <= 0:
+        return False, 'MISSING_STOP_LOSS'
+
+    # Use target_price if available, fallback to parsing exit_target
+    target_price = forecast.get('target_price')
+    if target_price is None or target_price <= 0:
+        exit_target_str = str(forecast.get('exit_target', ''))
+        target_nums = re.findall(r'[\d.]+', exit_target_str)
+        if not target_nums:
+            return False, 'MISSING_TARGET_PRICE'
+        try:
+            target_price = float(target_nums[-1])
+        except ValueError:
+            return False, 'MISSING_TARGET_PRICE'
+
+    # Use entry_limit_price if available, otherwise use current_price
+    entry_price = forecast.get('entry_limit_price') or current_price
+    if entry_price is None or entry_price <= 0:
+        entry_price = current_price
+
+    if current_price <= 0:
+        return False, 'INVALID_CURRENT_PRICE'
+
+    # Validate entry_limit_price position relative to current and stop
+    if side == 'LONG':
+        if stop_loss >= entry_price:
+            return False, 'STOP_ABOVE_ENTRY_FOR_LONG'
+        if entry_price > current_price:
+            return False, 'ENTRY_ABOVE_CURRENT_FOR_LONG'
+        rr = (target_price - entry_price) / (entry_price - stop_loss)
+    else:  # SHORT
+        if stop_loss <= entry_price:
+            return False, 'STOP_BELOW_ENTRY_FOR_SHORT'
+        if entry_price < current_price:
+            return False, 'ENTRY_BELOW_CURRENT_FOR_SHORT'
+        rr = (entry_price - target_price) / (stop_loss - entry_price)
+
+    if rr < min_rr:
+        return False, f'LOW_RR_{rr:.2f}'
+
+    return True, f'RR_{rr:.2f}'
 
 def generate_forecast(db_manager, ticker, indicators, method, method_num=1, model_cfg=None):
     """Генерирует прогноз для указанного метода через OpenRouter."""
@@ -419,9 +520,10 @@ def save_forecast(db_manager, ticker, method, forecast, prompt_text=None, api_re
     """Сохраняет прогноз в единую таблицу Logs"""
     try:
         from unified_logs_manager import save_forecast_to_logs
-        from multi_model_forecaster import _METHOD_HORIZON
-        horizon = _METHOD_HORIZON.get(method, 1)
-        forecast_date = (datetime.now() + timedelta(days=horizon)).strftime('%Y-%m-%d')
+        from multi_model_forecaster import _METHOD_HORIZON_HOURS
+        horizon_hours = _METHOD_HORIZON_HOURS.get(method, 24)
+        horizon = max(1, round(horizon_hours / 24))
+        forecast_date = (datetime.now() + timedelta(hours=horizon_hours)).strftime('%Y-%m-%d')
         entry_conditions = '; '.join(forecast.get('entry_conditions', []))
         forecast_data = {
             'forecast_date': forecast_date,

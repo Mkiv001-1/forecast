@@ -63,6 +63,7 @@ class ProviderSetting(BaseModel):
     max_tokens: Optional[Any] = None
     rate_limit: Optional[Any] = None
     active: Optional[Any] = None
+    execute: Optional[str] = "yes"  # 'yes' or 'no' - allow orders from this provider
 
     def get_name(self) -> str:
         return self.name or self.provider or ""
@@ -225,6 +226,26 @@ class ConsensusRecord(BaseModel):
     methods_short: Optional[str] = None
     methods_neutral: Optional[str] = None
     rationale: Optional[str] = None
+    target_price: Optional[Any] = None
+    stop_loss: Optional[Any] = None
+    entry_limit_price: Optional[Any] = None
+    high_model_disagreement: Optional[bool] = None
+    # Evaluation fields
+    horizon_hours: Optional[int] = None
+    eval_target_date: Optional[str] = None
+    eval_status: Optional[str] = None
+    actual_date: Optional[str] = None
+    actual_open: Optional[Any] = None
+    actual_close: Optional[Any] = None
+    actual_high: Optional[Any] = None
+    actual_low: Optional[Any] = None
+    entry_price_actual: Optional[Any] = None
+    target_hit: Optional[Any] = None
+    stop_hit: Optional[Any] = None
+    direction_correct: Optional[Any] = None
+    pnl_pct: Optional[Any] = None
+    r_multiple: Optional[Any] = None
+    first_hit: Optional[str] = None
 
 
 class ConsensusResponse(BaseModel):
@@ -301,3 +322,70 @@ class IBConfigResponse(BaseModel):
 class SystemLogResponse(BaseModel):
     lines: List[str]
     total: int
+
+
+class OrderSubmitRequest(BaseModel):
+    """Manual order submission request."""
+    ticker: str
+    entry_limit_price: Optional[float] = None
+    stop_loss: Optional[float] = None
+    target_price: Optional[float] = None
+    quantity: Optional[int] = None
+
+
+class OrderSubmitResponse(BaseModel):
+    """Manual order submission response."""
+    status: str
+    order_ids: List[int]
+    message: str
+    consensus_signal: str
+    confidence: float
+
+
+# Forecast Run tracking models
+class ForecastRunLink(BaseModel):
+    """Single forecast link with weight snapshot."""
+    id: int
+    run_id: int
+    log_id: str
+    ticker: str
+    method: str
+    model: str
+    signal: str
+    raw_confidence: float
+    win_rate: float
+    ema_accuracy: float
+    final_weight: float
+    target_price: Optional[float] = None
+    stop_loss: Optional[float] = None
+    included_in_consensus: int = 1
+
+
+class ForecastRunRecord(BaseModel):
+    """Single forecast run with aggregated stats."""
+    id: int
+    started_at: str
+    completed_at: Optional[str] = None
+    trigger_type: str
+    tickers_planned: int
+    tickers_processed: int
+    consensus_count: int
+    status: str
+    error_message: Optional[str] = None
+    # Aggregated stats
+    total_forecasts: Optional[int] = None
+    included_forecasts: Optional[int] = None
+    tickers_with_forecasts: Optional[int] = None
+
+
+class ForecastRunsResponse(BaseModel):
+    """Response for GET /forecast-runs."""
+    items: List[ForecastRunRecord]
+    total: int
+
+
+class ForecastRunDetailResponse(BaseModel):
+    """Response for GET /forecast-runs/{id}."""
+    run: ForecastRunRecord
+    links: List[ForecastRunLink]
+    consensus: Optional[List[ConsensusRecord]] = None

@@ -6,39 +6,55 @@ import logging
 from datetime import datetime, timedelta
 import pandas as pd
 
-def save_forecast_to_logs(excel_manager, forecast_data, prompt_text=None, api_response=None, model_name=None):
+def save_forecast_to_logs(db_manager, forecast_data, prompt_text=None, api_response=None, model_name=None):
     """Сохраняет прогноз в единую таблицу Logs со статусом NEW"""
     try:
         # Добавляем обязательные поля для новой структуры
         log_data = forecast_data.copy()
         log_data['status'] = 'NEW'
         log_data['id'] = generate_log_id()
-        
+
         # Добавляем использованный промпт
         log_data['forecast_prompt'] = prompt_text if prompt_text else ''
-        
+
         # Добавляем ответ от ИИ
         log_data['prompt_response'] = api_response if api_response else ''
-        
+
         # Добавляем модель ИИ
         log_data['model'] = model_name if model_name else 'perplexity'
-        
+
+        # Bracket order fields — ensure defaults (only fill if key is missing)
+        bracket_defaults = {
+            'entry_order_type': 'LMT',
+            'entry_limit_price': None,
+            'entry_tif': 'DAY',
+            'target_price': None,
+            'take_profit_tif': 'GTC',
+            'stop_loss_tif': 'GTC',
+        }
+        for field, default in bracket_defaults.items():
+            if field not in log_data:
+                log_data[field] = default
+
         # Поля actuals остаются пустыми
         actuals_fields = [
             'actual_date', 'actual_open', 'actual_close', 'actual_high', 'actual_low',
             'entry_triggered', 'target_hit', 'stop_hit',
             'pnl_pct', 'direction_correct', 'exit_successful'
         ]
-        
+
         for field in actuals_fields:
             if field not in log_data:
                 log_data[field] = None
-        
-        return excel_manager.append_to_sheet('Logs', log_data)
-        
+
+        success = db_manager.append_to_sheet('Logs', log_data)
+        if success:
+            return log_data['id']
+        return None
+
     except Exception as e:
         logging.error(f"❌ Ошибка сохранения прогноза в Logs: {e}")
-        return False
+        return None
 
 def generate_log_id():
     """Генерирует уникальный ID для записи лога"""
@@ -47,7 +63,7 @@ def generate_log_id():
     random_suffix = random.randint(1000, 9999)
     return f"LOG_{timestamp}_{random_suffix}"
 
-def get_forecasts_to_evaluate(excel_manager, days_back=30):
+def get_forecasts_to_evaluate(db_manager, days_back=30):
     """Возвращает NEW-прогнозы готовые к оценке.
 
     Условие: created_at старше 1 дня (данные уже должны быть доступны)
@@ -55,8 +71,9 @@ def get_forecasts_to_evaluate(excel_manager, days_back=30):
     forecast_date может быть чуть в будущем — берём ближайшую торговую дату.
     """
     try:
-        df = excel_manager.read_sheet('Logs')
+        df = db_manager.read_sheet('Logs')
         if df.empty:
+            logging.info("ℹ️ Таблица Logs пуста")
             return []
 
         now = datetime.now()
@@ -64,12 +81,42 @@ def get_forecasts_to_evaluate(excel_manager, days_back=30):
         threshold = now - timedelta(hours=3)
         cutoff    = now - timedelta(days=days_back)
 
-        df['created_at'] = pd.to_datetime(df['created_at'], errors='coerce')
+        logging.info(f"🔍 Поиск прогнозов: threshold={threshold}, cutoff={cutoff}, now={now}")
+        logging.info(f"📊 Всего записей в Logs: {len(df)}")
+
+        df['created_at']    = pd.to_datetime(df['created_at'],    errors='coerce')
+        df['forecast_date'] = pd.to_datetime(df['forecast_date'], errors='coerce')
+
+        # Показываем статусы
+        if 'status' in df.columns:
+            status_counts = df['status'].value_counts().to_dict()
+            logging.info(f"📋 Распределение статусов: {status_counts}")
+
+        # Показываем NEW прогнозы
+        new_df = df[df['status'] == 'NEW'] if 'status' in df.columns else pd.DataFrame()
+        logging.info(f"🆕 NEW прогнозов: {len(new_df)}")
+        if len(new_df) > 0:
+            for idx, row in new_df.head(5).iterrows():
+                created = row.get('created_at', 'N/A')
+                forecast = row.get('forecast_date', 'N/A')
+                logging.info(f"   - id={row.get('id', 'N/A')}, created={created}, forecast_date={forecast}")
+
+        # Проверяем каждое условие отдельно
+        status_filter = df['status'] == 'NEW' if 'status' in df.columns else pd.Series([False] * len(df))
+        created_before = df['created_at'] <= threshold
+        created_after = df['created_at'] >= cutoff
+        forecast_not_future = df['forecast_date'] <= now
+
+        logging.info(f"   Статус NEW: {status_filter.sum()}")
+        logging.info(f"   Created <= threshold: {created_before.sum()}")
+        logging.info(f"   Created >= cutoff: {created_after.sum()}")
+        logging.info(f"   Forecast <= now: {forecast_not_future.sum()}")
 
         to_evaluate = df[
-            (df['status'] == 'NEW') &
-            (df['created_at'] <= threshold) &
-            (df['created_at'] >= cutoff)
+            status_filter &
+            created_before &
+            created_after &
+            forecast_not_future
         ]
 
         records = to_evaluate.to_dict('records')
@@ -80,14 +127,15 @@ def get_forecasts_to_evaluate(excel_manager, days_back=30):
         logging.error(f"❌ Ошибка получения прогнозов для оценки: {e}")
         return []
 
-def update_forecast_with_actuals(excel_manager, log_id, actuals_data):
+def update_forecast_with_actuals(db_manager, log_id, actuals_data):
     """Обновляет запись прогноза с фактическими данными"""
     try:
-        valid_fields = ['actual_date', 'actual_close', 'actual_high', 'actual_low',
-                        'entry_triggered', 'target_hit', 'stop_hit', 'pnl_pct', 'direction_correct']
+        valid_fields = ['actual_date', 'actual_open', 'actual_close', 'actual_high', 'actual_low',
+                        'entry_triggered', 'target_hit', 'stop_hit', 'pnl_pct',
+                        'direction_correct', 'exit_successful']
         update_payload = {k: v for k, v in actuals_data.items() if k in valid_fields}
         update_payload['status'] = 'EVALUATED'
-        success = excel_manager.update_row_by_id('Logs', log_id, update_payload)
+        success = db_manager.update_row_by_id('Logs', log_id, update_payload)
         if success:
             logging.info(f"✅ Обновлена запись {log_id} с фактическими данными")
         return success
@@ -97,10 +145,10 @@ def update_forecast_with_actuals(excel_manager, log_id, actuals_data):
         return False
 
 
-def update_forecast_status(excel_manager, log_id, status):
+def update_forecast_status(db_manager, log_id, status):
     """Обновляет статус записи прогноза"""
     try:
-        success = excel_manager.update_row_by_id('Logs', log_id, {'status': status})
+        success = db_manager.update_row_by_id('Logs', log_id, {'status': status})
         if success:
             logging.info(f"✅ Обновлен статус записи {log_id} на {status}")
         return success
@@ -108,10 +156,10 @@ def update_forecast_status(excel_manager, log_id, status):
         logging.error(f"❌ Ошибка обновления статуса записи {log_id}: {e}")
         return False
 
-def get_forecast_statistics(excel_manager, days_back=30):
+def get_forecast_statistics(db_manager, days_back=30):
     """Получает статистику по прогнозам"""
     try:
-        df = excel_manager.read_sheet('Logs')
+        df = db_manager.read_sheet('Logs')
         
         if df.empty:
             return {}

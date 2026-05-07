@@ -112,32 +112,38 @@ Server (FastAPI, port 8000)
 
 | Таблица | Назначение |
 |---|---|
-| `settings` | Тикеры (ticker, active, comment) |
+| `settings` | Тикеры (ticker, active, comment, sector, trading_blocked) |
 | `price_data` | Исторические OHLCV (250 дней) |
+| `price_data_intraday` | Часовые бары (ticker, datetime, interval, OHLCV) |
 | `indicators` | Рассчитанные техиндикаторы |
-| `logs` | Все прогнозы + оценки (статус NEW/EVALUATED) |
-| `consensus` | Агрегированные консенсус-прогнозы |
+| `logs` | Все прогнозы + оценки (статус NEW/EVALUATED, bracket-поля, run_id) |
+| `consensus` | Агрегированные консенсус-прогнозы + поля оценки |
 | `config` | Параметры конфигурации (ключи AI, настройки) |
-| `providers` | Настройки AI-провайдеров |
+| `providers` | Настройки AI-провайдеров (ema_accuracy, execute) |
 | `prompts` | Сохранённые промпты |
 | `model_catalog` | Каталог моделей OpenRouter |
 | `prompt_templates` | Шаблоны промптов по методам |
-| `accounts` | Счета IB (балансы, buying power, тип paper/live) |
-| `portfolio` | Позиции IB (количество, стоимость, unrealized PnL) |
-| `ib_config` | Настройки подключения к IB Gateway |
+| `accounts` | Счета IB (broker, account_id, балансы, тип paper/live) |
+| `portfolio` | Позиции IB (ticker, quantity, avg_cost, market_value, unrealized PnL, asset_type) |
+| `ib_order_types` | Типы ордеров IB (order_type_code, name, tif_supported, active) |
+| `ib_gateway_log` | Лог операций IB Gateway |
 | `orders` | Ордера: Entry, Take Profit, Stop Loss; полный жизненный цикл |
+| `trades` | Закрытые трейды (ticker, signal, entry/exit, realized_pnl, r_multiple) |
+| `tickets` | Тикеты/задачи (ticker, action, quantity, price, status) |
 | `scheduled_tasks` | Реестр задач планировщика |
-| `method_config` | Параметры методов: timeframe_hours, execute |
+| `method_config` | Параметры методов: timeframe_hours, trigger, active, execute |
 | `heartbeat_log` | Служебные записи для проверки SQLite |
 | `forecast_runs` | Аудит запусков прогнозирования |
 | `forecast_run_links` | Связь прогнозов с весами |
+
+> **Примечание:** часть колонок (`settings.sector`, `providers.ema_accuracy`, `consensus.eval_*`, `logs.stop_loss` и др.) добавляются через `migrate.py`, а не в базовой схеме. Таблица `ib_config` упоминается в API, но CREATE TABLE для неё не создан — используйте `/ib-config` endpoints.
 
 ---
 
 ## REST API (FastAPI, порт 8000)
 
 Аутентификация: заголовок `X-API-Key`.  
-Ключевые группы эндпоинтов: `/run/*`, `/logs`, `/indicators`, `/consensus`, `/tickers`, `/providers`, `/config`, `/prompt-templates`, `/ib/*` (test-connection, sync, accounts, portfolio, config).
+Ключевые группы эндпоинтов: `/run/*`, `/logs`, `/indicators`, `/consensus`, `/tickers`, `/providers`, `/config`, `/prompt-templates`, `/prompts`, `/ib-config`, `/accounts`, `/portfolio`, `/orders`, `/trades`, `/tickets`, `/scheduler`, `/method-config`, `/heartbeat`, `/circuit-breaker`, `/capital`, `/model-catalog`, `/forecast-runs`.
 
 ---
 

@@ -557,33 +557,7 @@ async def get_indicators(
 
 
 # ---------------------------------------------------------------------------
-# Consensus endpoint
-# ---------------------------------------------------------------------------
-
-@app.get("/consensus", response_model=ConsensusResponse, dependencies=[Depends(verify_api_key)])
-async def get_consensus(
-    ticker: Optional[str] = None,
-    limit: int = Query(100, le=500),
-):
-    try:
-        em = _get_db_manager()
-        where = "WHERE ticker = ?" if ticker else ""
-        params = [ticker] if ticker else []
-        sql = f"SELECT * FROM consensus {where} ORDER BY date DESC LIMIT {limit}"
-        with em._connect() as con:
-            df = pd.read_sql_query(sql, con, params=params)
-        if df.empty:
-            return ConsensusResponse(items=[], total=0)
-        df = df.where(df.notna(), None)
-        items = [ConsensusRecord(**_safe_row(r)) for r in df.to_dict("records")]
-        return ConsensusResponse(items=items, total=len(items))
-    except Exception as e:
-        logger.exception("Error reading consensus")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ---------------------------------------------------------------------------
-# Consensus evaluate endpoint
+# Consensus evaluation & recalculation
 # ---------------------------------------------------------------------------
 
 @app.post("/consensus/evaluate", dependencies=[Depends(verify_api_key)])

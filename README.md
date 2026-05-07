@@ -15,8 +15,12 @@ forecast/
 │   │   ├── consensus_evaluator.py  # Оценка консенсус-прогнозов постфактум
 │   │   ├── consensus_recalc.py   # Ретроспективный пересчет консенсуса
 │   │   ├── market_regime.py      # Детекция рыночного режима (ADX + MA)
+│   │   ├── market_context.py     # Макро-контекст (SPY, VIX)
 │   │   ├── indicators.py         # Технические индикаторы (RSI, MACD, BB, ATR, ADX, OBV, Stoch RSI)
 │   │   ├── data_loader.py        # Загрузка исторических данных (yfinance, Alpha Vantage, Finnhub)
+│   │   ├── smart_data_loader.py  # Умный выбор источника данных
+│   │   ├── alpha_vantage_loader.py # Загрузчик Alpha Vantage
+│   │   ├── finnhub_loader.py     # Загрузчик Finnhub
 │   │   ├── sqlite_manager.py     # SQLite хранилище (WAL-режим)
 │   │   ├── unified_logs_manager.py # Управление таблицей logs
 │   │   ├── actuals_evaluator.py  # Оценка прошлых прогнозов по High/Low
@@ -26,7 +30,15 @@ forecast/
 │   │   ├── order_manager.py      # Bracket-ордера + атомарность + откат
 │   │   ├── ib_gateway_client.py # Интеграция с Interactive Brokers
 │   │   ├── circuit_breaker.py    # Защита от сбоев OpenRouter
-│   │   └── model_performance_tracker.py # EMA-веса моделей
+│   │   ├── model_performance_tracker.py # EMA-веса моделей
+│   │   ├── ai_client.py          # Клиент OpenRouter (HTTP + retry)
+│   │   ├── providers_manager.py  # Управление AI-провайдерами
+│   │   ├── prompt_manager.py     # Управление промпт-шаблонами
+│   │   ├── data_manager.py       # Абстракция над хранилищем данных
+│   │   ├── notification_manager.py # Уведомления (MANUAL_INTERVENTION_REQUIRED)
+│   │   ├── single_instance.py    # PID-защита от дублирования процессов
+│   │   ├── migrate.py            # Миграции схемы SQLite
+│   │   └── config.py             # Legacy-константы (fallback)
 │   │
 │   ├── server/               # FastAPI сервер
 │   │   ├── api.py            # REST API эндпоинты
@@ -346,6 +358,7 @@ python scripts/core/forecast_runner.py --clear
 - `POST /run/forecast` — запуск прогнозирования
 - `POST /run/evaluate` — оценка прошлых прогнозов
 - `POST /run/full` — полный цикл
+- `POST /run/price-data` — обновить исторические цены
 - `GET /run/status` — статус выполнения
 
 ### Forecast Runs (аудит весов)
@@ -368,11 +381,17 @@ python scripts/core/forecast_runner.py --clear
 
 ### AI Модели
 - `GET /providers` — список провайдеров
+- `GET /providers/{name}` — детали провайдера
+- `POST /providers` — добавить провайдера
 - `PUT /providers/{name}` — обновить провайдера
 - `PUT /providers/{name}/execute` — обновить execute флаг
+- `DELETE /providers/{name}` — удалить провайдера
 - `GET /model-catalog` — каталог моделей OpenRouter
 - `POST /model-catalog/refresh` — обновить список моделей
+- `GET /method-config` — список методов
 - `GET /method-config/{method}` — получить конфиг метода
+- `POST /method-config` — добавить метод
+- `PUT /method-config/{method}` — обновить метод
 - `PUT /method-config/{method}/execute` — обновить execute флаг метода
 
 ### Конфигурация
@@ -386,44 +405,98 @@ python scripts/core/forecast_runner.py --clear
 - `POST /orders/{id}/cancel` — отменить ордер
 
 ### Prompt Templates
+- `GET /prompts` — список сохраненных промптов
 - `GET /prompt-templates` — все шаблоны
 - `PUT /prompt-templates/{method}` — сохранить шаблон
 - `POST /prompt-templates/{method}/reset` — сбросить шаблон
 
+### Logs
+- `GET /logs/{log_id}` — детали одного прогноза
+
+### Providers (AI-модели)
+- `POST /providers` — добавить провайдера
+- `DELETE /providers/{name}` — удалить провайдера
+- `GET /providers/{name}` — детали провайдера
+
+### Method Config
+- `GET /method-config` — список всех методов
+- `POST /method-config` — добавить метод
+- `PUT /method-config/{method}` — обновить метод
+
+### Scheduler
+- `GET /scheduler/tasks` — список задач планировщика
+- `PATCH /scheduler/tasks/{name}/active` — включить/выключить задачу
+
+### Consensus Actions
+- `POST /consensus/{id}/activate` — активировать консенсус (выставить ордер)
+- `GET /consensus/{id}/preview-trade` — превью параметров трейда
+
+### Trades
+- `GET /trades` — список закрытых трейдов
+
+### Tickets
+- `GET /tickets` — список тикетов
+- `POST /tickets` — создать тикет
+- `PATCH /tickets/{id}` — обновить тикет
+- `DELETE /tickets/{id}` — удалить тикет
+
 ### IB Gateway
-- `POST /ib/test-connection` — тест подключения к IB
-- `POST /ib/sync-accounts` — синхронизировать счета
-- `POST /ib/sync-portfolio` — синхронизировать позиции
-- `GET /ib/accounts` — список счетов
-- `GET /ib/portfolio` — позиции портфеля
+- `GET /ib/test-connection` — тест подключения к IB
+- `GET /accounts` — список счетов IB
+- `POST /accounts/sync` — синхронизировать счета
+- `GET /portfolio` — позиции портфеля IB
+- `POST /portfolio/sync` — синхронизировать позиции
+- `GET /ib-log` — лог операций IB Gateway
+
+### IB Config
+- `GET /ib-config` — список конфигураций IB
+- `GET /ib-config/{id}` — детали конфигурации
+- `POST /ib-config` — создать конфигурацию
+- `PUT /ib-config/{id}` — обновить конфигурацию
+- `DELETE /ib-config/{id}` — удалить конфигурацию
+
+### IB Order Types
+- `GET /ib-order-types` — список типов ордеров
+- `PUT /ib-order-types/{code}/active` — включить/выключить тип
+- `POST /ib-order-types/reset` — сбросить к дефолтам
+
+### Heartbeat
+- `GET /heartbeat/history` — история health-check
 
 ## Структура базы данных SQLite
 
 ### Основные таблицы
 - **settings** — список тикеров (ticker, active, comment, sector, trading_blocked)
-- **price_data** — исторические цены (ticker, date, open, high, low, close, volume)
+- **price_data** — исторические дневные цены (ticker, date, open, high, low, close, volume)
+- **price_data_intraday** — часовые бары (ticker, datetime, interval, open, high, low, close, volume)
 - **indicators** — рассчитанные индикаторы
-- **logs** — единая таблица прогнозов и оценок (включая stop_loss, R/R, bracket-поля)
-- **consensus** — консенсус-прогнозы с полями оценки (target_hit, stop_hit, pnl_pct, r_multiple)
+- **logs** — единая таблица прогнозов и оценок (включая stop_loss, R/R, bracket-поля, run_id)
+- **consensus** — консенсус-прогнозы с полями оценки (target_hit, stop_hit, pnl_pct, r_multiple, order_state)
 - **config** — параметры конфигурации
 - **providers** — настройки AI-провайдеров (ema_accuracy, ema_updated_at, execute)
-- **method_config** — параметры методов анализа (timeframe_hours, execute)
+- **method_config** — параметры методов анализа (timeframe_hours, trigger, execute)
 - **prompts** — сохраненные промпты
 - **prompt_templates** — шаблоны промптов по методам
+- **model_catalog** — каталог моделей OpenRouter
 
 ### IB Integration
-- **accounts** — счета IB (net_liquidation, buying_power, available_funds, type)
-- **portfolio** — позиции IB (quantity, market_value, unrealized_pnl, type)
-- **ib_config** — настройки подключения к IB Gateway
+- **accounts** — счета IB (broker, account_id, net_liquidation, buying_power, available_funds, type)
+- **portfolio** — позиции IB (ticker, quantity, avg_cost, market_value, unrealized_pnl, asset_type)
+- **ib_order_types** — типы ордеров IB (order_type_code, name, tif_supported, active)
+- **ib_gateway_log** — лог операций IB Gateway
 
-### Orders & Execution
+### Orders, Trades & Execution
 - **orders** — ордера (bracket-группы: entry, take_profit, stop_loss; статусы, execution_latency_ms)
+- **trades** — закрытые трейды (ticker, signal, entry_price, exit_price, realized_pnl, r_multiple, status)
+- **tickets** — тикеты/задачи (ticker, action, quantity, price, status)
 
 ### Audit & Tracking
 - **forecast_runs** — аудит запусков прогнозирования
 - **forecast_run_links** — связь прогнозов с весами (raw_confidence, win_rate, ema_accuracy, final_weight)
 - **scheduled_tasks** — задачи планировщика
 - **heartbeat_log** — служебные записи для проверки SQLite
+
+> **Примечание:** часть колонок добавляется через миграции (`migrate.py`), а не в базовом `CREATE TABLE`. См. `scripts/core/migrate.py` для полной истории изменений схемы.
 
 ## Workflow
 
@@ -468,20 +541,72 @@ python scripts/core/forecast_runner.py --clear
 
 ## Справочник настроек (таблица `config`)
 
+### AI & Данные
 | Ключ | Дефолт | Описание |
 |---|---|---|
-| `ORDER_MODE` | `disabled` | Режим ордеров: `disabled` / `paper` / `live` |
-| `LIVE_TRADING_CONFIRMED` | `false` | Явное подтверждение live-торговли |
+| `OPENROUTER_API_KEY` | `""` | API ключ OpenRouter |
+| `OPENROUTER_FREE_ONLY` | `false` | Использовать только бесплатные модели |
+| `ALPHA_VANTAGE_API_KEY` | `""` | API ключ Alpha Vantage |
+| `DATA_SOURCE` | `yfinance` | Основной источник цен: `yfinance` / `alpha_vantage` / `finnhub` |
+| `PRICE_STALENESS_HOURS` | 6 | Порог устаревания цен (часы) |
+| `PRICE_STALENESS_BUSINESS_DAYS` | 2 | Порог для дневных свечей (рабочие дни) |
+
+### Риск-менеджмент
+| Ключ | Дефолт | Описание |
+|---|---|---|
 | `DEFAULT_RISK_PCT` | 0.01 | Риск на сделку (1% капитала) |
 | `MAX_POSITION_PCT` | 0.05 | Максимальная доля одной позиции (5%) |
 | `MAX_SECTOR_EXPOSURE_PCT` | 0.15 | Мягкий лимит секторной экспозиции |
 | `MAX_SECTOR_HARD_LIMIT_PCT` | 0.25 | Жёсткий лимит — отклонение сигнала |
-| `CAPITAL_STALENESS_MINUTES` | 15 | Порог устаревания данных IB |
-| `MAX_SPREAD_PCT` | 0.005 | Максимальный допустимый спред (Slippage Guard) |
+| `SECTOR_OVERWEIGHT_FACTOR` | 0.5 | Множитель позиции при превышении мягкого лимита |
+| `RISK_MODE` | `percent_of_capital` | Режим расчета риска |
+| `RISK_PERCENT_ON_STOP` | 1.0 | Риск как % портфеля при срабатывании стопа |
+
+### Капитал
+| Ключ | Дефолт | Описание |
+|---|---|---|
+| `CAPITAL_STALENESS_MINUTES` | 15 | Порог устаревания данных IB (минуты) |
+| `PREFERRED_ACCOUNT_TYPE` | `live` | Предпочтительный тип счета: `live` / `paper` |
+| `MANUAL_CAPITAL_OVERRIDE` | `""` | Ручное переопределение капитала (пусто = IB) |
+| `IB_CAPITAL_FAILSAFE` | `manual_only` | Fallback при недоступности IB |
+
+### Ордера
+| Ключ | Дефолт | Описание |
+|---|---|---|
+| `ORDER_MODE` | `disabled` | Режим ордеров: `disabled` / `paper` / `live` |
+| `LIVE_TRADING_CONFIRMED` | `false` | Явное подтверждение live-торговли |
+| `AUTO_ORDER_SUBMISSION` | `false` | Автоматическое выставление ордеров после консенсуса |
 | `MAX_OPEN_ORDERS` | 5 | Лимит активных ордеров |
-| `CONSENSUS_MAX_DEVIATION` | 0.15 | Максимальное отклонение target от цены |
-| `MODEL_WEIGHT_EMA_ALPHA` | 0.2 | Коэффициент сглаживания EMA весов |
-| `FORECAST_INTERVAL_MINUTES` | 60 | Интервал основного цикла |
+| `MAX_SPREAD_PCT` | 0.005 | Максимальный допустимый спред (Slippage Guard) |
+| `USE_STOP_LIMIT` | `false` | Использовать Stop-Limit вместо Stop |
+| `STOP_LIMIT_OFFSET_PCT` | 0.0005 | Отступ для Stop-Limit ордеров |
+| `ALLOW_EXTENDED_HOURS` | `false` | Разрешить торговлю вне основных часов |
+| `ORDER_QUEUE_MAX_AGE_HOURS` | 24 | Время жизни QUEUED-ордера (часы) |
+| `ORDER_CHILD_TIMEOUT_SEC` | 10 | Таймаут дочерних ордеров после исполнения Entry |
+| `ORDER_ROLLBACK_TIMEOUT_SEC` | 30 | Таймаут отката при ошибке |
+| `AUTO_BLOCK_ON_ROLLBACK_FAIL` | `true` | Блокировать тикер при неудачном откате |
+| `ORDER_WINDOW_ENABLED` | `false` | Ограничить выставление ордеров временным окном |
+| `ORDER_WINDOW_START` | `14:30` | Начало окна (UTC, открытие NYSE) |
+| `ORDER_WINDOW_END` | `20:45` | Конец окна (UTC, 15 мин до закрытия) |
+| `ORDER_WINDOW_WEEKDAYS` | `[0,1,2,3,4]` | Допустимые дни недели (0=Пн) |
+
+### Консенсус & Веса
+| Ключ | Дефолт | Описание |
+|---|---|---|
+| `CONSENSUS_MAX_DEVIATION` | 0.15 | Макс. отклонение target от цены (15%) |
+| `MODEL_WEIGHT_EMA_ALPHA` | 0.2 | Коэффициент сглаживания EMA весов моделей |
+
+### Планировщик
+| Ключ | Дефолт | Описание |
+|---|---|---|
+| `FORECAST_INTERVAL_MINUTES` | 60 | Интервал прогнозирования (минуты) |
+| `EVALUATE_INTERVAL_MINUTES` | 120 | Интервал оценки (минуты) |
+| `PRICE_DATA_INTERVAL_MINUTES` | 60 | Интервал обновления цен (минуты) |
+| `INTRADAY_UPDATE_INTERVAL_MINUTES` | 60 | Интервал обновления часовых баров |
+| `PENDING_ORDERS_INTERVAL_MINUTES` | 1 | Интервал обработки PENDING_ORDER (минуты) |
+| `SCHEDULER_MAX_WORKERS` | 4 | Число worker-потоков планировщика |
+| `SCHEDULER_MAX_RETRIES` | 2 | Макс. повторов при ошибке задачи |
+| `FORECAST_TTL_MINUTES` | 240 | TTL сигнала (минуты) |
 
 ## Логирование
 

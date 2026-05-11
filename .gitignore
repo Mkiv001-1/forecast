@@ -14,6 +14,11 @@ venv/
 venv_server/
 venv_client/
 .venv/
+.venv312/
+venv*/
+.venv*/
+env/
+env*/
 
 # Logs
 *.log

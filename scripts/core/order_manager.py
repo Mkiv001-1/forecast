@@ -28,6 +28,7 @@ import sqlite3
 import threading
 import json
 import time
+import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
 
@@ -246,7 +247,9 @@ def _log_ib_transaction_event(
     status_before: str = "",
     status_after: str = "",
     ticker: str = "",
+    trade_uid: str = "",
     ib_order_id: int = 0,
+    ib_perm_id: int = 0,
     ib_parent_id: int = 0,
     order_id: Optional[int] = None,
     trade_id: Optional[int] = None,
@@ -269,7 +272,9 @@ def _log_ib_transaction_event(
             status_before=status_before,
             status_after=status_after,
             ticker=ticker,
+            trade_uid=trade_uid,
             ib_order_id=ib_order_id,
+            ib_perm_id=ib_perm_id,
             ib_parent_id=ib_parent_id,
             order_id=order_id,
             trade_id=trade_id,
@@ -401,10 +406,12 @@ def submit_signal(
     mode = _cfg(db_manager, "ORDER_MODE", "disabled").lower()
     normalized_tag = (test_tag or "").strip()
     order_ref = ""
-    if is_test:
-        order_ref = normalized_tag if normalized_tag else f"TEST:{ticker.upper()}"
+    trade_uid = str(uuid.uuid4())
     has_order_test_cols = _table_has_column(db_manager, "orders", "is_test") and _table_has_column(db_manager, "orders", "test_tag")
+    has_order_trade_uid_col = _table_has_column(db_manager, "orders", "trade_uid")
+    has_order_ib_perm_id_col = _table_has_column(db_manager, "orders", "ib_perm_id")
     has_trade_test_cols = _table_has_column(db_manager, "trades", "is_test") and _table_has_column(db_manager, "trades", "test_tag")
+    has_trade_uid_col = _table_has_column(db_manager, "trades", "trade_uid")
 
     if mode == "disabled":
         logger.info(f"order_manager: ORDER_MODE=disabled, skipping {ticker}")
@@ -523,10 +530,18 @@ def submit_signal(
             "spread_at_submission": spread_info.get("spread_pct"),
             "error_message":        "",
         }
+        if has_order_trade_uid_col:
+            order_row["trade_uid"] = trade_uid
+        if has_order_ib_perm_id_col:
+            order_row["ib_perm_id"] = 0
         if has_order_test_cols:
             order_row["is_test"] = 1 if is_test else 0
             order_row["test_tag"] = normalized_tag
         parent_db_id = _save_order(db_manager, order_row)
+        if is_test and normalized_tag:
+            order_ref = normalized_tag
+        else:
+            order_ref = f"tid={trade_uid}|oid={parent_db_id}"
 
         if initial_status == "QUEUED":
             logger.info(f"order_manager: {ticker} order QUEUED (outside market hours)")
@@ -562,6 +577,7 @@ def submit_signal(
         event_type="ORDER_SUBMIT_REQUEST",
         operation_status="REQUESTED",
         ticker=ticker,
+        trade_uid=trade_uid,
         order_id=parent_db_id,
         consensus_id=consensus_id,
         log_id=log_id,
@@ -599,6 +615,7 @@ def submit_signal(
             status_before=initial_status,
             status_after="ERROR",
             ticker=ticker,
+            trade_uid=trade_uid,
             order_id=parent_db_id,
             consensus_id=consensus_id,
             log_id=log_id,
@@ -621,6 +638,7 @@ def submit_signal(
             status_before=initial_status,
             status_after="ERROR",
             ticker=ticker,
+            trade_uid=trade_uid,
             order_id=parent_db_id,
             consensus_id=consensus_id,
             log_id=log_id,
@@ -635,12 +653,15 @@ def submit_signal(
     target_ib_id = ib_result["target_id"]
     stop_ib_id   = ib_result["stop_id"]
 
-    _update_order(db_manager, parent_db_id, {
+    parent_updates = {
         "ib_order_id":  parent_ib_id,
         "ib_parent_id": parent_ib_id,
         "status":       "SUBMITTED",
         "submitted_at": _now_utc(),
-    })
+    }
+    if has_order_ib_perm_id_col:
+        parent_updates["ib_perm_id"] = int(ib_result.get("parent_perm_id") or 0)
+    _update_order(db_manager, parent_db_id, parent_updates)
 
     # Save child orders
     child_base = {
@@ -649,6 +670,8 @@ def submit_signal(
         "status": "SUBMITTED", "account_type": mode,
         "created_at": now, "submitted_at": _now_utc(), "error_message": "",
     }
+    if has_order_trade_uid_col:
+        child_base["trade_uid"] = trade_uid
     if has_order_test_cols:
         child_base["is_test"] = 1 if is_test else 0
         child_base["test_tag"] = normalized_tag
@@ -658,6 +681,9 @@ def submit_signal(
     stop_row = {**child_base, "ib_order_id": stop_ib_id, "order_role": "STOP_LOSS",
                 "order_type": "STP", "action": "SELL" if action == "BUY" else "BUY",
                 "limit_price": None, "stop_price": float(stop_loss)}
+    if has_order_ib_perm_id_col:
+        target_row["ib_perm_id"] = int(ib_result.get("target_perm_id") or 0)
+        stop_row["ib_perm_id"] = int(ib_result.get("stop_perm_id") or 0)
     target_db_id = _save_order(db_manager, target_row)
     stop_db_id   = _save_order(db_manager, stop_row)
 
@@ -670,7 +696,9 @@ def submit_signal(
         status_before=initial_status,
         status_after="SUBMITTED",
         ticker=ticker,
+        trade_uid=trade_uid,
         ib_order_id=parent_ib_id,
+        ib_perm_id=int(ib_result.get("parent_perm_id") or 0),
         ib_parent_id=parent_ib_id,
         order_id=parent_db_id,
         consensus_id=consensus_id,
@@ -693,31 +721,59 @@ def submit_signal(
         now_ts = _now_utc()
         with sqlite3.connect(db_manager.db_file) as con:
             if has_trade_test_cols:
-                cur = con.execute(
-                    """INSERT INTO trades
-                       (ticker, ib_parent_id, signal, quantity, entry_price,
-                        stop_loss, target_price, status, created_at, updated_at, is_test, test_tag)
-                       VALUES (?,?,?,?,?,?,?,'OPEN',?,?,?,?)""",
-                    (ticker, parent_ib_id,
-                     "LONG" if action == "BUY" else "SHORT",
-                     quantity, entry_price_val,
-                     float(stop_loss), float(target_price),
-                     now_ts, now_ts,
-                     1 if is_test else 0,
-                     normalized_tag),
-                )
+                if has_trade_uid_col:
+                    cur = con.execute(
+                        """INSERT INTO trades
+                           (trade_uid, ticker, ib_parent_id, signal, quantity, entry_price,
+                            stop_loss, target_price, status, created_at, updated_at, is_test, test_tag)
+                           VALUES (?,?,?,?,?,?,?,?,'OPEN',?,?,?,?)""",
+                        (trade_uid, ticker, parent_ib_id,
+                         "LONG" if action == "BUY" else "SHORT",
+                         quantity, entry_price_val,
+                         float(stop_loss), float(target_price),
+                         now_ts, now_ts,
+                         1 if is_test else 0,
+                         normalized_tag),
+                    )
+                else:
+                    cur = con.execute(
+                        """INSERT INTO trades
+                           (ticker, ib_parent_id, signal, quantity, entry_price,
+                            stop_loss, target_price, status, created_at, updated_at, is_test, test_tag)
+                           VALUES (?,?,?,?,?,?,?,'OPEN',?,?,?,?)""",
+                        (ticker, parent_ib_id,
+                         "LONG" if action == "BUY" else "SHORT",
+                         quantity, entry_price_val,
+                         float(stop_loss), float(target_price),
+                         now_ts, now_ts,
+                         1 if is_test else 0,
+                         normalized_tag),
+                    )
             else:
-                cur = con.execute(
-                    """INSERT INTO trades
-                       (ticker, ib_parent_id, signal, quantity, entry_price,
-                        stop_loss, target_price, status, created_at, updated_at)
-                       VALUES (?,?,?,?,?,?,?,'OPEN',?,?)""",
-                    (ticker, parent_ib_id,
-                     "LONG" if action == "BUY" else "SHORT",
-                     quantity, entry_price_val,
-                     float(stop_loss), float(target_price),
-                     now_ts, now_ts),
-                )
+                if has_trade_uid_col:
+                    cur = con.execute(
+                        """INSERT INTO trades
+                           (trade_uid, ticker, ib_parent_id, signal, quantity, entry_price,
+                            stop_loss, target_price, status, created_at, updated_at)
+                           VALUES (?,?,?,?,?,?,?,?,'OPEN',?,?)""",
+                        (trade_uid, ticker, parent_ib_id,
+                         "LONG" if action == "BUY" else "SHORT",
+                         quantity, entry_price_val,
+                         float(stop_loss), float(target_price),
+                         now_ts, now_ts),
+                    )
+                else:
+                    cur = con.execute(
+                        """INSERT INTO trades
+                           (ticker, ib_parent_id, signal, quantity, entry_price,
+                            stop_loss, target_price, status, created_at, updated_at)
+                           VALUES (?,?,?,?,?,?,?,'OPEN',?,?)""",
+                        (ticker, parent_ib_id,
+                         "LONG" if action == "BUY" else "SHORT",
+                         quantity, entry_price_val,
+                         float(stop_loss), float(target_price),
+                         now_ts, now_ts),
+                    )
             trade_id = cur.lastrowid
         logger.info(f"order_manager: created trade id={trade_id} for {ticker} IB#{parent_ib_id}")
     except Exception as e:

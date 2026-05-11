@@ -255,7 +255,7 @@ def test_real_bracket_order_with_cleanup():
     print("Test 5: Real Bracket Order (with Cleanup)")
     print("="*80)
     
-    print("\n⚠️  PLACING REAL ORDER ON IB ACCOUNT")
+    print("\n[WARNING] PLACING REAL ORDER ON IB ACCOUNT")
     print("    Using LIMIT entry to prevent instant fill")
     print("    Order will be cancelled immediately after placement")
     
@@ -307,11 +307,12 @@ def test_real_bracket_order_with_cleanup():
                 port=7497,
                 client_id=93
             )
-            print(f"  Parent order #{parent_id}: {cancel_result.get('status')}")
+            status_str = "cancelled" if cancel_result else "failed"
+            print(f"  Parent order #{parent_id}: {status_str}")
             
             # Verify cancellation
-            assert cancel_result.get("status") == "cancelled", \
-                f"Parent order should be cancelled, got: {cancel_result.get('status')}"
+            assert cancel_result is True, \
+                f"Parent order #{parent_id} should be cancelled, cancel_order returned: {cancel_result}"
             
         except Exception as e:
                     print(f"  [WARNING] Could not cancel parent order: {e}")
@@ -473,5 +474,5 @@ if __name__ == "__main__":
     print("  4. ORDER_MODE=paper (for safety)")
     print("\nRun with:")
     print("  pytest scripts/tests/test_ib_real_connection.py -v -s -m integration")
-    print("\n⚠️  WARNING: Tests place REAL orders (paper account only)!")
+    print("\n[WARNING] Tests place REAL orders (paper account only)!")
     print("="*80 + "\n")

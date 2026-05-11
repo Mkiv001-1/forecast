@@ -12,7 +12,6 @@ import asyncio
 import concurrent.futures
 import logging
 import os
-import sqlite3
 import sys
 from datetime import datetime, timezone, timedelta
 from typing import Callable, Dict, Optional, Any
@@ -20,13 +19,32 @@ from typing import Callable, Dict, Optional, Any
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Global state
+# Scheduler state (encapsulated in class to avoid global state)
 # ---------------------------------------------------------------------------
 
-_tasks: Dict[str, asyncio.Task] = {}
-_db_manager = None
-_running = False
-_task_running: Dict[str, bool] = {}  # overlap guard per task name
+class SchedulerState:
+    """Encapsulated scheduler state to avoid global variables."""
+    
+    def __init__(self):
+        self.tasks: Dict[str, asyncio.Task] = {}
+        self.db_manager = None
+        self.running = False
+        self.task_running: Dict[str, bool] = {}  # overlap guard per task name
+        self.thread_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+    
+    def reset(self):
+        """Reset state for clean shutdown/restart."""
+        self.tasks.clear()
+        self.task_running.clear()
+        self.db_manager = None
+        self.running = False
+        if self.thread_pool:
+            self.thread_pool.shutdown(wait=False, cancel_futures=True)
+            self.thread_pool = None
+
+
+# Module-level singleton instance
+_state = SchedulerState()
 
 
 # ---------------------------------------------------------------------------
@@ -34,10 +52,10 @@ _task_running: Dict[str, bool] = {}  # overlap guard per task name
 # ---------------------------------------------------------------------------
 
 def _cfg(key: str, default: str = "") -> str:
-    if _db_manager is None:
+    if _state.db_manager is None:
         return default
     try:
-        v = _db_manager.get_config_value(key)
+        v = _state.db_manager.get_config_value(key)
         return v if v is not None else default
     except Exception:
         return default
@@ -51,7 +69,7 @@ def _cfg_int(key: str, default: int) -> int:
 
 
 # ---------------------------------------------------------------------------
-# DB helpers
+# DB helpers (using encapsulated db_manager methods)
 # ---------------------------------------------------------------------------
 
 def _now_utc() -> str:
@@ -59,39 +77,17 @@ def _now_utc() -> str:
 
 
 def _upsert_task(name: str, updates: dict) -> None:
-    if _db_manager is None:
+    """Upsert scheduled task using db_manager method."""
+    if _state.db_manager is None:
         return
-    try:
-        updates["name"] = name
-        cols = list(updates.keys())
-        ph   = ", ".join(["?"] * len(cols))
-        set_parts = ", ".join(f"{c}=excluded.{c}" for c in cols if c != "name")
-        sql = (
-            f"INSERT INTO scheduled_tasks ({', '.join(cols)}) VALUES ({ph}) "
-            f"ON CONFLICT(name) DO UPDATE SET {set_parts}"
-        )
-        with sqlite3.connect(_db_manager.db_file) as con:
-            con.execute(sql, list(updates.values()))
-    except Exception as e:
-        logger.warning(f"scheduler: _upsert_task {name} failed: {e}")
+    _state.db_manager.upsert_scheduled_task(name, updates)
 
 
 def _increment_counters(name: str, success: bool, error_msg: str = "") -> None:
-    status = "ok" if success else "error"
-    try:
-        with sqlite3.connect(_db_manager.db_file) as con:
-            con.execute(
-                """
-                UPDATE scheduled_tasks
-                SET last_run_at=?, last_run_status=?, last_error=?,
-                    run_count = run_count + 1,
-                    error_count = error_count + (CASE WHEN ? = 'error' THEN 1 ELSE 0 END)
-                WHERE name=?
-                """,
-                (_now_utc(), status, error_msg, status, name),
-            )
-    except Exception as e:
-        logger.warning(f"scheduler: _increment_counters {name} failed: {e}")
+    """Increment task counters using db_manager method."""
+    if _state.db_manager is None:
+        return
+    _state.db_manager.increment_task_counters(name, success, error_msg)
 
 
 # ---------------------------------------------------------------------------
@@ -107,49 +103,40 @@ async def _run_task_loop(
 ) -> None:
     """Repeatedly call coro_factory() every interval_seconds, with retries."""
     logger.info(f"scheduler: task '{name}' started (interval={interval_seconds}s)")
-    _task_running[name] = False
+    _state.task_running[name] = False
 
     # Calculate initial sleep: if not run_on_start, check last_run_at from DB
     # so that after restart we don't wait a full interval if the task is overdue.
-    if run_on_start:
-        initial_sleep = 0.0
-    else:
-        initial_sleep = interval_seconds
-        if _db_manager:
+    initial_sleep = interval_seconds
+    if not run_on_start and _state.db_manager:
+        last_run_str = _state.db_manager.get_scheduled_task_last_run(name)
+        if last_run_str:
             try:
-                with sqlite3.connect(_db_manager.db_file) as con:
-                    row = con.execute(
-                        "SELECT last_run_at FROM scheduled_tasks WHERE name=?", (name,)
-                    ).fetchone()
-                if row and row[0]:
-                    from datetime import datetime, timezone
-                    last_run_str = row[0]
-                    try:
-                        last_run = datetime.fromisoformat(last_run_str)
-                        if last_run.tzinfo is None:
-                            last_run = last_run.replace(tzinfo=timezone.utc)
-                        elapsed = (datetime.now(tz=timezone.utc) - last_run).total_seconds()
-                        remaining = interval_seconds - elapsed
-                        if remaining <= 0:
-                            initial_sleep = 0.0
-                            logger.info(f"scheduler: '{name}' overdue by {-remaining:.0f}s, running immediately")
-                        else:
-                            initial_sleep = remaining
-                            logger.info(f"scheduler: '{name}' resuming, next run in {remaining:.0f}s")
-                    except Exception:
-                        pass
+                last_run = datetime.fromisoformat(last_run_str)
+                if last_run.tzinfo is None:
+                    last_run = last_run.replace(tzinfo=timezone.utc)
+                elapsed = (datetime.now(tz=timezone.utc) - last_run).total_seconds()
+                remaining = interval_seconds - elapsed
+                if remaining <= 0:
+                    initial_sleep = 0.0
+                    logger.info(f"scheduler: '{name}' overdue by {-remaining:.0f}s, running immediately")
+                else:
+                    initial_sleep = remaining
+                    logger.info(f"scheduler: '{name}' resuming, next run in {remaining:.0f}s")
             except Exception:
                 pass
+    elif run_on_start:
+        initial_sleep = 0.0
 
     if initial_sleep > 0:
         await asyncio.sleep(initial_sleep)
 
-    while _running:
-        if _task_running.get(name):
+    while _state.running:
+        if _state.task_running.get(name):
             logger.warning(f"scheduler: '{name}' previous run still in progress, skipping interval")
             await asyncio.sleep(interval_seconds)
             continue
-        _task_running[name] = True
+        _state.task_running[name] = True
         attempt = 0
         success = False
         last_error = ""
@@ -171,7 +158,7 @@ async def _run_task_loop(
                     else:
                         logger.error(f"scheduler: '{name}' failed after {max_retries} retries: {e}")
         finally:
-            _task_running[name] = False
+            _state.task_running[name] = False
 
         _increment_counters(name, success, last_error)
         await asyncio.sleep(interval_seconds)
@@ -189,13 +176,13 @@ async def _heartbeat_task() -> None:
     notes = []
 
     # SQLite check
-    try:
-        if _db_manager:
-            with sqlite3.connect(_db_manager.db_file) as con:
+    if _state.db_manager:
+        try:
+            with _state.db_manager._connect() as con:
                 con.execute("SELECT 1")
             db_ok = 1
-    except Exception as e:
-        notes.append(f"sqlite_err:{e}")
+        except Exception as e:
+            notes.append(f"sqlite_err:{e}")
 
     # OpenRouter circuit-breaker check
     try:
@@ -208,24 +195,16 @@ async def _heartbeat_task() -> None:
         or_ok = 1  # If no circuit breaker yet, assume ok
 
     # IB check: just verify DB has recent accounts
-    try:
-        if _db_manager:
-            with sqlite3.connect(_db_manager.db_file) as con:
-                row = con.execute("SELECT COUNT(*) FROM accounts").fetchone()
-            ib_ok = 1 if row and row[0] > 0 else 0
-    except Exception as e:
-        notes.append(f"ib_err:{e}")
+    if _state.db_manager:
+        try:
+            account_count = _state.db_manager.get_accounts_count()
+            ib_ok = 1 if account_count > 0 else 0
+        except Exception as e:
+            notes.append(f"ib_err:{e}")
 
     # Write to heartbeat_log
-    try:
-        if _db_manager:
-            with sqlite3.connect(_db_manager.db_file) as con:
-                con.execute(
-                    "INSERT INTO heartbeat_log(checked_at, ib_ok, openrouter_ok, sqlite_ok, notes) VALUES (?,?,?,?,?)",
-                    (_now_utc(), ib_ok, or_ok, db_ok, "; ".join(notes)),
-                )
-    except Exception as e:
-        logger.warning(f"heartbeat: write failed: {e}")
+    if _state.db_manager:
+        _state.db_manager.log_heartbeat(ib_ok, or_ok, db_ok, "; ".join(notes))
 
     logger.debug(f"heartbeat: ib={ib_ok} openrouter={or_ok} sqlite={db_ok}")
 
@@ -234,13 +213,10 @@ async def _order_timeout_task() -> None:
     """Check for bracket groups with missing children after fill."""
     try:
         from order_manager import check_child_timeouts
-        check_child_timeouts(_db_manager)
+        check_child_timeouts(_state.db_manager)
     except Exception as e:
         logger.error(f"scheduler: order_timeout_task error: {e}")
 
-
-# Thread pool for CPU-bound / blocking robot tasks (initialized in start_scheduler)
-_thread_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -258,16 +234,15 @@ def _run_forecast_sync() -> None:
     os.chdir(_PROJECT_ROOT)
     from scripts.core.forecast_runner import run_trading_bot
     from scripts.core.sqlite_manager import SQLiteManager
-    
-    # Create db_manager and run_id here for proper tracking
-    db = SQLiteManager(_db_manager.db_file if _db_manager else None)
-    active_tickers = db.get_settings()
-    run_id = db.create_forecast_run('scheduler', len(active_tickers))
-    
+
+    db_file = _state.db_manager.db_file if _state.db_manager else None
+    db = SQLiteManager(db_file)
+    run_id = None
     try:
+        active_tickers = db.get_settings()
+        run_id = db.create_forecast_run('scheduler', len(active_tickers))
         run_trading_bot(db_manager=db, run_id=run_id)
     except Exception as e:
-        # Mark run as failed
         if run_id:
             db.complete_forecast_run(run_id, status='failed', error_message=str(e))
         raise
@@ -279,27 +254,28 @@ def _run_evaluate_sync() -> None:
     os.chdir(_PROJECT_ROOT)
     from scripts.core.sqlite_manager import SQLiteManager
     from scripts.core.forecast_runner import evaluate_past_forecasts
-    db = SQLiteManager(_db_manager.db_file)
+    db_file = _state.db_manager.db_file if _state.db_manager else None
+    db = SQLiteManager(db_file)
     evaluate_past_forecasts(db)
 
 
 async def _scheduled_forecast_task() -> None:
     """Run forecast generation in a thread pool (non-blocking)."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     logger.info("scheduler: starting scheduled forecast run")
-    if _thread_pool is None:
+    if _state.thread_pool is None:
         raise RuntimeError("scheduler: thread pool is not initialized")
-    await loop.run_in_executor(_thread_pool, _run_forecast_sync)
+    await loop.run_in_executor(_state.thread_pool, _run_forecast_sync)
     logger.info("scheduler: scheduled forecast run complete")
 
 
 async def _scheduled_evaluate_task() -> None:
     """Run evaluation of past forecasts in a thread pool (non-blocking)."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     logger.info("scheduler: starting scheduled evaluate run")
-    if _thread_pool is None:
+    if _state.thread_pool is None:
         raise RuntimeError("scheduler: thread pool is not initialized")
-    await loop.run_in_executor(_thread_pool, _run_evaluate_sync)
+    await loop.run_in_executor(_state.thread_pool, _run_evaluate_sync)
     logger.info("scheduler: scheduled evaluate run complete")
 
 
@@ -309,18 +285,19 @@ def _run_consensus_evaluate_sync() -> None:
     os.chdir(_PROJECT_ROOT)
     from scripts.core.sqlite_manager import SQLiteManager
     from scripts.core.consensus_evaluator import evaluate_consensus_records
-    db = SQLiteManager(_db_manager.db_file)
+    db_file = _state.db_manager.db_file if _state.db_manager else None
+    db = SQLiteManager(db_file)
     count = evaluate_consensus_records(db)
     logger.info(f"scheduler: consensus_evaluate completed, {count} records evaluated")
 
 
 async def _scheduled_consensus_evaluate_task() -> None:
     """Run evaluation of consensus records in a thread pool (non-blocking)."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     logger.info("scheduler: starting scheduled consensus evaluate run")
-    if _thread_pool is None:
+    if _state.thread_pool is None:
         raise RuntimeError("scheduler: thread pool is not initialized")
-    await loop.run_in_executor(_thread_pool, _run_consensus_evaluate_sync)
+    await loop.run_in_executor(_state.thread_pool, _run_consensus_evaluate_sync)
     logger.info("scheduler: scheduled consensus evaluate run complete")
 
 
@@ -330,13 +307,12 @@ def _run_price_data_update_sync() -> None:
     os.chdir(_PROJECT_ROOT)
     from scripts.core.sqlite_manager import SQLiteManager
     from scripts.core.data_loader import fetch_price_data
-    db = SQLiteManager(_db_manager.db_file)
+    db_file = _state.db_manager.db_file if _state.db_manager else None
+    db = SQLiteManager(db_file)
     tickers = db.get_active_tickers() if hasattr(db, "get_active_tickers") else []
     if not tickers:
-        # fallback: read from settings table directly
-        import sqlite3 as _sq
-        with _sq.connect(_db_manager.db_file) as con:
-            tickers = [r[0] for r in con.execute("SELECT ticker FROM settings WHERE active=1").fetchall()]
+        # fallback: read from settings table directly using encapsulated method
+        tickers = db.get_active_tickers_direct()
     if not tickers:
         logger.warning("scheduler: price_data_update — no active tickers")
         return
@@ -357,11 +333,11 @@ def _run_price_data_update_sync() -> None:
 
 async def _scheduled_price_data_task() -> None:
     """Refresh price data for all active tickers in a thread pool (non-blocking)."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     logger.info("scheduler: starting price_data update")
-    if _thread_pool is None:
+    if _state.thread_pool is None:
         raise RuntimeError("scheduler: thread pool is not initialized")
-    await loop.run_in_executor(_thread_pool, _run_price_data_update_sync)
+    await loop.run_in_executor(_state.thread_pool, _run_price_data_update_sync)
     logger.info("scheduler: price_data update complete")
 
 
@@ -371,12 +347,11 @@ def _run_intraday_update_sync() -> None:
     os.chdir(_PROJECT_ROOT)
     from scripts.core.sqlite_manager import SQLiteManager
     from scripts.core.data_loader import fetch_intraday_yfinance
-    db = SQLiteManager(_db_manager.db_file)
+    db_file = _state.db_manager.db_file if _state.db_manager else None
+    db = SQLiteManager(db_file)
     tickers = db.get_active_tickers() if hasattr(db, "get_active_tickers") else []
     if not tickers:
-        import sqlite3 as _sq
-        with _sq.connect(_db_manager.db_file) as con:
-            tickers = [r[0] for r in con.execute("SELECT ticker FROM settings WHERE active=1").fetchall()]
+        tickers = db.get_active_tickers_direct()
     if not tickers:
         logger.warning("scheduler: intraday_update — no active tickers")
         return
@@ -397,11 +372,11 @@ def _run_intraday_update_sync() -> None:
 
 async def _scheduled_intraday_task() -> None:
     """Refresh hourly intraday bars for all active tickers (non-blocking)."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     logger.info("scheduler: starting intraday update")
-    if _thread_pool is None:
+    if _state.thread_pool is None:
         raise RuntimeError("scheduler: thread pool is not initialized")
-    await loop.run_in_executor(_thread_pool, _run_intraday_update_sync)
+    await loop.run_in_executor(_state.thread_pool, _run_intraday_update_sync)
     logger.info("scheduler: intraday update complete")
 
 
@@ -410,14 +385,10 @@ async def _expire_queued_orders_task() -> None:
     max_age_hours = _cfg_int("ORDER_QUEUE_MAX_AGE_HOURS", 24)
     cutoff = (datetime.now(tz=timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
     try:
-        if _db_manager:
-            with sqlite3.connect(_db_manager.db_file) as con:
-                cur = con.execute(
-                    "UPDATE orders SET status='EXPIRED' WHERE status='QUEUED' AND created_at < ?",
-                    (cutoff,)
-                )
-                if cur.rowcount:
-                    logger.info(f"scheduler: expired {cur.rowcount} QUEUED orders older than {max_age_hours}h")
+        if _state.db_manager:
+            expired = _state.db_manager.expire_queued_orders(cutoff)
+            if expired:
+                logger.info(f"scheduler: expired {expired} QUEUED orders older than {max_age_hours}h")
     except Exception as e:
         logger.error(f"scheduler: expire_queued_orders error: {e}")
 
@@ -428,16 +399,10 @@ def _run_process_pending_orders_sync() -> None:
     os.chdir(_PROJECT_ROOT)
     from scripts.core.sqlite_manager import SQLiteManager
     from scripts.core.order_manager import activate_consensus_order
-    db = SQLiteManager(_db_manager.db_file)
-    try:
-        with sqlite3.connect(db.db_file) as con:
-            rows = con.execute(
-                "SELECT id, ticker FROM consensus WHERE order_state='PENDING_ORDER' AND trade_id IS NULL"
-            ).fetchall()
-    except Exception as e:
-        logger.error(f"scheduler: pending_orders — DB query failed: {e}")
-        return
-
+    db_file = _state.db_manager.db_file if _state.db_manager else None
+    db = SQLiteManager(db_file)
+    
+    rows = db.get_pending_consensus_orders()
     if not rows:
         return
 
@@ -452,10 +417,44 @@ def _run_process_pending_orders_sync() -> None:
 
 async def _scheduled_pending_orders_task() -> None:
     """Activate pending consensus orders (non-blocking)."""
-    loop = asyncio.get_event_loop()
-    if _thread_pool is None:
+    loop = asyncio.get_running_loop()
+    if _state.thread_pool is None:
         raise RuntimeError("scheduler: thread pool is not initialized")
-    await loop.run_in_executor(_thread_pool, _run_process_pending_orders_sync)
+    await loop.run_in_executor(_state.thread_pool, _run_process_pending_orders_sync)
+
+
+def _run_order_status_sync_sync() -> None:
+    """Sync local orders/trades statuses from IB as a scheduler task."""
+    _ensure_core_path()
+    os.chdir(_PROJECT_ROOT)
+    from scripts.core.sqlite_manager import SQLiteManager
+    from scripts.core.order_status_sync import sync_orders_with_ib
+
+    db_file = _state.db_manager.db_file if _state.db_manager else None
+    db = SQLiteManager(db_file)
+
+    order_mode = str(db.get_config_value("ORDER_MODE") or "paper").lower()
+    port = 7496 if order_mode == "live" else 7497
+    client_id = 14
+
+    result = sync_orders_with_ib(
+        db,
+        host="127.0.0.1",
+        port=int(port),
+        client_id=int(client_id),
+        source="scheduler",
+    )
+    if not bool(result.get("ok", False)):
+        errs = result.get("errors", [])
+        raise RuntimeError("; ".join(str(e) for e in errs) or "order status sync failed")
+
+
+async def _scheduled_order_status_sync_task() -> None:
+    """Run IB order status synchronization in a thread pool (non-blocking)."""
+    loop = asyncio.get_running_loop()
+    if _state.thread_pool is None:
+        raise RuntimeError("scheduler: thread pool is not initialized")
+    await loop.run_in_executor(_state.thread_pool, _run_order_status_sync_sync)
 
 
 # ---------------------------------------------------------------------------
@@ -464,31 +463,35 @@ async def _scheduled_pending_orders_task() -> None:
 
 async def start_scheduler(db_manager) -> None:
     """Start all scheduler tasks. Call from FastAPI lifespan."""
-    global _db_manager, _running, _thread_pool
-    _db_manager = db_manager
-    _running = True
+    # Reset any previous state
+    _state.reset()
+    
+    _state.db_manager = db_manager
+    _state.running = True
 
     max_workers = _cfg_int("SCHEDULER_MAX_WORKERS", 4)
     if max_workers < 1:
         max_workers = 4
-    _thread_pool = concurrent.futures.ThreadPoolExecutor(
+    _state.thread_pool = concurrent.futures.ThreadPoolExecutor(
         max_workers=max_workers,
         thread_name_prefix="scheduler-robot",
     )
     logger.info(f"scheduler: thread pool initialized with max_workers={max_workers}")
 
     max_retries = _cfg_int("SCHEDULER_MAX_RETRIES", 2)
-    forecast_interval = _cfg_int("FORECAST_INTERVAL_MINUTES", 60) * 60
+    forecast_interval = _cfg_int("FORECAST_INTERVAL_MINUTES", 240) * 60
     evaluate_interval = _cfg_int("EVALUATE_INTERVAL_MINUTES", 120) * 60
     price_data_interval = _cfg_int("PRICE_DATA_INTERVAL_MINUTES", 60) * 60
     intraday_interval = _cfg_int("INTRADAY_UPDATE_INTERVAL_MINUTES", 60) * 60
     pending_orders_interval = _cfg_int("PENDING_ORDERS_INTERVAL_MINUTES", 1) * 60
+    order_status_sync_interval = _cfg_int("ORDER_STATUS_SYNC_INTERVAL_SECONDS", 60)
 
     task_specs = [
         ("heartbeat",              _heartbeat_task,                    30,                     True),
         ("order_timeout_check",    _order_timeout_task,                15,                     False),
         ("expire_queued_orders",   _expire_queued_orders_task,         300,                    False),
         ("process_pending_orders", _scheduled_pending_orders_task,     pending_orders_interval, False),
+        ("sync_order_statuses",    _scheduled_order_status_sync_task,   order_status_sync_interval, False),
         ("update_price_data",      _scheduled_price_data_task,         price_data_interval,    False),
         ("update_intraday",        _scheduled_intraday_task,           intraday_interval,      False),
         ("scheduled_forecast",     _scheduled_forecast_task,           forecast_interval,      False),
@@ -508,17 +511,16 @@ async def start_scheduler(db_manager) -> None:
             _run_task_loop(name, factory, interval, max_retries, run_on_start),
             name=name,
         )
-        _tasks[name] = task
+        _state.tasks[name] = task
         logger.info(f"scheduler: registered task '{name}' every {interval}s")
 
-    logger.info(f"scheduler: started with {len(_tasks)} tasks")
+    logger.info(f"scheduler: started with {len(_state.tasks)} tasks")
 
 
 async def stop_scheduler() -> None:
     """Cancel all scheduler tasks. Call from FastAPI lifespan shutdown."""
-    global _running, _thread_pool
-    _running = False
-    for name, task in _tasks.items():
+    _state.running = False
+    for name, task in _state.tasks.items():
         if not task.done():
             task.cancel()
             try:
@@ -526,11 +528,11 @@ async def stop_scheduler() -> None:
             except asyncio.CancelledError:
                 pass
             logger.info(f"scheduler: task '{name}' stopped")
-    _tasks.clear()
+    _state.tasks.clear()
 
-    if _thread_pool is not None:
-        _thread_pool.shutdown(wait=False, cancel_futures=True)
-        _thread_pool = None
+    if _state.thread_pool is not None:
+        _state.thread_pool.shutdown(wait=False, cancel_futures=True)
+        _state.thread_pool = None
 
     logger.info("scheduler: all tasks stopped")
 
@@ -538,7 +540,7 @@ async def stop_scheduler() -> None:
 def get_task_status() -> Dict[str, Any]:
     """Return current status of all registered tasks."""
     result = {}
-    for name, task in _tasks.items():
+    for name, task in _state.tasks.items():
         result[name] = {
             "running": not task.done(),
             "cancelled": task.cancelled(),

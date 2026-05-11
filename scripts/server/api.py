@@ -1320,9 +1320,6 @@ async def cancel_order_endpoint(order_id: int):
         ok = await asyncio.get_event_loop().run_in_executor(
             None, lambda: cancel_order(ib_id, port=port)
         )
-        if ok:
-            with em._connect() as con:
-                con.execute("UPDATE orders SET status='CANCELLED' WHERE id=?", (order_id,))
         return {"cancelled": ok, "order_id": order_id, "ib_order_id": ib_id}
     except HTTPException:
         raise
@@ -1508,6 +1505,7 @@ async def submit_order_manual(body: OrderSubmitRequest):
 
 @app.get("/trades", dependencies=[Depends(verify_api_key)])
 async def get_trades(
+    trade_id: Optional[int] = None,
     status: Optional[str] = None,
     ticker: Optional[str] = None,
     include_test: bool = Query(True, description="Include test rows (is_test=1)"),
@@ -1520,6 +1518,9 @@ async def get_trades(
         em = _get_db_manager()
         where_parts = []
         params = []
+        if trade_id is not None:
+            where_parts.append("id = ?")
+            params.append(int(trade_id))
         if status:
             where_parts.append("status = ?")
             params.append(status)
@@ -1536,7 +1537,8 @@ async def get_trades(
                 f"SELECT * FROM trades {where_sql} ORDER BY id DESC LIMIT ?",
                 params + [limit],
             ).fetchall()
-        return {"trades": [dict(r) for r in rows]}
+        items = [dict(r) for r in rows]
+        return {"items": items, "trades": items, "total": len(items)}
     except Exception as e:
         logger.exception("Error fetching trades")
         raise HTTPException(status_code=500, detail=str(e))

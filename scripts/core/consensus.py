@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_DEVIATION = 0.15
 _DEFAULT_DISAGREEMENT_THRESHOLD = 0.40
+_DEFAULT_MIN_EXPECTED_R = 0.5
 
 
 def calculate_atr(df, period: int = 14) -> Optional[float]:
@@ -353,7 +354,6 @@ def calculate_consensus(
     # --- Expected Value Filter ---
     # expected_r = (confidence_pct / 100) * (distance_to_target / distance_to_stop)
     # Filter out signals with expected_r below threshold
-    _DEFAULT_MIN_EXPECTED_R = 0.5
     expected_r = None
     if signal in ("LONG", "SHORT") and med_target and med_stop and med_entry:
         risk = abs(med_entry - med_stop)
@@ -390,10 +390,10 @@ def calculate_consensus(
         for link_data in forecast_link_data:
             link_data['included_in_consensus'] = 0
 
-    # TIF defaults — use most common or hardcoded defaults
-    entry_tif = entry_tif_values[0] if entry_tif_values else "DAY"
-    take_profit_tif = take_profit_tif_values[0] if take_profit_tif_values else "GTC"
-    stop_loss_tif = stop_loss_tif_values[0] if stop_loss_tif_values else "GTC"
+    # TIF defaults — use majority vote (most common value), fallback to hardcoded defaults
+    entry_tif = statistics.mode(entry_tif_values) if entry_tif_values else "DAY"
+    take_profit_tif = statistics.mode(take_profit_tif_values) if take_profit_tif_values else "GTC"
+    stop_loss_tif = statistics.mode(stop_loss_tif_values) if stop_loss_tif_values else "GTC"
 
     return {
         "signal":                  signal,
@@ -528,3 +528,52 @@ def save_consensus(db_manager, ticker: str, consensus: dict, method_stats: dict 
     except Exception as e:
         logger.error(f"Error saving consensus for {ticker}: {e}")
         return False
+
+
+def build_method_and_model_stats(db_manager, days_back: int = 30) -> tuple:
+    """Build method_stats and model_stats dicts used by calculate_consensus.
+
+    Extracted from forecast_runner.process_ticker and consensus_recalc._process_group
+    to eliminate code duplication (fix #6).
+
+    Returns:
+        (method_stats, model_stats)
+        method_stats: {method: {"win_rate": float, "timeframe_hours": int}}
+        model_stats:  {model_name: {"ema_accuracy": float}}
+    """
+    import pandas as pd
+    from unified_logs_manager import get_forecast_statistics
+
+    stats = get_forecast_statistics(db_manager, days_back=days_back)
+    accuracy = stats.get("accuracy", {})
+    method_stats = {
+        m: {"win_rate": accuracy.get(m, 50.0) / 100.0}
+        for m in stats.get("methods", {})
+    }
+    try:
+        with db_manager._connect() as _con:
+            _mc = pd.read_sql_query(
+                "SELECT method, timeframe_hours FROM method_config WHERE active=1", _con
+            )
+        for _, row in _mc.iterrows():
+            m = row["method"]
+            if m not in method_stats:
+                method_stats[m] = {}
+            method_stats[m]["timeframe_hours"] = int(row["timeframe_hours"])
+    except Exception as _e:
+        logger.warning(f"build_method_and_model_stats: could not load method_config: {_e}")
+
+    model_stats = {}
+    try:
+        with db_manager._connect() as _con:
+            _prov = pd.read_sql_query(
+                "SELECT name, ema_accuracy FROM providers WHERE active=1 AND ema_accuracy IS NOT NULL", _con
+            )
+        for _, row in _prov.iterrows():
+            m = str(row["name"])
+            if row["ema_accuracy"] is not None:
+                model_stats[m] = {"ema_accuracy": float(row["ema_accuracy"])}
+    except Exception as _e:
+        logger.warning(f"build_method_and_model_stats: could not load providers ema_accuracy: {_e}")
+
+    return method_stats, model_stats

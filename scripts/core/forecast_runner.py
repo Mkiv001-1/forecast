@@ -70,31 +70,14 @@ def process_ticker(db_manager, ticker, run_id=None):
                 for m in stats.get("methods", {})
             }
             # Enrich method_stats with timeframe_hours from method_config
-            try:
-                import pandas as pd
-                with db_manager._connect() as _con:
-                    _mc = pd.read_sql_query("SELECT method, timeframe_hours FROM method_config WHERE active=1", _con)
-                for _, row in _mc.iterrows():
-                    m = row["method"]
-                    if m not in method_stats:
-                        method_stats[m] = {}
-                    method_stats[m]["timeframe_hours"] = int(row["timeframe_hours"])
-            except Exception as _e:
-                logging.warning(f"forecast_runner: could not load method_config timeframe_hours: {_e}")
+            method_timeframes = db_manager.get_method_config_timeframes()
+            for m, hours in method_timeframes.items():
+                if m not in method_stats:
+                    method_stats[m] = {}
+                method_stats[m]["timeframe_hours"] = hours
+            
             # Build model_stats keyed by AI model name (providers.name) for ema_accuracy lookup
-            model_stats = {}
-            try:
-                import pandas as pd
-                with db_manager._connect() as _con:
-                    _prov = pd.read_sql_query(
-                        "SELECT name, ema_accuracy FROM providers WHERE active=1 AND ema_accuracy IS NOT NULL", _con
-                    )
-                for _, row in _prov.iterrows():
-                    m = str(row["name"])
-                    if row["ema_accuracy"] is not None:
-                        model_stats[m] = {"ema_accuracy": float(row["ema_accuracy"])}
-            except Exception as _e:
-                logging.warning(f"forecast_runner: could not load providers ema_accuracy: {_e}")
+            model_stats = db_manager.get_providers_ema_accuracy()
             current_price = price_data[-1]['close'] if price_data else 0.0
             cons = calculate_consensus(raw_forecasts, method_stats, current_price=current_price, run_id=run_id, log_ids=log_ids, model_stats=model_stats)
             save_consensus(db_manager, ticker, cons, method_stats=method_stats, run_id=run_id)
@@ -108,14 +91,9 @@ def process_ticker(db_manager, ticker, run_id=None):
                 try:
                     from order_manager import activate_consensus_order
                     # Retrieve the id of the consensus record we just saved
-                    import sqlite3 as _sq
-                    with _sq.connect(db_manager.db_file) as _con:
-                        _row = _con.execute(
-                            "SELECT id FROM consensus WHERE ticker=? ORDER BY id DESC LIMIT 1",
-                            (ticker,)
-                        ).fetchone()
-                    if _row:
-                        result = activate_consensus_order(_row[0], db_manager)
+                    consensus_id = db_manager.get_last_consensus_id(ticker)
+                    if consensus_id:
+                        result = activate_consensus_order(consensus_id, db_manager)
                         logging.info(f"📤 Активация ордера: {result['status']} - {result.get('message', '')}")
                 except Exception as _e:
                     logging.warning(f"⚠️ Ошибка немедленной активации ордера: {_e}")
@@ -130,55 +108,12 @@ def process_ticker(db_manager, ticker, run_id=None):
         return log_ids, False
 
 def evaluate_past_forecasts(db_manager):
-    """Оценивает предыдущие прогнозы и добавляет фактические данные"""
+    """Оценивает предыдущие прогнозы через consensus_evaluator (основной путь)."""
     try:
         logging.info("📊 Начало оценки предыдущих прогнозов")
-        
-        # Получаем прогнозы для оценки
-        forecasts_to_evaluate = get_forecasts_to_evaluate(db_manager)
-        
-        if not forecasts_to_evaluate:
-            logging.info("ℹ️ Нет прогнозов для оценки")
-            return
-        
-        evaluated_count = 0
-        for forecast in forecasts_to_evaluate:
-            try:
-                ticker = forecast['ticker']
-                forecast_date = forecast['forecast_date']
-                log_id = forecast['id']
-                
-                logging.info(f"📊 Оценка прогноза {log_id} для {ticker} на {forecast_date}")
-                
-                # Загружаем фактические данные
-                actual_data = fetch_actual_data(ticker, forecast_date, db_manager)
-                if not actual_data:
-                    logging.warning(f"⚠️ Не удалось загрузить фактические данные для {ticker} на {forecast_date}")
-                    continue
-                
-                # Оцениваем прогноз
-                evaluation = evaluate_forecast(forecast, actual_data)
-                if not evaluation:
-                    logging.warning(f"⚠️ Не удалось оценить прогноз {log_id}")
-                    continue
-                
-                # Обновляем запись с фактическими данными
-                success = update_forecast_with_actuals(db_manager, log_id, {**actual_data, **evaluation})
-                if success:
-                    evaluated_count += 1
-                    logging.info(f"✅ Обновлен прогноз {log_id}")
-                else:
-                    logging.error(f"❌ Не удалось обновить прогноз {log_id}")
-                
-                # Задержка между оценками
-                time.sleep(1)
-                
-            except Exception as e:
-                logging.error(f"❌ Ошибка оценки прогноза: {e}")
-                continue
-        
-        logging.info(f"✅ Оценка завершена. Обработано {evaluated_count}/{len(forecasts_to_evaluate)} прогнозов")
-        
+        from consensus_evaluator import evaluate_consensus_records
+        count = evaluate_consensus_records(db_manager)
+        logging.info(f"✅ Оценка завершена. Обработано {count} consensus записей")
     except Exception as e:
         logging.error(f"❌ Критическая ошибка оценки прогнозов: {e}")
         raise
@@ -208,15 +143,14 @@ def run_trading_bot(db_file: str = None, run_id: int = None, db_manager=None):
                 )
             db_manager = SQLiteManager(db_file)
 
+        # Читаем настройки (один вызов — используется и для tickers_planned, и для итерации)
+        active_tickers = db_manager.get_settings()
+
         # Создаём запись о запуске если run_id не передан
         if run_id is None:
-            active_tickers = db_manager.get_settings()
             run_id = db_manager.create_forecast_run('scheduler', len(active_tickers))
             if run_id:
                 logging.info(f"📋 Создан forecast run #{run_id}")
-        
-        # Читаем настройки
-        active_tickers = db_manager.get_settings()
         
         if not active_tickers:
             logging.warning("⚠️ Нет активных тикеров для обработки")
@@ -275,8 +209,9 @@ def test_single_ticker(ticker='NASDAQ:NVDA', db_file: str = None):
         
         # Создаём run для теста
         run_id = db_manager.create_forecast_run('manual', 1)
-        process_ticker(db_manager, ticker, run_id=run_id)
-        db_manager.complete_forecast_run(run_id, status='completed', tickers_processed=1)
+        _, has_consensus = process_ticker(db_manager, ticker, run_id=run_id)
+        consensus_count = 1 if has_consensus else 0
+        db_manager.complete_forecast_run(run_id, status='completed', tickers_processed=1, consensus_count=consensus_count)
         
         logging.info(f"✅ Тест для {ticker} завершен, run #{run_id}")
         return run_id

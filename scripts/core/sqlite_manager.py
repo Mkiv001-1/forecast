@@ -226,8 +226,10 @@ CREATE TABLE IF NOT EXISTS method_config (
 CREATE TABLE IF NOT EXISTS orders (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     log_id                  TEXT    DEFAULT '',
+    trade_uid               TEXT    DEFAULT NULL,
     ticker                  TEXT    NOT NULL,
     ib_order_id             INTEGER DEFAULT 0,
+    ib_perm_id              INTEGER DEFAULT 0,
     ib_parent_id            INTEGER DEFAULT 0,
     order_role              TEXT    DEFAULT '',
     order_type              TEXT    DEFAULT '',
@@ -250,6 +252,8 @@ CREATE TABLE IF NOT EXISTS orders (
 CREATE INDEX IF NOT EXISTS idx_orders_ticker     ON orders(ticker);
 CREATE INDEX IF NOT EXISTS idx_orders_status     ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_orders_ib_parent  ON orders(ib_parent_id);
+CREATE INDEX IF NOT EXISTS idx_orders_trade_uid  ON orders(trade_uid);
+CREATE INDEX IF NOT EXISTS idx_orders_ib_perm_id ON orders(ib_perm_id);
 CREATE INDEX IF NOT EXISTS idx_orders_is_test    ON orders(is_test);
 CREATE INDEX IF NOT EXISTS idx_orders_test_tag   ON orders(test_tag);
 
@@ -293,6 +297,7 @@ CREATE INDEX IF NOT EXISTS idx_tickets_portfolio ON tickets(portfolio);
 
 CREATE TABLE IF NOT EXISTS trades (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_uid        TEXT    DEFAULT NULL,
     ticker           TEXT    NOT NULL,
     consensus_id     INTEGER REFERENCES consensus(id),
     ib_parent_id     INTEGER DEFAULT 0,
@@ -316,6 +321,10 @@ CREATE TABLE IF NOT EXISTS trades (
 CREATE INDEX IF NOT EXISTS idx_trades_ticker    ON trades(ticker);
 CREATE INDEX IF NOT EXISTS idx_trades_status    ON trades(status);
 CREATE INDEX IF NOT EXISTS idx_trades_consensus ON trades(consensus_id);
+CREATE INDEX IF NOT EXISTS idx_trades_trade_uid ON trades(trade_uid);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_trades_trade_uid
+ON trades(trade_uid)
+WHERE trade_uid IS NOT NULL AND trade_uid <> '';
 CREATE INDEX IF NOT EXISTS idx_trades_is_test   ON trades(is_test);
 CREATE INDEX IF NOT EXISTS idx_trades_test_tag  ON trades(test_tag);
 
@@ -333,6 +342,38 @@ CREATE TABLE IF NOT EXISTS ib_gateway_log (
 );
 CREATE INDEX IF NOT EXISTS idx_ib_log_ticker   ON ib_gateway_log(ticker);
 CREATE INDEX IF NOT EXISTS idx_ib_log_occurred ON ib_gateway_log(occurred_at);
+
+CREATE TABLE IF NOT EXISTS ib_order_transactions (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at           TEXT    NOT NULL,
+    event_source          TEXT    NOT NULL,
+    event_type            TEXT    NOT NULL,
+    operation_status      TEXT    DEFAULT '',
+    status_before         TEXT    DEFAULT '',
+    status_after          TEXT    DEFAULT '',
+    ticker                TEXT    DEFAULT '',
+    trade_uid             TEXT    DEFAULT NULL,
+    ib_order_id           INTEGER DEFAULT 0,
+    ib_perm_id            INTEGER DEFAULT 0,
+    ib_parent_id          INTEGER DEFAULT 0,
+    order_id              INTEGER REFERENCES orders(id),
+    trade_id              INTEGER REFERENCES trades(id),
+    consensus_id          INTEGER REFERENCES consensus(id),
+    log_id                TEXT REFERENCES logs(id),
+    request_payload_json  TEXT    DEFAULT '',
+    response_payload_json TEXT    DEFAULT '',
+    error_message         TEXT    DEFAULT '',
+    latency_ms            INTEGER DEFAULT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ib_tx_occurred  ON ib_order_transactions(occurred_at);
+CREATE INDEX IF NOT EXISTS idx_ib_tx_ticker    ON ib_order_transactions(ticker);
+CREATE INDEX IF NOT EXISTS idx_ib_tx_trade_uid ON ib_order_transactions(trade_uid);
+CREATE INDEX IF NOT EXISTS idx_ib_tx_ib_order  ON ib_order_transactions(ib_order_id);
+CREATE INDEX IF NOT EXISTS idx_ib_tx_ib_perm   ON ib_order_transactions(ib_perm_id);
+CREATE INDEX IF NOT EXISTS idx_ib_tx_ib_parent ON ib_order_transactions(ib_parent_id);
+CREATE INDEX IF NOT EXISTS idx_ib_tx_source    ON ib_order_transactions(event_source);
+CREATE INDEX IF NOT EXISTS idx_ib_tx_order_id  ON ib_order_transactions(order_id);
+CREATE INDEX IF NOT EXISTS idx_ib_tx_trade_id  ON ib_order_transactions(trade_id);
 """
 
 _DEFAULT_CONFIG = [
@@ -382,12 +423,13 @@ _DEFAULT_CONFIG = [
     # Model weights
     ("MODEL_WEIGHT_EMA_ALPHA",       "0.2",        "EMA smoothing factor for provider accuracy weights"),
     # Scheduler
-    ("FORECAST_INTERVAL_MINUTES",    "60",         "Forecast cycle interval in minutes"),
+    ("FORECAST_INTERVAL_MINUTES",    "240",        "Forecast cycle interval in minutes"),
     ("EVALUATE_INTERVAL_MINUTES",    "120",        "Evaluate past forecasts interval in minutes"),
     ("PRICE_DATA_INTERVAL_MINUTES",  "60",         "Price data refresh interval in minutes"),
     ("INTRADAY_UPDATE_INTERVAL_MINUTES", "60",     "Intraday (hourly) price data refresh interval in minutes"),
     ("SCHEDULER_MAX_WORKERS",        "4",          "Scheduler thread pool worker count"),
     ("SCHEDULER_MAX_RETRIES",        "2",          "Max retries for failed scheduled tasks"),
+    ("ORDER_STATUS_SYNC_INTERVAL_SECONDS", "60",   "Interval for automatic IB order status synchronization in seconds"),
     ("HEARTBEAT_OPENROUTER_GRACE_SEC","120",        "Grace period before circuit-open triggers degradation"),
     # Order activation pipeline
     ("FORECAST_TTL_MINUTES",         "240",        "Signal TTL in minutes — PENDING_ORDER older than this becomes EXPIRED"),
@@ -578,7 +620,261 @@ def _tbl(sheet_name: str) -> str:
     return _SHEET_TO_TABLE.get(sheet_name, sheet_name.lower())
 
 
-class SQLiteManager:
+class _SQLiteManagerQueriesMixin:
+    """Mixin class providing encapsulated query methods for SQLiteManager.
+    
+    These methods replace direct SQL queries that were previously scattered
+    across forecast_runner.py, scheduler.py, and order_manager.py.
+    """
+    
+    def get_method_config_timeframes(self) -> dict:
+        """Get active method configurations with timeframe_hours.
+        
+        Returns:
+            Dict mapping method name to timeframe_hours
+        """
+        try:
+            with self._connect() as con:
+                df = pd.read_sql_query(
+                    "SELECT method, timeframe_hours FROM method_config WHERE active=1",
+                    con
+                )
+            result = {}
+            for _, row in df.iterrows():
+                result[row["method"]] = int(row["timeframe_hours"])
+            return result
+        except Exception as e:
+            logger.warning(f"Could not load method_config timeframe_hours: {e}")
+            return {}
+
+    def get_providers_ema_accuracy(self) -> dict:
+        """Get active providers with their EMA accuracy.
+        
+        Returns:
+            Dict mapping provider name to ema_accuracy value
+        """
+        try:
+            with self._connect() as con:
+                df = pd.read_sql_query(
+                    "SELECT name, ema_accuracy FROM providers WHERE active=1 AND ema_accuracy IS NOT NULL",
+                    con
+                )
+            result = {}
+            for _, row in df.iterrows():
+                if row["ema_accuracy"] is not None:
+                    result[str(row["name"])] = float(row["ema_accuracy"])
+            return result
+        except Exception as e:
+            logger.warning(f"Could not load providers ema_accuracy: {e}")
+            return {}
+
+    def get_last_consensus_id(self, ticker: str) -> Optional[int]:
+        """Get most recent consensus record ID for a ticker.
+        
+        Args:
+            ticker: Ticker symbol
+            
+        Returns:
+            Consensus record ID or None
+        """
+        try:
+            with self._connect() as con:
+                row = con.execute(
+                    "SELECT id FROM consensus WHERE ticker=? ORDER BY id DESC LIMIT 1",
+                    (ticker,)
+                ).fetchone()
+            return row[0] if row else None
+        except Exception as e:
+            logger.warning(f"Could not get last consensus ID for {ticker}: {e}")
+            return None
+
+    def get_scheduled_task_last_run(self, name: str) -> Optional[str]:
+        """Get last_run_at for a scheduled task.
+        
+        Args:
+            name: Task name
+            
+        Returns:
+            ISO datetime string or None
+        """
+        try:
+            with self._connect() as con:
+                row = con.execute(
+                    "SELECT last_run_at FROM scheduled_tasks WHERE name=?",
+                    (name,)
+                ).fetchone()
+            return row[0] if row else None
+        except Exception:
+            return None
+
+    def upsert_scheduled_task(self, name: str, updates: dict) -> bool:
+        """Upsert a scheduled task record.
+        
+        Args:
+            name: Task name
+            updates: Dict of column values to update
+            
+        Returns:
+            True if successful
+        """
+        try:
+            updates["name"] = name
+            cols = list(updates.keys())
+            ph = ", ".join(["?"] * len(cols))
+            set_parts = ", ".join(f"{c}=excluded.{c}" for c in cols if c != "name")
+            sql = (
+                f"INSERT INTO scheduled_tasks ({', '.join(cols)}) VALUES ({ph}) "
+                f"ON CONFLICT(name) DO UPDATE SET {set_parts}"
+            )
+            with self._connect() as con:
+                con.execute(sql, list(updates.values()))
+            return True
+        except Exception as e:
+            logger.warning(f"_upsert_task {name} failed: {e}")
+            return False
+
+    def increment_task_counters(self, name: str, success: bool, error_msg: str = "") -> bool:
+        """Increment run_count and error_count for a scheduled task.
+        
+        Args:
+            name: Task name
+            success: Whether the run was successful
+            error_msg: Error message if failed
+            
+        Returns:
+            True if successful
+        """
+        from datetime import datetime, timezone
+        status = "ok" if success else "error"
+        now_str = datetime.now(tz=timezone.utc).isoformat()
+        try:
+            with self._connect() as con:
+                con.execute(
+                    """
+                    UPDATE scheduled_tasks
+                    SET last_run_at=?, last_run_status=?, last_error=?,
+                        run_count = run_count + 1,
+                        error_count = error_count + (CASE WHEN ? = 'error' THEN 1 ELSE 0 END)
+                    WHERE name=?
+                    """,
+                    (now_str, status, error_msg, status, name),
+                )
+            return True
+        except Exception as e:
+            logger.warning(f"_increment_counters {name} failed: {e}")
+            return False
+
+    def get_active_tickers_direct(self) -> list:
+        """Get active tickers directly from settings (fallback method).
+        
+        Returns:
+            List of ticker strings
+        """
+        try:
+            with self._connect() as con:
+                rows = con.execute(
+                    "SELECT ticker FROM settings WHERE active=1"
+                ).fetchall()
+            return [r[0] for r in rows]
+        except Exception as e:
+            logger.warning(f"Could not get active tickers: {e}")
+            return []
+
+    def expire_queued_orders(self, cutoff_iso: str) -> int:
+        """Expire QUEUED orders older than cutoff.
+        
+        Args:
+            cutoff_iso: ISO datetime string for cutoff
+            
+        Returns:
+            Number of orders expired
+        """
+        try:
+            with self._connect() as con:
+                cur = con.execute(
+                    "UPDATE orders SET status='EXPIRED' WHERE status='QUEUED' AND created_at < ?",
+                    (cutoff_iso,)
+                )
+            return cur.rowcount
+        except Exception as e:
+            logger.warning(f"expire_queued_orders failed: {e}")
+            return 0
+
+    def get_pending_consensus_orders(self) -> list:
+        """Get consensus records in PENDING_ORDER state.
+        
+        Returns:
+            List of (id, ticker) tuples
+        """
+        try:
+            with self._connect() as con:
+                rows = con.execute(
+                    "SELECT id, ticker FROM consensus WHERE order_state='PENDING_ORDER' AND trade_id IS NULL"
+                ).fetchall()
+            return [(r[0], r[1]) for r in rows]
+        except Exception as e:
+            logger.warning(f"get_pending_consensus_orders failed: {e}")
+            return []
+
+    def get_accounts_count(self) -> int:
+        """Get count of accounts for health checks.
+        
+        Returns:
+            Number of accounts or 0 on error
+        """
+        try:
+            with self._connect() as con:
+                row = con.execute("SELECT COUNT(*) FROM accounts").fetchone()
+            return row[0] if row else 0
+        except Exception:
+            return 0
+
+    def log_heartbeat(self, ib_ok: int, openrouter_ok: int, sqlite_ok: int, notes: str) -> bool:
+        """Log heartbeat entry.
+        
+        Args:
+            ib_ok: IB status (0/1)
+            openrouter_ok: OpenRouter status (0/1)
+            sqlite_ok: SQLite status (0/1)
+            notes: Semicolon-separated notes
+            
+        Returns:
+            True if logged successfully
+        """
+        from datetime import datetime, timezone
+        try:
+            now_str = datetime.now(tz=timezone.utc).isoformat()
+            with self._connect() as con:
+                con.execute(
+                    "INSERT INTO heartbeat_log(checked_at, ib_ok, openrouter_ok, sqlite_ok, notes) VALUES (?,?,?,?,?)",
+                    (now_str, ib_ok, openrouter_ok, sqlite_ok, notes),
+                )
+            return True
+        except Exception as e:
+            logger.warning(f"heartbeat: write failed: {e}")
+            return False
+
+    def get_last_price(self, ticker: str) -> float:
+        """Get most recent close price for a ticker.
+        
+        Args:
+            ticker: Ticker symbol
+            
+        Returns:
+            Last close price or 0.0 if not found
+        """
+        try:
+            with self._connect() as con:
+                row = con.execute(
+                    "SELECT close FROM price_data WHERE ticker=? ORDER BY date DESC LIMIT 1",
+                    (ticker,)
+                ).fetchone()
+            return float(row[0]) if row and row[0] else 0.0
+        except Exception:
+            return 0.0
+
+
+class SQLiteManager(_SQLiteManagerQueriesMixin):
     """SQLite-backed storage. Drop-in replacement for ExcelManager."""
 
     def __init__(self, db_file: str = "trading_robot.db"):
@@ -608,7 +904,6 @@ class SQLiteManager:
                 con.commit()
                 logger.info(f"Created new database: {self.db_file}")
             else:
-                logger.info(f"Using existing database: {self.db_file}")
                 self._migrate_schema(con)
         finally:
             con.close()
@@ -721,6 +1016,11 @@ class SQLiteManager:
             ("consensus", "order_reason",      "TEXT DEFAULT ''"),
             ("consensus", "trade_id",          "INTEGER REFERENCES trades(id)"),
             # Test marker fields
+            ("orders",    "trade_uid",         "TEXT DEFAULT NULL"),
+            ("orders",    "ib_perm_id",        "INTEGER DEFAULT 0"),
+            ("trades",    "trade_uid",         "TEXT DEFAULT NULL"),
+            ("ib_order_transactions", "trade_uid", "TEXT DEFAULT NULL"),
+            ("ib_order_transactions", "ib_perm_id", "INTEGER DEFAULT 0"),
             ("orders",    "is_test",           "INTEGER DEFAULT 0"),
             ("orders",    "test_tag",          "TEXT DEFAULT ''"),
             ("trades",    "is_test",           "INTEGER DEFAULT 0"),
@@ -748,8 +1048,10 @@ class SQLiteManager:
             CREATE TABLE IF NOT EXISTS orders (
                 id                   INTEGER PRIMARY KEY AUTOINCREMENT,
                 log_id               TEXT    DEFAULT '',
+                trade_uid            TEXT    DEFAULT NULL,
                 ticker               TEXT    NOT NULL,
                 ib_order_id          INTEGER DEFAULT 0,
+                ib_perm_id           INTEGER DEFAULT 0,
                 ib_parent_id         INTEGER DEFAULT 0,
                 order_role           TEXT    DEFAULT '',
                 order_type           TEXT    DEFAULT '',
@@ -772,6 +1074,8 @@ class SQLiteManager:
             CREATE INDEX IF NOT EXISTS idx_orders_ticker    ON orders(ticker);
             CREATE INDEX IF NOT EXISTS idx_orders_status    ON orders(status);
             CREATE INDEX IF NOT EXISTS idx_orders_ib_parent ON orders(ib_parent_id);
+            CREATE INDEX IF NOT EXISTS idx_orders_trade_uid ON orders(trade_uid);
+            CREATE INDEX IF NOT EXISTS idx_orders_ib_perm_id ON orders(ib_perm_id);
             CREATE INDEX IF NOT EXISTS idx_orders_is_test   ON orders(is_test);
             CREATE INDEX IF NOT EXISTS idx_orders_test_tag  ON orders(test_tag);
             CREATE TABLE IF NOT EXISTS scheduled_tasks (
@@ -850,6 +1154,7 @@ class SQLiteManager:
 
             CREATE TABLE IF NOT EXISTS trades (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_uid        TEXT    DEFAULT NULL,
                 ticker           TEXT    NOT NULL,
                 consensus_id     INTEGER REFERENCES consensus(id),
                 ib_parent_id     INTEGER DEFAULT 0,
@@ -873,6 +1178,10 @@ class SQLiteManager:
             CREATE INDEX IF NOT EXISTS idx_trades_ticker    ON trades(ticker);
             CREATE INDEX IF NOT EXISTS idx_trades_status    ON trades(status);
             CREATE INDEX IF NOT EXISTS idx_trades_consensus ON trades(consensus_id);
+            CREATE INDEX IF NOT EXISTS idx_trades_trade_uid ON trades(trade_uid);
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_trades_trade_uid
+            ON trades(trade_uid)
+            WHERE trade_uid IS NOT NULL AND trade_uid <> '';
             CREATE INDEX IF NOT EXISTS idx_trades_is_test   ON trades(is_test);
             CREATE INDEX IF NOT EXISTS idx_trades_test_tag  ON trades(test_tag);
 
@@ -890,6 +1199,38 @@ class SQLiteManager:
             );
             CREATE INDEX IF NOT EXISTS idx_ib_log_ticker   ON ib_gateway_log(ticker);
             CREATE INDEX IF NOT EXISTS idx_ib_log_occurred ON ib_gateway_log(occurred_at);
+
+            CREATE TABLE IF NOT EXISTS ib_order_transactions (
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                occurred_at           TEXT    NOT NULL,
+                event_source          TEXT    NOT NULL,
+                event_type            TEXT    NOT NULL,
+                operation_status      TEXT    DEFAULT '',
+                status_before         TEXT    DEFAULT '',
+                status_after          TEXT    DEFAULT '',
+                ticker                TEXT    DEFAULT '',
+                trade_uid             TEXT    DEFAULT NULL,
+                ib_order_id           INTEGER DEFAULT 0,
+                ib_perm_id            INTEGER DEFAULT 0,
+                ib_parent_id          INTEGER DEFAULT 0,
+                order_id              INTEGER REFERENCES orders(id),
+                trade_id              INTEGER REFERENCES trades(id),
+                consensus_id          INTEGER REFERENCES consensus(id),
+                log_id                TEXT REFERENCES logs(id),
+                request_payload_json  TEXT    DEFAULT '',
+                response_payload_json TEXT    DEFAULT '',
+                error_message         TEXT    DEFAULT '',
+                latency_ms            INTEGER DEFAULT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ib_tx_occurred  ON ib_order_transactions(occurred_at);
+            CREATE INDEX IF NOT EXISTS idx_ib_tx_ticker    ON ib_order_transactions(ticker);
+            CREATE INDEX IF NOT EXISTS idx_ib_tx_trade_uid ON ib_order_transactions(trade_uid);
+            CREATE INDEX IF NOT EXISTS idx_ib_tx_ib_order  ON ib_order_transactions(ib_order_id);
+            CREATE INDEX IF NOT EXISTS idx_ib_tx_ib_perm   ON ib_order_transactions(ib_perm_id);
+            CREATE INDEX IF NOT EXISTS idx_ib_tx_ib_parent ON ib_order_transactions(ib_parent_id);
+            CREATE INDEX IF NOT EXISTS idx_ib_tx_source    ON ib_order_transactions(event_source);
+            CREATE INDEX IF NOT EXISTS idx_ib_tx_order_id  ON ib_order_transactions(order_id);
+            CREATE INDEX IF NOT EXISTS idx_ib_tx_trade_id  ON ib_order_transactions(trade_id);
         """)
         con.commit()
 
@@ -947,10 +1288,11 @@ class SQLiteManager:
             ("CONSENSUS_MAX_DEVIATION",      "0.15",   "Max target_price deviation from current price (15%)"),
             ("AUTO_ORDER_SUBMISSION",        "false",  "Auto-submit orders after consensus (true/false)"),
             ("MODEL_WEIGHT_EMA_ALPHA",       "0.2",    "EMA smoothing factor for provider accuracy weights"),
-            ("FORECAST_INTERVAL_MINUTES",    "60",     "Forecast cycle interval in minutes"),
+            ("FORECAST_INTERVAL_MINUTES",    "240",    "Forecast cycle interval in minutes"),
             ("EVALUATE_INTERVAL_MINUTES",    "120",    "Evaluate past forecasts interval in minutes"),
             ("SCHEDULER_MAX_WORKERS",        "4",      "Scheduler thread pool worker count"),
             ("SCHEDULER_MAX_RETRIES",        "2",      "Max retries for failed scheduled tasks"),
+            ("ORDER_STATUS_SYNC_INTERVAL_SECONDS", "60", "Interval for automatic IB order status synchronization in seconds"),
             ("HEARTBEAT_OPENROUTER_GRACE_SEC","120",   "Grace period before circuit-open triggers degradation"),
             # Order activation pipeline (Phase 1)
             ("FORECAST_TTL_MINUTES",         "240",    "Signal TTL in minutes — PENDING_ORDER older than this becomes EXPIRED"),
@@ -1063,6 +1405,103 @@ class SQLiteManager:
         except Exception as e:
             logger.error(f"Error clearing '{table}': {e}")
             return False
+
+    def reset_orders_and_trades_state(self, reset_eval_status: bool = True) -> dict:
+        """Reset DB order/trade state while keeping forecasts and consensus rows.
+
+        Returns:
+            Dict with counters and status flags.
+        """
+        summary: Dict[str, Any] = {
+            "ok": False,
+            "deleted_orders": 0,
+            "deleted_trades": 0,
+            "deleted_ib_transactions": 0,
+            "updated_consensus": 0,
+            "errors": [],
+        }
+
+        try:
+            with self._connect() as con:
+                cur = con.cursor()
+                con_cols = {r[1] for r in cur.execute("PRAGMA table_info(consensus)").fetchall()}
+
+                # 1) Drop links from consensus to trades before deleting trade rows.
+                if "trade_id" in con_cols:
+                    cur.execute("UPDATE consensus SET trade_id = NULL WHERE trade_id IS NOT NULL")
+
+                # 2) Remove execution/order records.
+                try:
+                    cur.execute("DELETE FROM ib_order_transactions")
+                    summary["deleted_ib_transactions"] = cur.rowcount if cur.rowcount is not None else 0
+                except Exception as e:
+                    summary["errors"].append(f"delete ib_order_transactions failed: {e}")
+
+                cur.execute("DELETE FROM orders")
+                summary["deleted_orders"] = cur.rowcount if cur.rowcount is not None else 0
+
+                cur.execute("DELETE FROM trades")
+                summary["deleted_trades"] = cur.rowcount if cur.rowcount is not None else 0
+
+                # 3) Restore consensus to pre-order state and clear actual-trade fields.
+                set_parts: List[str] = []
+                values: List[Any] = []
+
+                if "order_checked_at" in con_cols:
+                    set_parts.append("order_checked_at = ''")
+                if "order_attempted_at" in con_cols:
+                    set_parts.append("order_attempted_at = ''")
+
+                if "order_state" in con_cols:
+                    set_parts.append("order_state = CASE WHEN signal IN ('LONG','SHORT') THEN 'PENDING_ORDER' ELSE 'ORDER_SKIPPED' END")
+                if "order_reason" in con_cols:
+                    set_parts.append("order_reason = CASE WHEN signal IN ('LONG','SHORT') THEN '' ELSE 'neutral_signal' END")
+
+                if "entry_price_actual" in con_cols:
+                    set_parts.append("entry_price_actual = NULL")
+                if "target_hit" in con_cols:
+                    set_parts.append("target_hit = NULL")
+                if "stop_hit" in con_cols:
+                    set_parts.append("stop_hit = NULL")
+                if "first_hit" in con_cols:
+                    set_parts.append("first_hit = NULL")
+                if "exit_successful" in con_cols:
+                    set_parts.append("exit_successful = NULL")
+                if "direction_correct" in con_cols:
+                    set_parts.append("direction_correct = NULL")
+                if "pnl_pct" in con_cols:
+                    set_parts.append("pnl_pct = NULL")
+                if "r_multiple" in con_cols:
+                    set_parts.append("r_multiple = NULL")
+
+                if "actual_date" in con_cols:
+                    set_parts.append("actual_date = ''")
+                if "actual_open" in con_cols:
+                    set_parts.append("actual_open = NULL")
+                if "actual_close" in con_cols:
+                    set_parts.append("actual_close = NULL")
+                if "actual_high" in con_cols:
+                    set_parts.append("actual_high = NULL")
+                if "actual_low" in con_cols:
+                    set_parts.append("actual_low = NULL")
+
+                if reset_eval_status and "eval_status" in con_cols:
+                    set_parts.append("eval_status = ?")
+                    values.append("PENDING")
+
+                if set_parts:
+                    sql = f"UPDATE consensus SET {', '.join(set_parts)}"
+                    cur.execute(sql, values)
+                    summary["updated_consensus"] = cur.rowcount if cur.rowcount is not None else 0
+
+                con.commit()
+
+            summary["ok"] = True
+            return summary
+        except Exception as e:
+            summary["errors"].append(str(e))
+            logger.error(f"Error resetting orders/trades state: {e}")
+            return summary
 
     # ------------------------------------------------------------------
     # Domain helpers (ExcelManager-compatible)
@@ -1541,6 +1980,113 @@ class SQLiteManager:
         except Exception as e:
             logger.error(f"Error saving consensus: {e}")
             return False
+
+    def log_ib_transaction(
+        self,
+        *,
+        occurred_at: str,
+        event_source: str,
+        event_type: str,
+        operation_status: str = "",
+        status_before: str = "",
+        status_after: str = "",
+        ticker: str = "",
+        trade_uid: str = "",
+        ib_order_id: int = 0,
+        ib_perm_id: int = 0,
+        ib_parent_id: int = 0,
+        order_id: Optional[int] = None,
+        trade_id: Optional[int] = None,
+        consensus_id: Optional[int] = None,
+        log_id: str = "",
+        request_payload_json: str = "",
+        response_payload_json: str = "",
+        error_message: str = "",
+        latency_ms: Optional[int] = None,
+    ) -> bool:
+        """Insert one row into ib_order_transactions."""
+        try:
+            with self._connect() as con:
+                con.execute(
+                    """
+                    INSERT INTO ib_order_transactions (
+                        occurred_at, event_source, event_type, operation_status,
+                        status_before, status_after, ticker, trade_uid,
+                        ib_order_id, ib_perm_id, ib_parent_id,
+                        order_id, trade_id, consensus_id, log_id,
+                        request_payload_json, response_payload_json,
+                        error_message, latency_ms
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        occurred_at,
+                        event_source,
+                        event_type,
+                        operation_status,
+                        status_before,
+                        status_after,
+                        ticker,
+                        trade_uid,
+                        ib_order_id,
+                        ib_perm_id,
+                        ib_parent_id,
+                        order_id,
+                        trade_id,
+                        consensus_id,
+                        log_id,
+                        request_payload_json,
+                        response_payload_json,
+                        error_message,
+                        latency_ms,
+                    ),
+                )
+            return True
+        except Exception as e:
+            logger.warning(f"log_ib_transaction: failed to write log: {e}")
+            return False
+
+    def get_ib_transactions(
+        self,
+        *,
+        ticker: Optional[str] = None,
+        ib_order_id: Optional[int] = None,
+        ib_parent_id: Optional[int] = None,
+        event_source: Optional[str] = None,
+        event_type: Optional[str] = None,
+        limit: int = 500,
+    ) -> pd.DataFrame:
+        """Return rows from ib_order_transactions with optional filters."""
+        try:
+            where = []
+            params: list[Any] = []
+            if ticker:
+                where.append("UPPER(ticker)=UPPER(?)")
+                params.append(ticker)
+            if ib_order_id is not None:
+                where.append("ib_order_id=?")
+                params.append(int(ib_order_id))
+            if ib_parent_id is not None:
+                where.append("ib_parent_id=?")
+                params.append(int(ib_parent_id))
+            if event_source:
+                where.append("event_source=?")
+                params.append(event_source)
+            if event_type:
+                where.append("event_type=?")
+                params.append(event_type)
+
+            clause = f"WHERE {' AND '.join(where)}" if where else ""
+            params.append(int(limit))
+
+            with self._connect() as con:
+                return pd.read_sql_query(
+                    f"SELECT * FROM ib_order_transactions {clause} ORDER BY occurred_at DESC, id DESC LIMIT ?",
+                    con,
+                    params=params,
+                )
+        except Exception as e:
+            logger.error(f"Error reading ib_order_transactions: {e}")
+            return pd.DataFrame()
 
     # ------------------------------------------------------------------
     # Forecast Run tracking

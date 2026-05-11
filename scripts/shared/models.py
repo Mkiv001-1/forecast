@@ -128,9 +128,11 @@ class HealthResponse(BaseModel):
     """Response for GET /health."""
     status: str = "ok"
     version: str = "1.0.0"
+    db_file: Optional[str] = None
+    db_exists: bool = False
+    server: Optional[str] = None
     excel_file: Optional[str] = None
     excel_exists: bool = False
-    server: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

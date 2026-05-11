@@ -74,6 +74,9 @@ def migrate(xlsx_path: str, db_path: str):
 
     db = SQLiteManager(db_path)
     totals = {}
+    # Table ib_order_transactions has no Excel source and is created by SQLiteManager schema init.
+    # ID lifecycle fields (trade_uid, ib_perm_id) are also managed by SQLiteManager migrations.
+    totals["ib_order_transactions"] = 0
 
     # ---- Settings -----------------------------------------------------------
     try:

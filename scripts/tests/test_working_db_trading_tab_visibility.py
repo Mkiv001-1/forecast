@@ -53,6 +53,7 @@ def test_create_trade_and_three_orders_visible_in_trading_tab():
     with sqlite3.connect(db_file) as con:
         con.execute("INSERT OR REPLACE INTO config(key,value,description) VALUES ('ORDER_MODE','paper','')")
         con.execute("INSERT OR REPLACE INTO config(key,value,description) VALUES ('LIVE_TRADING_CONFIRMED','false','')")
+        con.execute("INSERT OR REPLACE INTO config(key,value,description) VALUES ('MAX_OPEN_ORDERS','9999','integration test override')")
         con.execute("INSERT OR REPLACE INTO settings(ticker,active,comment,sector,trading_blocked) VALUES (?,?,?,?,?)",
                     (ticker, 1, 'integration test ticker', 'Testing', 0))
         con.commit()

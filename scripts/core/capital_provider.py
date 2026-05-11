@@ -20,7 +20,7 @@ a forced refresh is triggered before returning the value.
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +178,68 @@ async def get_net_liquidation_async(db_manager) -> float:
     """Async wrapper for use in FastAPI endpoints."""
     import asyncio
     return await asyncio.get_event_loop().run_in_executor(None, get_net_liquidation, db_manager)
+
+
+def get_capital(db_manager) -> dict[str, Any]:
+    """
+    Backward-compatible capital payload for legacy callers (e.g. order_manager).
+
+    Returns:
+      {
+        "status": "OK" | "UNAVAILABLE" | "ERROR",
+        "net_liquidation": float,
+        "source": str,
+        "message": str,
+      }
+    """
+    risk_mode = _get_config(db_manager, "RISK_MODE", "percent_of_capital").strip().lower()
+
+    try:
+        if risk_mode == "percent_of_portfolio_on_stop":
+            net_liq, source = get_portfolio_net_liquidation(db_manager)
+            if net_liq > 0:
+                return {
+                    "status": "OK",
+                    "net_liquidation": float(net_liq),
+                    "source": source,
+                    "message": "",
+                }
+            return {
+                "status": "UNAVAILABLE",
+                "net_liquidation": 0.0,
+                "source": source,
+                "message": "non_positive_net_liquidation",
+            }
+
+        net_liq = float(get_net_liquidation(db_manager) or 0.0)
+        if net_liq > 0:
+            return {
+                "status": "OK",
+                "net_liquidation": net_liq,
+                "source": "best_available",
+                "message": "",
+            }
+        return {
+            "status": "UNAVAILABLE",
+            "net_liquidation": 0.0,
+            "source": "none",
+            "message": "no_capital_source",
+        }
+    except CapitalUnavailableError as e:
+        return {
+            "status": "UNAVAILABLE",
+            "net_liquidation": 0.0,
+            "source": "none",
+            "message": str(e),
+        }
+    except Exception as e:
+        logger.error(f"capital_provider.get_capital failed: {e}")
+        return {
+            "status": "ERROR",
+            "net_liquidation": 0.0,
+            "source": "none",
+            "message": str(e),
+        }
 
 
 # ---------------------------------------------------------------------------

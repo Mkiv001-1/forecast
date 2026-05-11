@@ -315,6 +315,32 @@ class ForecastApiClient:
         """Test IB Gateway connection and return detailed logs."""
         return self._get("/ib/test-connection", params={"host": host, "port": port, "client_id": client_id})
 
+    def get_ib_position_status(
+        self,
+        con_id: int,
+        host: str = "127.0.0.1",
+        port: int = 7497,
+        client_id: int = 1,
+    ) -> dict:
+        """Fetch live status for one IB position by con_id."""
+        return self._get(
+            f"/ib/positions/{int(con_id)}/status",
+            params={"host": host, "port": port, "client_id": client_id},
+        )
+
+    def get_ib_order_status(
+        self,
+        ib_order_id: int,
+        host: str = "127.0.0.1",
+        port: int = 7497,
+        client_id: int = 14,
+    ) -> dict:
+        """Fetch live status for one IB order by ib_order_id."""
+        return self._get(
+            f"/ib/orders/{int(ib_order_id)}/status",
+            params={"host": host, "port": port, "client_id": client_id},
+        )
+
     def get_ib_configs(self) -> IBConfigResponse:
         """Get all IB Gateway connection configurations."""
         data = self._get("/ib-config")
@@ -376,6 +402,7 @@ class ForecastApiClient:
 
     def get_trades(
         self,
+        trade_id: Optional[int] = None,
         ticker: Optional[str] = None,
         status: Optional[str] = None,
         limit: int = 200,
@@ -384,6 +411,8 @@ class ForecastApiClient:
     ) -> list:
         """Return trades from the server."""
         params = {"limit": limit}
+        if trade_id is not None:
+            params["trade_id"] = int(trade_id)
         if ticker:
             params["ticker"] = ticker
         if status:
@@ -393,11 +422,54 @@ class ForecastApiClient:
         if test_only is not None:
             params["test_only"] = test_only
         data = self._get("/trades", params=params)
-        return data.get("trades", [])
+        return data.get("items", data.get("trades", []))
+
+    def get_trade_by_id(self, trade_id: int, include_test: Optional[bool] = None) -> Optional[dict]:
+        """Return one trade by DB id or None when not found."""
+        rows = self.get_trades(trade_id=trade_id, limit=1, include_test=include_test)
+        if not rows:
+            return None
+        return rows[0]
 
     def cancel_order(self, order_id: int) -> dict:
         """Cancel an IB order by DB id."""
         return self._post(f"/orders/{order_id}/cancel")
+
+    def sync_orders(
+        self,
+        host: str = "127.0.0.1",
+        port: Optional[int] = None,
+        client_id: int = 14,
+    ) -> dict:
+        """Trigger one-shot IB -> local orders/trades synchronization."""
+        params: dict = {"host": host, "client_id": client_id}
+        if port is not None:
+            params["port"] = port
+        return self._post("/orders/sync", json={}, params=params)
+
+    def get_ib_transactions(
+        self,
+        ticker: Optional[str] = None,
+        ib_order_id: Optional[int] = None,
+        ib_parent_id: Optional[int] = None,
+        event_source: Optional[str] = None,
+        event_type: Optional[str] = None,
+        limit: int = 500,
+    ) -> list:
+        """Return rows from ib_order_transactions."""
+        params: dict = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        if ib_order_id is not None:
+            params["ib_order_id"] = int(ib_order_id)
+        if ib_parent_id is not None:
+            params["ib_parent_id"] = int(ib_parent_id)
+        if event_source:
+            params["event_source"] = event_source
+        if event_type:
+            params["event_type"] = event_type
+        data = self._get("/ib-transactions", params=params)
+        return data.get("items", [])
 
     def get_tickets(
         self,

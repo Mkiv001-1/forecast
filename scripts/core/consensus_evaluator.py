@@ -284,6 +284,7 @@ def _evaluate_one_intraday(
         target_hit=int(target_hit),
         stop_hit=int(stop_hit),
         first_hit=first_hit,
+        exit_successful=exit_successful,
         direction_correct=int(direction_correct),
         pnl_pct=pnl_pct,
         r_multiple=r_multiple,

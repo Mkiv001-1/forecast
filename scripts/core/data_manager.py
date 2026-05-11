@@ -1,6 +1,18 @@
 """
 Работа с локальными данными
+
+.. deprecated::
+    DataManager is superseded by SQLiteManager. This module will be removed in a future
+    version. Import from scripts.core.sqlite_manager instead.
 """
+
+import warnings
+warnings.warn(
+    "data_manager.DataManager is deprecated and will be removed. "
+    "Use scripts.core.sqlite_manager.SQLiteManager instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 import pandas as pd
 import os

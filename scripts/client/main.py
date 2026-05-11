@@ -4,8 +4,11 @@ import os
 import sys
 import logging
 
+# Suppress PyQt6 diagnostic messages (fonts, layout warnings)
+os.environ["QT_DEBUG_PLUGINS"] = "0"
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s %(levelname)s %(message)s",
     handlers=[logging.StreamHandler()],
 )

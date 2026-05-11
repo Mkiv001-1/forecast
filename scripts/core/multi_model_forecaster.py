@@ -183,7 +183,9 @@ def generate_multi_model_forecasts(db_manager, ticker, indicators, methods, run_
                     time.sleep(min_interval - elapsed)
 
             except RateLimitError as e:
-                logging.warning(f"⏭️ Skipping model '{model_name}' — rate limited (retry_after={e.retry_after}s)")
+                wait = getattr(e, "retry_after", None) or 60
+                logging.warning(f"⏭️ Skipping model '{model_name}' — rate limited, sleeping {wait}s (retry_after={e.retry_after})")
+                time.sleep(wait)
                 break  # skip remaining methods for this model, try next model
 
             except Exception as e:

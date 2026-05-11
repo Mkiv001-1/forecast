@@ -2,23 +2,39 @@
 chcp 65001 >nul
 setlocal
 
+set "SCRIPT_DIR=%~dp0"
+set "PYTHON_EXE=%SCRIPT_DIR%.venv312\Scripts\python.exe"
+set "RESET_SCRIPT=%SCRIPT_DIR%scripts\tools\reset_trading_state.py"
+set "FINAL_ARGS=%*"
+set "INTERACTIVE_MODE=0"
+
 echo =========================================
 echo  Forecast Trading Robot - Trading Reset
 echo =========================================
 echo.
 
 REM Use existing .venv312 (Python 3.12)
-if not exist "%~dp0.venv312\Scripts\python.exe" (
+if not exist "%PYTHON_EXE%" (
     echo Error: .venv312 not found.
     echo Run: py -3.12 -m venv .venv312
     echo Then: .venv312\Scripts\python.exe -m pip install -r requirements_server.txt
-    pause
-    exit /b 1
+    goto :END_WITH_PAUSE_ERROR
 )
 
-echo Running reset tool...
+if not exist "%RESET_SCRIPT%" (
+    echo Error: reset script not found: %RESET_SCRIPT%
+    goto :END_WITH_PAUSE_ERROR
+)
+
+if "%~1"=="" (
+    set "INTERACTIVE_MODE=1"
+    call :SHOW_MENU
+    if errorlevel 1 goto :END_WITH_PAUSE_ERROR
+)
+
+echo Running reset tool with args: %FINAL_ARGS%
 echo.
-"%~dp0.venv312\Scripts\python.exe" "%~dp0scripts\tools\reset_trading_state.py" %*
+"%PYTHON_EXE%" "%RESET_SCRIPT%" %FINAL_ARGS%
 set EXIT_CODE=%ERRORLEVEL%
 
 echo.
@@ -28,5 +44,72 @@ if %EXIT_CODE% EQU 0 (
     echo Reset finished with errors. Exit code: %EXIT_CODE%
 )
 
-pause
+if "%INTERACTIVE_MODE%"=="1" pause
 exit /b %EXIT_CODE%
+
+:SHOW_MENU
+echo Select reset mode:
+echo   [1] Dry-run DB only
+echo   [2] Dry-run full (IB + DB)
+echo   [3] Full reset (IB + DB)
+echo   [4] IB only
+echo   [5] DB only
+echo   [6] Custom args
+echo   [Q] Cancel
+echo.
+set "CHOICE="
+set /p "CHOICE=Enter choice: "
+
+if /I "%CHOICE%"=="1" (
+    set "FINAL_ARGS=--dry-run --db-only"
+    exit /b 0
+)
+if /I "%CHOICE%"=="2" (
+    set "FINAL_ARGS=--dry-run"
+    exit /b 0
+)
+if /I "%CHOICE%"=="3" (
+    call :CONFIRM_DESTRUCTIVE "FULL reset (IB + DB)"
+    if errorlevel 1 exit /b 1
+    set "FINAL_ARGS="
+    exit /b 0
+)
+if /I "%CHOICE%"=="4" (
+    call :CONFIRM_DESTRUCTIVE "IB-only reset"
+    if errorlevel 1 exit /b 1
+    set "FINAL_ARGS=--ib-only"
+    exit /b 0
+)
+if /I "%CHOICE%"=="5" (
+    call :CONFIRM_DESTRUCTIVE "DB-only reset"
+    if errorlevel 1 exit /b 1
+    set "FINAL_ARGS=--db-only"
+    exit /b 0
+)
+if /I "%CHOICE%"=="6" (
+    set "CUSTOM_ARGS="
+    set /p "CUSTOM_ARGS=Enter custom args for reset_trading_state.py: "
+    set "FINAL_ARGS=%CUSTOM_ARGS%"
+    exit /b 0
+)
+if /I "%CHOICE%"=="Q" exit /b 1
+
+echo Invalid choice.
+echo.
+goto :SHOW_MENU
+
+:CONFIRM_DESTRUCTIVE
+set "CONFIRM_TEXT=%~1"
+echo.
+echo WARNING: %CONFIRM_TEXT% will change live state.
+set "CONFIRM_VALUE="
+set /p "CONFIRM_VALUE=Type YES to continue: "
+if /I not "%CONFIRM_VALUE%"=="YES" (
+    echo Cancelled.
+    exit /b 1
+)
+exit /b 0
+
+:END_WITH_PAUSE_ERROR
+pause
+exit /b 1

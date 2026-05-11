@@ -88,6 +88,83 @@ def _collect_open_order_ids(host: str, port: int, client_id: int) -> List[int]:
     return list(dict.fromkeys(order_ids))
 
 
+def _collect_cancellable_order_ids(host: str, port: int, client_id: int) -> List[int]:
+    """Collect only currently open/cancellable IB orders.
+
+    Unlike fetch_open_order_statuses(), this intentionally ignores completed/executed
+    history and returns only active open order IDs.
+    """
+    try:
+        from ib_insync import IB
+    except ImportError:
+        return []
+
+    ib = IB()
+    order_ids: List[int] = []
+    try:
+        ib.connect(host, port, clientId=client_id, timeout=15)
+
+        # openTrades() is usually enough for the current client session.
+        for trade in ib.openTrades() or []:
+            order = getattr(trade, "order", None)
+            order_id = int(getattr(order, "orderId", 0) or 0)
+            if order_id > 0:
+                order_ids.append(order_id)
+
+        # reqAllOpenOrders() covers open orders across sessions/clients visible to TWS.
+        try:
+            for trade in ib.reqAllOpenOrders() or []:
+                order = getattr(trade, "order", None)
+                order_id = int(getattr(order, "orderId", 0) or 0)
+                if order_id > 0:
+                    order_ids.append(order_id)
+        except Exception:
+            pass
+    except Exception:
+        return []
+    finally:
+        try:
+            if ib.isConnected():
+                ib.disconnect()
+        except Exception:
+            pass
+
+    return list(dict.fromkeys(order_ids))
+
+
+def _global_cancel_all_orders(host: str, port: int, client_id: int) -> bool:
+    """Request IB global cancel for all open orders visible to the account/session."""
+    try:
+        from ib_insync import IB
+    except ImportError:
+        return False
+
+    # clientId=0 often has broader control over existing orders in a test setup.
+    candidate_client_ids = [0]
+    if int(client_id) not in candidate_client_ids:
+        candidate_client_ids.append(int(client_id))
+
+    requested = False
+    for cid in candidate_client_ids:
+        ib = IB()
+        try:
+            ib.connect(host, port, clientId=cid, timeout=15)
+            ib.reqGlobalCancel()
+            # Let TWS/Gateway process the cancel wave before post-check.
+            ib.sleep(1.5)
+            requested = True
+        except Exception:
+            pass
+        finally:
+            try:
+                if ib.isConnected():
+                    ib.disconnect()
+            except Exception:
+                pass
+
+    return requested
+
+
 def _collect_open_positions(host: str, port: int, client_id: int) -> List[Dict[str, Any]]:
     positions = fetch_ib_positions(host=host, port=port, client_id=client_id)
     open_positions: List[Dict[str, Any]] = []
@@ -116,9 +193,12 @@ def reset_ib_state(
 ) -> Dict[str, Any]:
     summary: Dict[str, Any] = {
         "ok": False,
+        "global_cancel_requested": 0,
+        "global_cancel_ok": 0,
         "orders_found": 0,
         "orders_cancel_attempted": 0,
         "orders_cancel_ok": 0,
+        "orders_cancel_not_found": 0,
         "orders_cancel_failed": 0,
         "positions_found": 0,
         "positions_close_attempted": 0,
@@ -130,7 +210,7 @@ def reset_ib_state(
     }
 
     try:
-        open_order_ids = _collect_open_order_ids(host=host, port=port, client_id=client_id)
+        open_order_ids = _collect_cancellable_order_ids(host=host, port=port, client_id=client_id)
         summary["orders_found"] = len(open_order_ids)
 
         open_positions = _collect_open_positions(host=host, port=port, client_id=client_id)
@@ -142,18 +222,32 @@ def reset_ib_state(
             summary["ok"] = True
             return summary
 
+        # For test accounts we want to cancel all IB open orders regardless of local DB links.
+        if open_order_ids:
+            summary["global_cancel_requested"] = 1
+            if _global_cancel_all_orders(host=host, port=port, client_id=client_id + 5):
+                summary["global_cancel_ok"] = 1
+
+            # Re-check after global cancel. If nothing remains, per-order cancels are not needed.
+            after_global_ids = _collect_cancellable_order_ids(host=host, port=port, client_id=client_id + 6)
+            if not after_global_ids:
+                summary["orders_cancel_ok"] = len(open_order_ids)
+            else:
+                open_order_ids = after_global_ids
+
+        failed_order_ids: List[int] = []
         for idx, order_id in enumerate(open_order_ids):
             summary["orders_cancel_attempted"] += 1
             ok = cancel_order_safe(
                 order_id=order_id,
                 host=host,
                 port=port,
-                client_id=client_id + 10 + idx,
+                client_id=0,
             )
             if ok:
                 summary["orders_cancel_ok"] += 1
             else:
-                summary["orders_cancel_failed"] += 1
+                failed_order_ids.append(order_id)
 
         for idx, pos in enumerate(open_positions):
             summary["positions_close_attempted"] += 1
@@ -174,8 +268,20 @@ def reset_ib_state(
                     f"close failed for {pos['ticker']} ({pos['quantity']}): {result.get('error')}"
                 )
 
-        remaining_orders = _collect_open_order_ids(host=host, port=port, client_id=client_id + 200)
+        remaining_orders = _collect_cancellable_order_ids(host=host, port=port, client_id=client_id + 200)
         remaining_positions = _collect_open_positions(host=host, port=port, client_id=client_id + 201)
+
+        remaining_set = set(int(x) for x in remaining_orders)
+        unresolved_failed = [oid for oid in failed_order_ids if oid in remaining_set]
+        already_gone = len(failed_order_ids) - len(unresolved_failed)
+
+        summary["orders_cancel_not_found"] = already_gone
+        summary["orders_cancel_failed"] = len(unresolved_failed)
+        summary["orders_cancel_ok"] = (
+            summary["orders_cancel_attempted"]
+            - summary["orders_cancel_not_found"]
+            - summary["orders_cancel_failed"]
+        )
 
         summary["remaining_open_orders"] = len(remaining_orders)
         summary["remaining_open_positions"] = len(remaining_positions)
@@ -185,6 +291,10 @@ def reset_ib_state(
             and summary["remaining_open_orders"] == 0
             and summary["remaining_open_positions"] == 0
         )
+        if summary["orders_cancel_not_found"] > 0:
+            summary["errors"].append(
+                f"orders_not_found_during_cancel={summary['orders_cancel_not_found']}"
+            )
         if summary["remaining_open_orders"] > 0:
             summary["errors"].append(f"remaining_open_orders={summary['remaining_open_orders']}")
         if summary["remaining_open_positions"] > 0:
@@ -245,9 +355,12 @@ def main() -> int:
         )
         print("IB summary:")
         for key in [
+            "global_cancel_requested",
+            "global_cancel_ok",
             "orders_found",
             "orders_cancel_attempted",
             "orders_cancel_ok",
+            "orders_cancel_not_found",
             "orders_cancel_failed",
             "positions_found",
             "positions_close_attempted",

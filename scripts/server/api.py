@@ -932,11 +932,14 @@ async def sync_portfolio(
 ):
     try:
         from scripts.core.ib_gateway_client import sync_portfolio_with_ib_async
+        from datetime import datetime, timezone
         em = _get_db_manager()
         ok = await sync_portfolio_with_ib_async(em, host=host, port=port, client_id=client_id, type=type)
         if not ok:
             raise HTTPException(status_code=502, detail="IB Gateway returned no positions. Ensure TWS/Gateway is running and API is enabled on port " + str(port))
-        return {"synced": True, "client_id": client_id, "type": type}
+        synced_at = datetime.now(tz=timezone.utc).isoformat()
+        em.set_config_value("LAST_PORTFOLIO_SYNC_AT", synced_at)
+        return {"synced": True, "client_id": client_id, "type": type, "synced_at": synced_at}
     except HTTPException:
         raise
     except Exception as e:
@@ -954,6 +957,64 @@ async def test_ib_connection_endpoint(
     from scripts.core.ib_gateway_client import test_ib_connection_async
     result = await test_ib_connection_async(host=host, port=port, client_id=client_id)
     return result
+
+
+@app.get("/ib/positions/{con_id}/status", dependencies=[Depends(verify_api_key)])
+async def get_ib_position_status(
+    con_id: int,
+    host: str = Query("127.0.0.1"),
+    port: int = Query(7497),
+    client_id: int = Query(1, ge=0, le=999),
+):
+    """Fetch live status for a single IB position identified by con_id."""
+    try:
+        from scripts.core.ib_gateway_client import fetch_ib_position_status_by_con_id
+        import asyncio
+
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: fetch_ib_position_status_by_con_id(
+                con_id=int(con_id),
+                host=host,
+                port=int(port),
+                client_id=int(client_id),
+            ),
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("Error fetching IB position status")
+        raise HTTPException(status_code=502, detail=f"Cannot fetch IB position status: {e}")
+
+
+@app.get("/ib/orders/{ib_order_id}/status", dependencies=[Depends(verify_api_key)])
+async def get_ib_order_status(
+    ib_order_id: int,
+    host: str = Query("127.0.0.1"),
+    port: int = Query(7497),
+    client_id: int = Query(14, ge=0, le=999),
+):
+    """Fetch live status for a single IB order identified by ib_order_id."""
+    try:
+        from scripts.core.ib_gateway_client import fetch_ib_order_status_by_order_id
+        import asyncio
+
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: fetch_ib_order_status_by_order_id(
+                order_id=int(ib_order_id),
+                host=host,
+                port=int(port),
+                client_id=int(client_id),
+            ),
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("Error fetching IB order status")
+        raise HTTPException(status_code=502, detail=f"Cannot fetch IB order status: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1270,6 +1331,47 @@ async def cancel_order_endpoint(order_id: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/orders/sync", dependencies=[Depends(verify_api_key)])
+async def sync_orders_from_ib(
+    host: str = Query("127.0.0.1"),
+    port: Optional[int] = Query(None),
+    client_id: int = Query(14),
+):
+    """Manually synchronize order statuses from IB into local orders/trades."""
+    try:
+        _ensure_paths()
+        em = _get_db_manager()
+
+        resolved_port = port
+        if resolved_port is None:
+            order_mode = str(em.get_config_value("ORDER_MODE") or "paper").lower()
+            resolved_port = 7496 if order_mode == "live" else 7497
+
+        from scripts.core.order_status_sync import sync_orders_with_ib
+        import asyncio
+
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: sync_orders_with_ib(
+                em,
+                host=host,
+                port=int(resolved_port),
+                client_id=int(client_id),
+                source="manual",
+            ),
+        )
+
+        if bool(result.get("ok", False)):
+            synced_at = str(result.get("synced_at", "") or "")
+            if synced_at:
+                em.set_config_value("LAST_ORDERS_SYNC_AT", synced_at)
+
+        return result
+    except Exception as e:
+        logger.exception("Error syncing orders from IB")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/orders/submit", response_model=OrderSubmitResponse, dependencies=[Depends(verify_api_key)])
 async def submit_order_manual(body: OrderSubmitRequest):
     """Manually submit order for ticker based on latest consensus."""
@@ -1288,6 +1390,7 @@ async def submit_order_manual(body: OrderSubmitRequest):
             raise HTTPException(status_code=404, detail=f"No consensus found for {body.ticker}")
 
         consensus = dict(row)
+        consensus_id = consensus.get("id")
         signal = consensus.get("signal", "NEUTRAL")
         confidence = consensus.get("confidence", 0.0)
 
@@ -1379,7 +1482,9 @@ async def submit_order_manual(body: OrderSubmitRequest):
             consensus=consensus,
             position_size=position,
             db_manager=em,
-            log_id=log_id or ""
+            log_id=log_id or "",
+            consensus_id=int(consensus_id) if consensus_id is not None else None,
+            event_source="submit_manual",
         )
 
         return OrderSubmitResponse(
@@ -1453,6 +1558,36 @@ async def get_ib_log(ticker: Optional[str] = None, limit: int = 500):
         return {"log": [dict(r) for r in rows]}
     except Exception as e:
         logger.exception("Error fetching ib_gateway_log")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/ib-transactions", dependencies=[Depends(verify_api_key)])
+async def get_ib_transactions(
+    ticker: Optional[str] = None,
+    ib_order_id: Optional[int] = None,
+    ib_parent_id: Optional[int] = None,
+    event_source: Optional[str] = None,
+    event_type: Optional[str] = None,
+    limit: int = Query(500, ge=1, le=5000),
+):
+    """Return rows from ib_order_transactions with optional filters."""
+    try:
+        em = _get_db_manager()
+        df = em.get_ib_transactions(
+            ticker=ticker,
+            ib_order_id=ib_order_id,
+            ib_parent_id=ib_parent_id,
+            event_source=event_source,
+            event_type=event_type,
+            limit=limit,
+        )
+        if df.empty:
+            return {"items": [], "total": 0}
+        df = df.where(df.notna(), None)
+        items = [_clean_record(r) for r in df.to_dict("records")]
+        return {"items": items, "total": len(items)}
+    except Exception as e:
+        logger.exception("Error fetching ib_order_transactions")
         raise HTTPException(status_code=500, detail=str(e))
 
 

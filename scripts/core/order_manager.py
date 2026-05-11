@@ -26,6 +26,8 @@ Rollback (Step 8):
 import logging
 import sqlite3
 import threading
+import json
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
 
@@ -60,14 +62,6 @@ def _cfg(db_manager, key: str, default: str = "") -> str:
         return default
 
 
-def _cfg_int(db_manager, key: str, default: int) -> int:
-    try:
-        v = db_manager.get_config_value(key)
-        return int(v) if v is not None else default
-    except Exception:
-        return default
-
-
 def _cfg_float(db_manager, key: str, default: float) -> float:
     try:
         return float(_cfg(db_manager, key, str(default)))
@@ -90,6 +84,28 @@ def _now_utc() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
 
 
+def _get_last_price(db_manager, ticker: str) -> float:
+    """Return the most recent close price for ticker from price_data, or 0.0 if not found.
+    
+    Uses encapsulated db_manager method if available, falls back to direct query.
+    """
+    # Prefer encapsulated method if available
+    if hasattr(db_manager, 'get_last_price'):
+        return db_manager.get_last_price(ticker)
+    
+    # Fallback for backward compatibility
+    try:
+        import sqlite3 as _sq
+        with _sq.connect(db_manager.db_file) as con:
+            row = con.execute(
+                "SELECT close FROM price_data WHERE ticker=? ORDER BY date DESC LIMIT 1",
+                (ticker,)
+            ).fetchone()
+        return float(row[0]) if row and row[0] else 0.0
+    except Exception:
+        return 0.0
+
+
 def _symbol_from_ticker(ticker: str) -> str:
     """Extract bare symbol from 'NASDAQ:AAPL' or 'AAPL'."""
     return ticker.split(":")[-1].strip()
@@ -109,12 +125,34 @@ def _get_ib_port(mode: str) -> int:
     return _IB_LIVE_PORT if mode == "live" else _IB_PAPER_PORT
 
 
+def _table_exists(con: sqlite3.Connection, table: str) -> bool:
+    row = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _open_orders_count_sql(has_trades_table: bool) -> str:
+    if not has_trades_table:
+        return "SELECT COUNT(*) FROM orders WHERE UPPER(order_role)='ENTRY' AND status IN ('QUEUED','SUBMITTED','FILLED_ENTRY')"
+    return (
+        "SELECT COUNT(*) "
+        "FROM orders o "
+        "LEFT JOIN trades t ON t.ib_parent_id = o.ib_parent_id "
+        "WHERE "
+        "UPPER(o.order_role)='ENTRY' AND ("
+        "o.status IN ('QUEUED','SUBMITTED') "
+        "OR (o.status = 'FILLED_ENTRY' AND COALESCE(UPPER(t.status), 'OPEN') = 'OPEN')"
+        ")"
+    )
+
+
 def _count_open_orders(db_manager) -> int:
     try:
         with sqlite3.connect(db_manager.db_file) as con:
-            row = con.execute(
-                "SELECT COUNT(*) FROM orders WHERE status IN ('QUEUED','SUBMITTED','FILLED_ENTRY')"
-            ).fetchone()
+            has_trades_table = _table_exists(con, "trades")
+            row = con.execute(_open_orders_count_sql(has_trades_table)).fetchone()
             return row[0] if row else 0
     except Exception:
         return 0
@@ -123,10 +161,26 @@ def _count_open_orders(db_manager) -> int:
 def _has_open_order_for_ticker(db_manager, ticker: str) -> bool:
     try:
         with sqlite3.connect(db_manager.db_file) as con:
-            row = con.execute(
-                "SELECT COUNT(*) FROM orders WHERE UPPER(ticker)=UPPER(?) AND status IN ('QUEUED','SUBMITTED','FILLED_ENTRY')",
-                (ticker,)
-            ).fetchone()
+            has_trades_table = _table_exists(con, "trades")
+            if not has_trades_table:
+                row = con.execute(
+                    "SELECT COUNT(*) FROM orders WHERE UPPER(ticker)=UPPER(?) AND UPPER(order_role)='ENTRY' AND status IN ('QUEUED','SUBMITTED','FILLED_ENTRY')",
+                    (ticker,)
+                ).fetchone()
+            else:
+                row = con.execute(
+                    "SELECT COUNT(*) "
+                    "FROM orders o "
+                    "LEFT JOIN trades t ON t.ib_parent_id = o.ib_parent_id "
+                    "WHERE UPPER(o.ticker)=UPPER(?) "
+                    "AND ("
+                    "UPPER(o.order_role)='ENTRY' AND ("
+                    "o.status IN ('QUEUED','SUBMITTED') "
+                    "OR (o.status='FILLED_ENTRY' AND COALESCE(UPPER(t.status), 'OPEN')='OPEN')"
+                    ")"
+                    ")",
+                    (ticker,)
+                ).fetchone()
             return (row[0] if row else 0) > 0
     except Exception:
         return False
@@ -168,6 +222,66 @@ def _update_order(db_manager, row_id: int, updates: dict) -> None:
     vals = list(updates.values()) + [row_id]
     with sqlite3.connect(db_manager.db_file) as con:
         con.execute(f"UPDATE orders SET {set_parts} WHERE id=?", vals)
+
+
+def _json_payload(value: Any, max_len: int = 32000) -> str:
+    """Serialize payload to compact JSON string with size guard."""
+    if value is None:
+        return ""
+    try:
+        text = json.dumps(value, ensure_ascii=True, separators=(",", ":"), default=str)
+    except Exception:
+        text = str(value)
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+def _log_ib_transaction_event(
+    db_manager,
+    *,
+    event_source: str,
+    event_type: str,
+    operation_status: str = "",
+    status_before: str = "",
+    status_after: str = "",
+    ticker: str = "",
+    ib_order_id: int = 0,
+    ib_parent_id: int = 0,
+    order_id: Optional[int] = None,
+    trade_id: Optional[int] = None,
+    consensus_id: Optional[int] = None,
+    log_id: str = "",
+    request_payload: Any = None,
+    response_payload: Any = None,
+    error_message: str = "",
+    latency_ms: Optional[int] = None,
+) -> None:
+    """Best-effort write to ib_order_transactions via SQLiteManager helper."""
+    if not hasattr(db_manager, "log_ib_transaction"):
+        return
+    try:
+        db_manager.log_ib_transaction(
+            occurred_at=_now_utc(),
+            event_source=event_source,
+            event_type=event_type,
+            operation_status=operation_status,
+            status_before=status_before,
+            status_after=status_after,
+            ticker=ticker,
+            ib_order_id=ib_order_id,
+            ib_parent_id=ib_parent_id,
+            order_id=order_id,
+            trade_id=trade_id,
+            consensus_id=consensus_id,
+            log_id=log_id,
+            request_payload_json=_json_payload(request_payload),
+            response_payload_json=_json_payload(response_payload),
+            error_message=error_message,
+            latency_ms=latency_ms,
+        )
+    except Exception as e:
+        logger.warning(f"_log_ib_transaction_event failed: {e}")
 
 
 def _block_ticker(db_manager, ticker: str) -> None:
@@ -274,6 +388,8 @@ def submit_signal(
     log_id: str = "",
     is_test: bool = False,
     test_tag: str = "",
+    consensus_id: Optional[int] = None,
+    event_source: str = "submit_auto",
 ) -> Dict[str, Any]:
     """
     Convert a consensus signal + position size into a bracket order.
@@ -321,8 +437,13 @@ def submit_signal(
 
         # Guard: max open orders
         max_open = _cfg_int(db_manager, "MAX_OPEN_ORDERS", 5)
-        if _count_open_orders(db_manager) >= max_open:
-            return {"status": "SKIPPED_MAX_ORDERS", "order_ids": [], "message": f"MAX_OPEN_ORDERS={max_open} reached"}
+        open_count = _count_open_orders(db_manager)
+        if open_count >= max_open:
+            return {
+                "status": "SKIPPED_MAX_ORDERS",
+                "order_ids": [],
+                "message": f"MAX_OPEN_ORDERS={max_open} reached (open={open_count})",
+            }
 
         # Guard: execute flags for methods and providers
         methods_for_signal = ""
@@ -352,8 +473,8 @@ def submit_signal(
         max_spread_pct = _cfg_float(db_manager, "MAX_SPREAD_PCT", 0.005)
         ib_port = _get_ib_port(mode)
         try:
-            from ib_gateway_client import get_bid_ask_spread
-            spread_info = get_bid_ask_spread(symbol, port=ib_port)
+            from ib_gateway_client import get_bid_ask_spread_safe
+            spread_info = get_bid_ask_spread_safe(symbol, port=ib_port)
             if spread_info.get("status") == "ok":
                 spread_pct = spread_info.get("spread_pct", 0)
                 if spread_pct > max_spread_pct:
@@ -418,9 +539,39 @@ def submit_signal(
             _ticker_lock = None
 
     # Place bracket via IB (outside critical section — lock already released)
+    ib_request_payload = {
+        "symbol": symbol,
+        "action": action,
+        "quantity": quantity,
+        "entry_order_type": entry_order_type,
+        "entry_price": entry_price_val,
+        "entry_tif": entry_tif,
+        "stop_loss_price": float(stop_loss),
+        "take_profit_price": float(target_price),
+        "take_profit_tif": consensus.get("take_profit_tif", "GTC"),
+        "stop_loss_tif": consensus.get("stop_loss_tif", "GTC"),
+        "use_stop_limit": use_stop_limit,
+        "stop_limit_offset_pct": stop_limit_offset_pct,
+        "allow_extended_hours": allow_extended,
+        "order_ref": order_ref,
+        "port": ib_port,
+    }
+    _log_ib_transaction_event(
+        db_manager,
+        event_source=event_source,
+        event_type="ORDER_SUBMIT_REQUEST",
+        operation_status="REQUESTED",
+        ticker=ticker,
+        order_id=parent_db_id,
+        consensus_id=consensus_id,
+        log_id=log_id,
+        request_payload=ib_request_payload,
+    )
+    ib_call_started = time.monotonic()
+
     try:
-        from ib_gateway_client import place_bracket_order
-        ib_result = place_bracket_order(
+        from ib_gateway_client import place_bracket_order_safe
+        ib_result = place_bracket_order_safe(
             symbol=symbol,
             action=action,
             quantity=quantity,
@@ -438,13 +589,46 @@ def submit_signal(
             port=ib_port,
         )
     except Exception as e:
+        latency_ms = int((time.monotonic() - ib_call_started) * 1000)
         _update_order(db_manager, parent_db_id, {"status": "ERROR", "error_message": str(e)})
+        _log_ib_transaction_event(
+            db_manager,
+            event_source=event_source,
+            event_type="ORDER_SUBMIT_RESPONSE",
+            operation_status="FAILED",
+            status_before=initial_status,
+            status_after="ERROR",
+            ticker=ticker,
+            order_id=parent_db_id,
+            consensus_id=consensus_id,
+            log_id=log_id,
+            request_payload=ib_request_payload,
+            error_message=str(e),
+            latency_ms=latency_ms,
+        )
         logger.error(f"order_manager: place_bracket_order exception for {ticker}: {e}")
         return {"status": "ERROR", "order_ids": [parent_db_id], "message": str(e)}
 
     if ib_result.get("status") != "submitted":
+        latency_ms = int((time.monotonic() - ib_call_started) * 1000)
         err = ib_result.get("error", "unknown")
         _update_order(db_manager, parent_db_id, {"status": "ERROR", "error_message": err})
+        _log_ib_transaction_event(
+            db_manager,
+            event_source=event_source,
+            event_type="ORDER_SUBMIT_RESPONSE",
+            operation_status="FAILED",
+            status_before=initial_status,
+            status_after="ERROR",
+            ticker=ticker,
+            order_id=parent_db_id,
+            consensus_id=consensus_id,
+            log_id=log_id,
+            request_payload=ib_request_payload,
+            response_payload=ib_result,
+            error_message=str(err),
+            latency_ms=latency_ms,
+        )
         return {"status": "ERROR", "order_ids": [parent_db_id], "message": err}
 
     parent_ib_id = ib_result["parent_id"]
@@ -476,6 +660,25 @@ def submit_signal(
                 "limit_price": None, "stop_price": float(stop_loss)}
     target_db_id = _save_order(db_manager, target_row)
     stop_db_id   = _save_order(db_manager, stop_row)
+
+    latency_ms = int((time.monotonic() - ib_call_started) * 1000)
+    _log_ib_transaction_event(
+        db_manager,
+        event_source=event_source,
+        event_type="ORDER_SUBMIT_RESPONSE",
+        operation_status="SUCCESS",
+        status_before=initial_status,
+        status_after="SUBMITTED",
+        ticker=ticker,
+        ib_order_id=parent_ib_id,
+        ib_parent_id=parent_ib_id,
+        order_id=parent_db_id,
+        consensus_id=consensus_id,
+        log_id=log_id,
+        request_payload=ib_request_payload,
+        response_payload=ib_result,
+        latency_ms=latency_ms,
+    )
 
     from notification_manager import notify
     notify(
@@ -595,19 +798,19 @@ def rollback_bracket_group(
                 (ib_parent_id,)
             ).fetchall()
 
-        from ib_gateway_client import cancel_order
+        from ib_gateway_client import cancel_order_safe
         for child_ib_id, role, status in children:
             if status not in ("FILLED", "CANCELLED"):
                 logger.info(f"rollback: cancelling {role} IB#{child_ib_id}")
-                cancel_order(child_ib_id, port=ib_port)
+            cancel_order_safe(child_ib_id, port=ib_port)
 
     except Exception as e:
         logger.error(f"rollback: cancel children failed: {e}")
 
     # Step 3 — close position at market
     try:
-        from ib_gateway_client import close_position_market
-        close_result = close_position_market(symbol, quantity=1, port=ib_port)
+        from ib_gateway_client import close_position_market_safe
+        close_result = close_position_market_safe(symbol, quantity=1, port=ib_port)
         logger.info(f"rollback: close_position_market result: {close_result}")
     except Exception as e:
         logger.error(f"rollback: close position failed: {e}")
@@ -693,6 +896,120 @@ def check_child_timeouts(db_manager) -> None:
                 rollback_bracket_group(row["id"], db_manager)
         except Exception as e:
             logger.error(f"check_child_timeouts: error processing row {row['id']}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible IB status processor (test/legacy entrypoint)
+# ---------------------------------------------------------------------------
+
+def process_ib_order_updates(db_manager, ib_statuses: list) -> None:
+    """Apply IB order status snapshots to local orders/trades.
+
+    This function is kept for backward compatibility with existing tests and
+    scripts. Scheduler/manual sync path uses scripts.core.order_status_sync.
+    """
+    if not ib_statuses:
+        return
+
+    def _to_float(value: Any) -> Optional[float]:
+        try:
+            if value in (None, ""):
+                return None
+            return float(value)
+        except Exception:
+            return None
+
+    ib_map: dict[int, dict] = {}
+    for row in ib_statuses:
+        try:
+            oid = int(row.get("ib_order_id") or 0)
+        except Exception:
+            oid = 0
+        if oid > 0:
+            ib_map[oid] = row
+
+    if not ib_map:
+        return
+
+    with sqlite3.connect(db_manager.db_file) as con:
+        con.row_factory = sqlite3.Row
+        orders = con.execute(
+            """
+            SELECT id, ticker, ib_order_id, ib_parent_id, order_role, status
+            FROM orders
+            WHERE ib_order_id != 0
+            """
+        ).fetchall()
+
+        for order in orders:
+            ib_order_id = int(order["ib_order_id"] or 0)
+            ib_row = ib_map.get(ib_order_id)
+            if ib_row is None:
+                continue
+
+            ib_status_raw = str(ib_row.get("status") or "").strip()
+            ib_status = ib_status_raw.lower()
+            role = str(order["order_role"] or "").upper()
+            current = str(order["status"] or "").upper()
+            fill_price = _to_float(ib_row.get("avg_fill_price"))
+            fill_ts = str(ib_row.get("last_update") or "") or _now_utc()
+
+            if ib_status == "filled":
+                if role == "ENTRY" and current not in ("FILLED_ENTRY", "FILLED"):
+                    con.execute(
+                        "UPDATE orders SET status='FILLED_ENTRY', filled_price=?, filled_at=? WHERE id=?",
+                        (fill_price, fill_ts, order["id"]),
+                    )
+                    con.execute(
+                        """
+                        UPDATE trades
+                        SET entry_price=?, entry_filled_at=?, updated_at=?
+                        WHERE ib_parent_id=? AND status='OPEN'
+                        """,
+                        (fill_price, fill_ts, _now_utc(), int(order["ib_parent_id"] or 0)),
+                    )
+
+                elif role in ("TAKE_PROFIT", "STOP_LOSS") and current not in ("FILLED", "CANCELLED"):
+                    con.execute(
+                        "UPDATE orders SET status='FILLED', filled_price=?, filled_at=? WHERE id=?",
+                        (fill_price, fill_ts, order["id"]),
+                    )
+
+                    trade = con.execute(
+                        """
+                        SELECT id, signal, quantity, entry_price, status
+                        FROM trades
+                        WHERE ib_parent_id=?
+                        ORDER BY id DESC LIMIT 1
+                        """,
+                        (int(order["ib_parent_id"] or 0),),
+                    ).fetchone()
+                    if trade and str(trade["status"] or "").upper() == "OPEN":
+                        entry_price = _to_float(trade["entry_price"]) or 0.0
+                        qty = _to_float(trade["quantity"]) or 0.0
+                        px = fill_price or 0.0
+                        signal = str(trade["signal"] or "LONG").upper()
+                        if signal == "SHORT":
+                            pnl = (entry_price - px) * qty
+                        else:
+                            pnl = (px - entry_price) * qty
+                        close_reason = "TAKE_PROFIT" if role == "TAKE_PROFIT" else "STOP_LOSS"
+                        con.execute(
+                            """
+                            UPDATE trades
+                            SET status='CLOSED', exit_price=?, exit_filled_at=?, close_reason=?,
+                                realized_pnl=?, updated_at=?
+                            WHERE id=?
+                            """,
+                            (px, fill_ts, close_reason, pnl, _now_utc(), trade["id"]),
+                        )
+
+            elif ib_status in ("cancelled", "inactive"):
+                if current not in ("FILLED", "FILLED_ENTRY", "CANCELLED"):
+                    con.execute(
+                        "UPDATE orders SET status='CANCELLED', error_message=? WHERE id=?",
+                        (f"IB:{ib_status_raw}", order["id"]),
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -791,6 +1108,14 @@ def preview_consensus_order(
         return {
             "status": "SKIPPED",
             "message": "neutral_signal",
+            "ticker": ticker,
+            "signal": signal,
+        }
+
+    if stop_loss is None or target_price is None:
+        return {
+            "status": "SKIPPED_MISSING_LEVELS",
+            "message": "consensus missing stop_loss or target_price",
             "ticker": ticker,
             "signal": signal,
         }
@@ -947,9 +1272,10 @@ def activate_consensus_order(
         return {"status": "PENDING", "message": reason}
 
     consensus_dict = dict(row)
+    entry_price = row["entry_limit_price"] or _get_last_price(db_manager, ticker) or row["stop_loss"] or 0
     position = calculate_position(
         ticker=ticker,
-        entry_price=row["entry_limit_price"] or row["stop_loss"] or 0,
+        entry_price=entry_price,
         stop_loss=row["stop_loss"],
         db_manager=db_manager,
         net_liquidation=capital["net_liquidation"],
@@ -966,6 +1292,8 @@ def activate_consensus_order(
         position_size=position,
         db_manager=db_manager,
         log_id="",
+        consensus_id=consensus_id,
+        event_source="submit_auto",
     )
 
     r_status = result.get("status", "ERROR")

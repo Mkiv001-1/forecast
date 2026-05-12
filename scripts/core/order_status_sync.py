@@ -281,6 +281,15 @@ def _find_order_for_status_row(
         if row is not None:
             return row
 
+        # Fallback for legacy rows where ib_order_id may differ but perm_id is stable.
+        row = con.execute(
+            f"SELECT {select_cols} FROM orders "
+            "WHERE ib_perm_id=? ORDER BY id DESC LIMIT 1",
+            (ib_perm_id,),
+        ).fetchone()
+        if row is not None:
+            return row
+
     trade_uid = _extract_trade_uid_from_order_ref(str(status_row.get("order_ref") or ""))
     if has_order_trade_uid_col and trade_uid:
         row = con.execute(
@@ -556,6 +565,7 @@ def sync_orders_with_ib(
         return summary
 
     event_source = "sync_scheduler" if str(source).lower() == "scheduler" else "sync_manual"
+    mapping_warning_set: set[str] = set()
 
     try:
         with sqlite3.connect(db_manager.db_file) as con:
@@ -578,8 +588,9 @@ def sync_orders_with_ib(
                     )
                     if order is None:
                         msg = f"mapping_error:ib_order_id={ib_order_id};ib_perm_id={ib_perm_id};trade_uid={trade_uid}"
-                        summary["mapping_warnings"].append(msg)
-                        logger.warning(f"order_status_sync: {msg}")
+                        if msg not in mapping_warning_set:
+                            mapping_warning_set.add(msg)
+                            summary["mapping_warnings"].append(msg)
                         continue
 
                     ib_status = str(status_row.get("status") or "")
@@ -710,8 +721,10 @@ def sync_orders_with_ib(
     if summary["errors"]:
         summary["ok"] = False
     if summary["mapping_warnings"]:
+        preview = "; ".join(summary["mapping_warnings"][:10])
+        suffix = "" if len(summary["mapping_warnings"]) <= 10 else "; ..."
         logger.warning(
             f"order_status_sync: {len(summary['mapping_warnings'])} IB order(s) could not be matched "
-            f"to local records (orphaned): {'; '.join(summary['mapping_warnings'])}"
+            f"to local records (orphaned): {preview}{suffix}"
         )
     return summary

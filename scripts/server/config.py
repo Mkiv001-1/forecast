@@ -50,7 +50,14 @@ class ServerConfig:
             self._cfg["security"]["api_key"] = new_key
             self._write()
             logger.info(f"Generated new API key and saved to {self.config_file}")
-            logger.info(f"API Key: {new_key}")
+            logger.info(f"API Key: {_mask_secret(new_key)}")
+def _mask_secret(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "<empty>"
+    if len(text) <= 8:
+        return "***"
+    return f"{text[:4]}...{text[-4:]}"
 
     def _write(self):
         os.makedirs(os.path.dirname(self.config_file), exist_ok=True)

@@ -47,6 +47,15 @@ _runner: RobotRunner = None
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
+def _mask_secret(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "<empty>"
+    if len(text) <= 8:
+        return "***"
+    return f"{text[:4]}...{text[-4:]}"
+
+
 def get_config() -> ServerConfig:
     return _config
 
@@ -66,7 +75,7 @@ async def lifespan(app: FastAPI):
     _runner = RobotRunner(_config.db_file)
     logger.info(f"Server started on {_config.host}:{_config.port}")
     logger.info(f"DB file: {_config.db_file}")
-    logger.info(f"API Key: {_config.api_key}")
+    logger.info(f"API Key: {_mask_secret(_config.api_key)}")
 
     # Mark any runs stuck as 'running' from a previous server session as failed
     try:

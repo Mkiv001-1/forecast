@@ -78,8 +78,8 @@ def _is_stale(last_sync_str: str, staleness_minutes: int) -> bool:
 def _refresh_ib_sync(db_manager) -> bool:
     """Trigger a synchronous IB account refresh. Returns True on success."""
     try:
-        from ib_gateway_client import sync_accounts_with_ib
-        sync_accounts_with_ib(db_manager)
+        from ib_gateway_client import sync_accounts_with_ib_safe
+        sync_accounts_with_ib_safe(db_manager)
         return True
     except Exception as e:
         logger.warning(f"CAPITAL_SOURCE_STALE: IB refresh failed: {e}")

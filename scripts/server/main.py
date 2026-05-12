@@ -30,6 +30,15 @@ for _p in [_PROJECT_ROOT, _SCRIPTS_DIR]:
         sys.path.insert(0, _p)
 
 
+def _mask_secret(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "<empty>"
+    if len(text) <= 8:
+        return "***"
+    return f"{text[:4]}...{text[-4:]}"
+
+
 def main():
     from scripts.core.single_instance import SingleInstance
     SingleInstance("server").acquire()
@@ -54,7 +63,7 @@ def main():
 
     logger.info(f"Starting server on http://{host}:{port}")
     logger.info(f"Excel: {cfg.excel_file}")
-    logger.info(f"API Key: {cfg.api_key}")
+    logger.info(f"API Key: {_mask_secret(cfg.api_key)}")
 
     uvicorn.run(
         "scripts.server.api:app",

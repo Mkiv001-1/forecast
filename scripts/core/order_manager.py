@@ -330,7 +330,8 @@ def _check_execute_flags(db_manager, methods_list: str) -> tuple[bool, str]:
             SELECT method, execute FROM method_config 
             WHERE method IN ({method_placeholders})
         """
-        method_rows = db_manager._execute_query(method_query, methods)
+        with sqlite3.connect(db_manager.db_file) as con:
+            method_rows = con.execute(method_query, methods).fetchall()
         
         method_execute = {row[0]: row[1] for row in method_rows}
         
@@ -358,7 +359,8 @@ def _check_execute_flags(db_manager, methods_list: str) -> tuple[bool, str]:
                 SELECT name, execute FROM providers 
                 WHERE name IN ({provider_placeholders})
             """
-            provider_rows = db_manager._execute_query(provider_query, providers)
+            with sqlite3.connect(db_manager.db_file) as con:
+                provider_rows = con.execute(provider_query, providers).fetchall()
             provider_execute = {row[0]: row[1] for row in provider_rows}
         
         # Check all methods have execute='yes'

@@ -42,6 +42,31 @@ def _normalize_contract_ticker(contract: Any) -> str:
     return symbol
 
 
+def _client_id_candidates(preferred: int) -> list[int]:
+    ids: list[int] = []
+    for candidate in (preferred, preferred + 100, preferred + 200):
+        if 0 <= int(candidate) <= 999 and int(candidate) not in ids:
+            ids.append(int(candidate))
+    return ids or [int(preferred)]
+
+
+def _connect_with_client_id_fallback(ib, host: str, port: int, client_id: int, timeout: int | float) -> int:
+    last_error: Exception | None = None
+    for candidate in _client_id_candidates(int(client_id)):
+        try:
+            ib.connect(host, port, clientId=candidate, timeout=timeout)
+            return candidate
+        except Exception as e:
+            last_error = e
+            if "client id is already in use" in str(e).lower():
+                logger.warning(f"[IB] clientId {candidate} is busy, retrying with fallback id")
+                continue
+            raise
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("IB connect failed: no client_id candidates")
+
+
 def _extract_trade_last_update(trade: Any) -> str:
     log_items = getattr(trade, "log", None) or []
     if not log_items:
@@ -136,7 +161,9 @@ def fetch_ib_accounts(host: str = "127.0.0.1", port: int = 7497, client_id: int 
     ib = IB()
     try:
         logger.info(f"[IB] Connecting to {host}:{port} with clientId={client_id}, timeout={timeout}s...")
-        ib.connect(host, port, clientId=client_id, timeout=timeout)
+        connected_client_id = _connect_with_client_id_fallback(ib, host, port, client_id, timeout)
+        if connected_client_id != client_id:
+            logger.info(f"[IB] Connected with fallback clientId={connected_client_id} (requested={client_id})")
         logger.info(f"[IB] Connected successfully")
         logger.info(f"Connected to IB Gateway {host}:{port}")
 
@@ -194,7 +221,9 @@ def fetch_ib_positions(host: str = "127.0.0.1", port: int = 7497, client_id: int
 
     ib = IB()
     try:
-        ib.connect(host, port, clientId=client_id, timeout=10)
+        connected_client_id = _connect_with_client_id_fallback(ib, host, port, client_id, 10)
+        if connected_client_id != client_id:
+            logger.info(f"[IB] positions fallback clientId={connected_client_id} (requested={client_id})")
         logger.info(f"Connected to IB Gateway {host}:{port}")
 
         for pos in ib.portfolio():  # noqa: E501
@@ -720,7 +749,9 @@ def get_bid_ask_spread(
 
     ib = IB()
     try:
-        ib.connect(host, port, clientId=client_id, timeout=15)
+        connected_client_id = _connect_with_client_id_fallback(ib, host, port, client_id, 15)
+        if connected_client_id != client_id:
+            logger.info(f"[IB] spread fallback clientId={connected_client_id} (requested={client_id})")
         contract = Stock(symbol, "SMART", "USD")
         ib.qualifyContracts(contract)
 
@@ -761,6 +792,16 @@ def get_bid_ask_spread(
 def place_bracket_order_safe(*args, **kwargs) -> Dict[str, Any]:
     """Safe wrapper for place_bracket_order with isolated event loop."""
     return _run_with_isolated_loop(place_bracket_order, *args, **kwargs)
+
+
+def sync_accounts_with_ib_safe(*args, **kwargs) -> bool:
+    """Safe wrapper for sync_accounts_with_ib with isolated event loop."""
+    return _run_with_isolated_loop(sync_accounts_with_ib, *args, **kwargs)
+
+
+def sync_portfolio_with_ib_safe(*args, **kwargs) -> bool:
+    """Safe wrapper for sync_portfolio_with_ib with isolated event loop."""
+    return _run_with_isolated_loop(sync_portfolio_with_ib, *args, **kwargs)
 
 
 def get_bid_ask_spread_safe(*args, **kwargs) -> Dict[str, Any]:
@@ -804,7 +845,9 @@ def fetch_open_order_statuses(
 
     ib = IB()
     try:
-        ib.connect(host, port, clientId=client_id, timeout=15)
+        connected_client_id = _connect_with_client_id_fallback(ib, host, port, client_id, 15)
+        if connected_client_id != client_id:
+            logger.info(f"[IB] open orders fallback clientId={connected_client_id} (requested={client_id})")
         trades = ib.openTrades()
         ib.sleep(timeout)
 
@@ -965,7 +1008,9 @@ def fetch_ib_order_status_by_order_id(
 
     ib = IB()
     try:
-        ib.connect(host, port, clientId=client_id, timeout=15)
+        connected_client_id = _connect_with_client_id_fallback(ib, host, port, client_id, 15)
+        if connected_client_id != client_id:
+            logger.info(f"[IB] order status fallback clientId={connected_client_id} (requested={client_id})")
 
         open_trades = ib.openTrades()
         ib.sleep(timeout)

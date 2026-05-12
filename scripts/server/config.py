@@ -10,6 +10,16 @@ logger = logging.getLogger(__name__)
 _DEFAULT_INI = os.path.join(os.path.dirname(__file__), "ini", "server_config.ini")
 
 
+def _mask_secret(value: str) -> str:
+    """Mask API key for logging (show only first/last 4 chars)."""
+    text = str(value or "").strip()
+    if not text:
+        return "<empty>"
+    if len(text) <= 8:
+        return "***"
+    return f"{text[:4]}...{text[-4:]}"
+
+
 class ServerConfig:
     CONFIG_FILE = _DEFAULT_INI
 
@@ -51,13 +61,6 @@ class ServerConfig:
             self._write()
             logger.info(f"Generated new API key and saved to {self.config_file}")
             logger.info(f"API Key: {_mask_secret(new_key)}")
-def _mask_secret(value: str) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return "<empty>"
-    if len(text) <= 8:
-        return "***"
-    return f"{text[:4]}...{text[-4:]}"
 
     def _write(self):
         os.makedirs(os.path.dirname(self.config_file), exist_ok=True)

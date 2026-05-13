@@ -956,6 +956,128 @@ async def sync_portfolio(
         raise HTTPException(status_code=502, detail=f"Cannot connect to IB Gateway at {host}:{port} — {e}")
 
 
+@app.get("/portfolio/history", dependencies=[Depends(verify_api_key)])
+async def get_portfolio_history(
+    ticker: Optional[str] = Query(None),
+    account: Optional[str] = Query(None),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+    include_summary: bool = Query(False),
+    limit: int = Query(500, ge=1, le=2000),
+):
+    """Вернуть историю портфеля (снимки) с фильтрами по account и дате."""
+    try:
+        em = _get_db_manager()
+        query = "SELECT * FROM portfolio_history"
+        clauses = []
+        params = []
+        if not include_summary:
+            clauses.append("COALESCE(row_type, 'position') <> 'summary'")
+        if ticker:
+            clauses.append("ticker=?")
+            params.append(ticker)
+        if account:
+            clauses.append("account=?")
+            params.append(account)
+        if date_from:
+            clauses.append("timestamp>=?")
+            params.append(date_from)
+        if date_to:
+            clauses.append("timestamp<=?")
+            params.append(date_to)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(limit)
+        with em._connect() as con:
+            rows = con.execute(query, params).fetchall()
+        items = [dict(r) for r in rows]
+        return {"items": items, "total": len(items)}
+    except Exception as e:
+        logger.exception("Error fetching portfolio history")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/portfolio/history/snapshot", dependencies=[Depends(verify_api_key)])
+async def trigger_portfolio_history_snapshot(
+    host: str = Query("127.0.0.1"),
+    port: int = Query(7497),
+    client_id: int = Query(1, ge=0, le=999),
+):
+    """Принудительно собрать snapshot портфеля через IB Gateway."""
+    try:
+        from scripts.core.ib_gateway_client import snapshot_portfolio_history_async
+
+        em = _get_db_manager()
+        count = await snapshot_portfolio_history_async(em, host=host, port=port, client_id=client_id)
+        return {"snapshots_added": int(count or 0)}
+    except Exception as e:
+        logger.exception("Error triggering portfolio history snapshot")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/portfolio/history/summary/ib", dependencies=[Depends(verify_api_key)])
+async def get_ib_portfolio_summary(
+    refresh: bool = Query(False),
+    host: str = Query("127.0.0.1"),
+    port: int = Query(7497),
+    client_id: int = Query(1, ge=0, le=999),
+):
+    """Return latest account summary persisted in portfolio_history.
+
+    If refresh=true, trigger a fresh IB snapshot first.
+    """
+    try:
+        from scripts.core.ib_gateway_client import snapshot_portfolio_history_async
+
+        em = _get_db_manager()
+        if refresh:
+            await snapshot_portfolio_history_async(em, host=host, port=port, client_id=client_id)
+
+        with em._connect() as con:
+            row = con.execute(
+                """
+                SELECT *
+                FROM portfolio_history
+                WHERE COALESCE(row_type, 'position') = 'summary'
+                ORDER BY timestamp DESC, id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        if not row:
+            return {
+                "timestamp": "",
+                "accounts_count": 0,
+                "positions_count": 0,
+                "net_liquidation": 0.0,
+                "equity": 0.0,
+                "unrealized_pnl": 0.0,
+                "realized_pnl": 0.0,
+                "buying_power": 0.0,
+                "available_funds": 0.0,
+                "cash": 0.0,
+                "maintenance_margin": 0.0,
+            }
+
+        d = dict(row)
+        return {
+            "timestamp": d.get("timestamp", ""),
+            "accounts_count": int(d.get("accounts_count") or 0),
+            "positions_count": int(d.get("positions_count") or 0),
+            "net_liquidation": float(d.get("net_liquidation") or 0),
+            "equity": float(d.get("equity") or 0),
+            "unrealized_pnl": float(d.get("unrealized_pnl") or 0),
+            "realized_pnl": float(d.get("realized_pnl") or 0),
+            "buying_power": float(d.get("buying_power") or 0),
+            "available_funds": float(d.get("available_funds") or 0),
+            "cash": float(d.get("cash") or 0),
+            "maintenance_margin": float(d.get("maintenance_margin") or 0),
+        }
+    except Exception as e:
+        logger.exception("Error fetching IB portfolio summary")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/ib/test-connection", dependencies=[Depends(verify_api_key)])
 async def test_ib_connection_endpoint(
     host: str = Query("127.0.0.1"),

@@ -64,6 +64,43 @@ class ForecastApiClient:
         resp.raise_for_status()
         return resp.json()
 
+    def get_portfolio_history(
+        self,
+        ticker: Optional[str] = None,
+        account: Optional[str] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        limit: int = 500,
+    ) -> dict:
+        """Получить историю портфеля (список снимков)."""
+        params = {"limit": limit}
+        if ticker:
+            params["ticker"] = ticker
+        if account:
+            params["account"] = account
+        if date_from:
+            params["date_from"] = date_from
+        if date_to:
+            params["date_to"] = date_to
+        return self._get("/portfolio/history", params=params)
+
+    def trigger_portfolio_history_snapshot(self) -> dict:
+        """Принудительно сделать снимок портфеля (ручной refresh)."""
+        return self._post("/portfolio/history/snapshot")
+
+    def get_ib_portfolio_summary(
+        self,
+        refresh: bool = False,
+        host: str = "127.0.0.1",
+        port: int = 7497,
+        client_id: int = 1,
+    ) -> dict:
+        """Получить последний сохраненный summary портфеля из portfolio_history."""
+        return self._get(
+            "/portfolio/history/summary/ib",
+            params={"refresh": refresh, "host": host, "port": port, "client_id": client_id},
+        )
+
     def health(self, timeout: Optional[int] = None) -> HealthResponse:
         req_timeout = timeout if timeout is not None else self.timeout
         data = self._session.get(f"{self.server_url}/health", timeout=req_timeout).json()

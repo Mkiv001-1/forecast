@@ -1184,6 +1184,137 @@ def test_scheduler_max_workers_from_config(monkeypatch):
             pass
 
 
+def test_scheduler_heartbeat_marks_ib_red_on_connection_failure(monkeypatch):
+    import asyncio
+    import scheduler
+
+    class FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, sql):
+            return self
+
+    class FakeDb:
+        def __init__(self, db_file):
+            self.db_file = db_file
+            self.logged = None
+
+        def get_config_value(self, key):
+            if key == "ORDER_MODE":
+                return "paper"
+            if key == "IB_HOST":
+                return "127.0.0.1"
+            if key == "IB_PORT":
+                return "7497"
+            if key == "IB_CLIENT_ID":
+                return "1"
+            return None
+
+        def _connect(self):
+            return FakeConn()
+
+        def log_heartbeat(self, ib_ok, openrouter_ok, sqlite_ok, notes):
+            self.logged = (ib_ok, openrouter_ok, sqlite_ok, notes)
+            return True
+
+    async def _fake_test_ib_connection_async(host, port, client_id):
+        assert host == "127.0.0.1"
+        assert port == 7497
+        assert client_id == 1
+        return {"success": False, "error": "connection refused"}
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_file = f.name
+    try:
+        db = FakeDb(db_file)
+        scheduler._state.db_manager = db
+        monkeypatch.setattr(scheduler, "test_ib_connection_async", _fake_test_ib_connection_async)
+
+        asyncio.run(scheduler._heartbeat_task())
+
+        assert db.logged is not None
+        ib_ok, _, sqlite_ok, notes = db.logged
+        assert ib_ok == 0
+        assert sqlite_ok == 1
+        assert "ib_err:connection refused" in notes
+    finally:
+        scheduler._state.reset()
+        try:
+            os.unlink(db_file)
+        except PermissionError:
+            pass
+
+
+def test_scheduler_heartbeat_marks_external_services_red_on_probe_failure(monkeypatch):
+    import asyncio
+    import scheduler
+
+    class FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def execute(self, sql):
+            return self
+
+    class FakeDb:
+        def __init__(self, db_file):
+            self.db_file = db_file
+            self.logged = None
+
+        def get_config_value(self, key):
+            return None
+
+        def _connect(self):
+            return FakeConn()
+
+        def log_heartbeat(self, ib_ok, openrouter_ok, sqlite_ok, notes):
+            self.logged = (ib_ok, openrouter_ok, sqlite_ok, notes)
+            return True
+
+    def _fake_openrouter_probe():
+        return 0, "openrouter_err:http_401"
+
+    def _fake_yahoo_probe():
+        return 0, "yahoo_err:http_503"
+
+    async def _fake_test_ib_connection_async(host, port, client_id):
+        return {"success": True}
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_file = f.name
+    try:
+        db = FakeDb(db_file)
+        scheduler._state.db_manager = db
+        scheduler._HEARTBEAT_PROBE_CACHE.clear()
+        monkeypatch.setattr(scheduler, "test_ib_connection_async", _fake_test_ib_connection_async)
+        monkeypatch.setattr(scheduler, "_probe_openrouter", _fake_openrouter_probe)
+        monkeypatch.setattr(scheduler, "_probe_yahoo", _fake_yahoo_probe)
+
+        asyncio.run(scheduler._heartbeat_task())
+
+        assert db.logged is not None
+        ib_ok, openrouter_ok, sqlite_ok, notes = db.logged
+        assert ib_ok == 1
+        assert openrouter_ok == 0
+        assert sqlite_ok == 1
+        assert "openrouter_err:http_401" in notes
+        assert "yahoo_err:http_503" in notes
+    finally:
+        scheduler._state.reset()
+        scheduler._HEARTBEAT_PROBE_CACHE.clear()
+        try:
+            os.unlink(db_file)
+        except PermissionError:
+            pass
+
+
 def test_evaluate_consensus_stop_hit():
     """LONG consensus: stop triggered → stop_hit=1, pnl negative."""
     from consensus_evaluator import evaluate_consensus_records

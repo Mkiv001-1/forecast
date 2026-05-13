@@ -18,7 +18,6 @@ PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 
 CREATE TABLE IF NOT EXISTS settings (
-    ticker  TEXT PRIMARY KEY,
     active  INTEGER DEFAULT 0,
     comment TEXT    DEFAULT ''
 );
@@ -365,6 +364,32 @@ CREATE TABLE IF NOT EXISTS ib_order_transactions (
     error_message         TEXT    DEFAULT '',
     latency_ms            INTEGER DEFAULT NULL
 );
+
+-- Portfolio history for dashboard
+CREATE TABLE IF NOT EXISTS portfolio_history (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp       TEXT    NOT NULL,
+    ticker          TEXT    NOT NULL,
+    row_type        TEXT    DEFAULT 'position',
+    equity          REAL    DEFAULT 0,
+    unrealized_pnl  REAL    DEFAULT 0,
+    realized_pnl    REAL    DEFAULT 0,
+    cumulative_pnl  REAL    DEFAULT 0,
+    volume          REAL    DEFAULT 0,
+    price           REAL    DEFAULT 0,
+    account         TEXT    DEFAULT '',
+    currency        TEXT    DEFAULT 'USD',
+    net_liquidation REAL    DEFAULT 0,
+    buying_power    REAL    DEFAULT 0,
+    available_funds REAL    DEFAULT 0,
+    cash            REAL    DEFAULT 0,
+    maintenance_margin REAL DEFAULT 0,
+    positions_count INTEGER DEFAULT 0,
+    accounts_count  INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_portfolio_history_ticker ON portfolio_history(ticker);
+CREATE INDEX IF NOT EXISTS idx_portfolio_history_timestamp ON portfolio_history(timestamp);
+CREATE INDEX IF NOT EXISTS idx_portfolio_history_row_type ON portfolio_history(row_type);
 CREATE INDEX IF NOT EXISTS idx_ib_tx_occurred  ON ib_order_transactions(occurred_at);
 CREATE INDEX IF NOT EXISTS idx_ib_tx_ticker    ON ib_order_transactions(ticker);
 CREATE INDEX IF NOT EXISTS idx_ib_tx_trade_uid ON ib_order_transactions(trade_uid);
@@ -431,6 +456,10 @@ _DEFAULT_CONFIG = [
     ("SCHEDULER_MAX_RETRIES",        "2",          "Max retries for failed scheduled tasks"),
     ("ORDER_STATUS_SYNC_INTERVAL_SECONDS", "60",   "Interval for automatic IB order status synchronization in seconds"),
     ("HEARTBEAT_OPENROUTER_GRACE_SEC","120",        "Grace period before circuit-open triggers degradation"),
+    ("PORTFOLIO_HISTORY_SNAPSHOT_INTERVAL_MINUTES", "1440", "How often to collect portfolio history snapshot (minutes)"),
+    ("IB_GATEWAY_HOST",             "127.0.0.1",   "IB Gateway host for scheduler tasks"),
+    ("IB_GATEWAY_PORT",             "7497",        "IB Gateway port for scheduler tasks"),
+    ("IB_GATEWAY_CLIENT_ID",        "1",           "IB Gateway client id for scheduler tasks"),
     # Order activation pipeline
     ("FORECAST_TTL_MINUTES",         "240",        "Signal TTL in minutes — PENDING_ORDER older than this becomes EXPIRED"),
     ("ORDER_WINDOW_ENABLED",         "false",      "Restrict order submission to a time window"),
@@ -622,11 +651,68 @@ def _tbl(sheet_name: str) -> str:
 
 class _SQLiteManagerQueriesMixin:
     """Mixin class providing encapsulated query methods for SQLiteManager.
-    
+
     These methods replace direct SQL queries that were previously scattered
     across forecast_runner.py, scheduler.py, and order_manager.py.
     """
-    
+
+    def insert_portfolio_history(self, records: List[Dict[str, Any]]) -> int:
+        """Массовая вставка истории портфеля в таблицу portfolio_history.
+
+        Args:
+            records: список dict с ключами: timestamp, ticker, equity, unrealized_pnl,
+                realized_pnl, cumulative_pnl, volume, price, account, currency
+
+        Returns:
+            Число успешно вставленных записей.
+        """
+        if not records:
+            return 0
+
+        cols = [
+            "timestamp", "ticker", "row_type", "equity", "unrealized_pnl", "realized_pnl", "cumulative_pnl",
+            "volume", "price", "account", "currency",
+            "net_liquidation", "buying_power", "available_funds", "cash",
+            "maintenance_margin", "positions_count", "accounts_count",
+        ]
+        values = []
+        for r in records:
+            values.append(
+                (
+                    r.get("timestamp", None),
+                    r.get("ticker", None),
+                    r.get("row_type", "position"),
+                    r.get("equity", None),
+                    r.get("unrealized_pnl", None),
+                    r.get("realized_pnl", None),
+                    r.get("cumulative_pnl", None),
+                    r.get("volume", None),
+                    r.get("price", None),
+                    r.get("account", None),
+                    r.get("currency", None),
+                    r.get("net_liquidation", None),
+                    r.get("buying_power", None),
+                    r.get("available_funds", None),
+                    r.get("cash", None),
+                    r.get("maintenance_margin", None),
+                    r.get("positions_count", None),
+                    r.get("accounts_count", None),
+                )
+            )
+        sql = f"""
+            INSERT INTO portfolio_history
+            ({', '.join(cols)})
+            VALUES ({', '.join(['?'] * len(cols))})
+        """
+        try:
+            with self._connect() as con:
+                con.executemany(sql, values)
+                con.commit()
+            return len(values)
+        except Exception as e:
+            logger.error(f"insert_portfolio_history error: {e}")
+            return 0
+
     def get_method_config_timeframes(self) -> dict:
         """Get active method configurations with timeframe_hours.
         
@@ -1025,6 +1111,14 @@ class SQLiteManager(_SQLiteManagerQueriesMixin):
             ("orders",    "test_tag",          "TEXT DEFAULT ''"),
             ("trades",    "is_test",           "INTEGER DEFAULT 0"),
             ("trades",    "test_tag",          "TEXT DEFAULT ''"),
+            ("portfolio_history", "row_type",            "TEXT DEFAULT 'position'"),
+            ("portfolio_history", "net_liquidation",     "REAL DEFAULT 0"),
+            ("portfolio_history", "buying_power",        "REAL DEFAULT 0"),
+            ("portfolio_history", "available_funds",     "REAL DEFAULT 0"),
+            ("portfolio_history", "cash",                "REAL DEFAULT 0"),
+            ("portfolio_history", "maintenance_margin",  "REAL DEFAULT 0"),
+            ("portfolio_history", "positions_count",     "INTEGER DEFAULT 0"),
+            ("portfolio_history", "accounts_count",      "INTEGER DEFAULT 0"),
         ]
         for table, col, col_type in _MISSING_COLS:
             try:
@@ -1036,6 +1130,12 @@ class SQLiteManager(_SQLiteManagerQueriesMixin):
                     logger.info(f"Schema migration: added column {table}.{col}")
             except Exception as e:
                 logger.warning(f"Schema migration skipped {table}.{col}: {e}")
+
+        try:
+            con.execute("CREATE INDEX IF NOT EXISTS idx_portfolio_history_row_type ON portfolio_history(row_type)")
+            con.commit()
+        except Exception as e:
+            logger.warning(f"Schema migration skipped idx_portfolio_history_row_type: {e}")
 
         # Ensure new tables exist (for DBs created before this migration)
         con.executescript("""

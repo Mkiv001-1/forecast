@@ -1,3 +1,65 @@
+def snapshot_portfolio_history(db_manager, host: str = "127.0.0.1", port: int = 7497, client_id: int = 1) -> int:
+    """Собрать snapshot позиций + account summary из IB и записать в portfolio_history."""
+    accounts = fetch_ib_accounts(host=host, port=port, client_id=client_id)
+    positions = fetch_ib_positions(host=host, port=port, client_id=client_id)
+    summary = _aggregate_portfolio_summary(accounts, positions)
+
+    now = str(summary.get("timestamp") or datetime.now().isoformat(timespec="seconds"))
+    records = []
+
+    # Сводная строка аккаунта хранится в той же таблице portfolio_history
+    records.append(
+        {
+            "timestamp": now,
+            "ticker": "__ACCOUNT_SUMMARY__",
+            "row_type": "summary",
+            "equity": float(summary.get("equity", 0) or 0),
+            "unrealized_pnl": float(summary.get("unrealized_pnl", 0) or 0),
+            "realized_pnl": float(summary.get("realized_pnl", 0) or 0),
+            "cumulative_pnl": float(summary.get("unrealized_pnl", 0) or 0) + float(summary.get("realized_pnl", 0) or 0),
+            "volume": float(summary.get("positions_count", 0) or 0),
+            "price": 0.0,
+            "account": "ALL",
+            "currency": "USD",
+            "net_liquidation": float(summary.get("net_liquidation", 0) or 0),
+            "buying_power": float(summary.get("buying_power", 0) or 0),
+            "available_funds": float(summary.get("available_funds", 0) or 0),
+            "cash": float(summary.get("cash", 0) or 0),
+            "maintenance_margin": float(summary.get("maintenance_margin", 0) or 0),
+            "positions_count": int(summary.get("positions_count", 0) or 0),
+            "accounts_count": int(summary.get("accounts_count", 0) or 0),
+        }
+    )
+
+    # Позиционные строки snapshot
+    cumulative_by_ticker: Dict[str, float] = {}
+    for pos in positions:
+        ticker = pos.get("ticker", "")
+        realized = float(pos.get("realized_pnl", 0) or 0)
+        unrealized = float(pos.get("unrealized_pnl", 0) or 0)
+        cumulative = cumulative_by_ticker.get(ticker, 0) + realized + unrealized
+        cumulative_by_ticker[ticker] = cumulative
+        records.append(
+            {
+                "timestamp": now,
+                "ticker": ticker,
+                "row_type": "position",
+                "equity": float(pos.get("market_value", 0) or 0),
+                "unrealized_pnl": unrealized,
+                "realized_pnl": realized,
+                "cumulative_pnl": cumulative,
+                "volume": float(pos.get("quantity", 0) or 0),
+                "price": float(pos.get("market_price", 0) or 0),
+                "account": pos.get("account", ""),
+                "currency": pos.get("currency", "USD") or "USD",
+            }
+        )
+
+    count = db_manager.insert_portfolio_history(records)
+    logger.info(f"Inserted {count} portfolio history records at {now} (positions={len(positions)})")
+    return count
+
+
 """IB Gateway client — sync wrapper around ib_insync to fetch portfolio positions and account balances."""
 
 import asyncio
@@ -309,6 +371,40 @@ def sync_portfolio_with_ib(db_manager, host: str = "127.0.0.1", port: int = 7497
         return False
 
 
+def _aggregate_portfolio_summary(accounts: List[Dict[str, Any]], positions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    net_liq = sum(float(a.get("net_liquidation", 0) or 0) for a in accounts)
+    buying_power = sum(float(a.get("buying_power", 0) or 0) for a in accounts)
+    available_funds = sum(float(a.get("available_funds", 0) or 0) for a in accounts)
+    cash = sum(float(a.get("cash", 0) or 0) for a in accounts)
+    maint_margin = sum(float(a.get("maintenance_margin", 0) or 0) for a in accounts)
+
+    equity = sum(float(p.get("market_value", 0) or 0) for p in positions)
+    unrealized = sum(float(p.get("unrealized_pnl", 0) or 0) for p in positions)
+    realized = sum(float(p.get("realized_pnl", 0) or 0) for p in positions)
+    positions_count = sum(1 for p in positions if float(p.get("quantity", 0) or 0) != 0)
+
+    return {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "accounts_count": len(accounts),
+        "positions_count": positions_count,
+        "net_liquidation": net_liq,
+        "equity": equity,
+        "unrealized_pnl": unrealized,
+        "realized_pnl": realized,
+        "buying_power": buying_power,
+        "available_funds": available_funds,
+        "cash": cash,
+        "maintenance_margin": maint_margin,
+    }
+
+
+def fetch_ib_portfolio_summary(host: str = "127.0.0.1", port: int = 7497, client_id: int = 1) -> Dict[str, Any]:
+    """Fetch aggregated account/portfolio summary directly from IB Gateway."""
+    accounts = fetch_ib_accounts(host=host, port=port, client_id=client_id)
+    positions = fetch_ib_positions(host=host, port=port, client_id=client_id)
+    return _aggregate_portfolio_summary(accounts, positions)
+
+
 def _run_in_thread(func):
     """Decorator to run function in thread with isolated event loop."""
     def wrapper(*args, **kwargs):
@@ -374,6 +470,8 @@ def _run_with_isolated_loop(func, *args, **kwargs):
 # Create wrapped versions of sync functions
 _sync_accounts_wrapped = _run_in_thread(sync_accounts_with_ib)
 _sync_portfolio_wrapped = _run_in_thread(sync_portfolio_with_ib)
+_snapshot_portfolio_history_wrapped = _run_in_thread(snapshot_portfolio_history)
+_portfolio_summary_wrapped = _run_in_thread(fetch_ib_portfolio_summary)
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +493,24 @@ async def sync_portfolio_with_ib_async(db_manager, host: str = "127.0.0.1", port
     return await loop.run_in_executor(
         None, 
         functools.partial(_sync_portfolio_wrapped, db_manager, host, port, client_id, type)
+    )
+
+
+async def snapshot_portfolio_history_async(db_manager, host: str = "127.0.0.1", port: int = 7497, client_id: int = 1) -> int:
+    """Async version that runs snapshot_portfolio_history in an isolated thread."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        functools.partial(_snapshot_portfolio_history_wrapped, db_manager, host, port, client_id),
+    )
+
+
+async def fetch_ib_portfolio_summary_async(host: str = "127.0.0.1", port: int = 7497, client_id: int = 1) -> Dict[str, Any]:
+    """Async version that fetches aggregated portfolio summary directly from IB."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        functools.partial(_portfolio_summary_wrapped, host, port, client_id),
     )
 
 

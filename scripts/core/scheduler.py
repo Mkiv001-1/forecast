@@ -13,10 +13,22 @@ import concurrent.futures
 import logging
 import os
 import sys
+import json
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Callable, Dict, Optional, Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
+
+try:
+    from ib_gateway_client import test_ib_connection_async
+except Exception:
+    test_ib_connection_async = None
+
+_HEARTBEAT_PROBE_CACHE: Dict[str, tuple[float, int, str]] = {}
+_HEARTBEAT_PROBE_SUCCESS_TTL_SEC = 300
 
 # ---------------------------------------------------------------------------
 # Scheduler state (encapsulated in class to avoid global state)
@@ -66,6 +78,93 @@ def _cfg_int(key: str, default: int) -> int:
         return int(_cfg(key, str(default)))
     except ValueError:
         return default
+
+
+def _cached_probe(
+    name: str,
+    probe_func: Callable[[], tuple[int, str]],
+    *,
+    success_ttl_sec: int = _HEARTBEAT_PROBE_SUCCESS_TTL_SEC,
+    failure_ttl_sec: int = 30,
+) -> tuple[int, str]:
+    cached = _HEARTBEAT_PROBE_CACHE.get(name)
+    now = time.monotonic()
+    if cached:
+        cached_at, status, note = cached
+        age = now - cached_at
+        if status == 1 and age < success_ttl_sec:
+            return status, note
+        if status == 0 and age < failure_ttl_sec:
+            return status, note
+
+    status, note = probe_func()
+    _HEARTBEAT_PROBE_CACHE[name] = (now, status, note)
+    return status, note
+
+
+def _probe_openrouter() -> tuple[int, str]:
+    if _state.db_manager is None:
+        return 0, "openrouter_err:no_db_manager"
+
+    api_key = _cfg("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        return 0, "openrouter_err:no_api_key"
+
+    request = Request(
+        "https://openrouter.ai/api/v1/models",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+            "User-Agent": "forecast-heartbeat/1.0",
+        },
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=10) as response:
+            status_code = getattr(response, "status", response.getcode())
+            if 200 <= int(status_code) < 300:
+                return 1, ""
+            return 0, f"openrouter_err:http_{status_code}"
+    except HTTPError as e:
+        return 0, f"openrouter_err:http_{e.code}"
+    except URLError as e:
+        return 0, f"openrouter_err:{getattr(e, 'reason', e)}"
+    except Exception as e:
+        return 0, f"openrouter_err:{e}"
+
+
+def _probe_yahoo() -> tuple[int, str]:
+    request = Request(
+        "https://query1.finance.yahoo.com/v8/finance/chart/SPY?range=1d&interval=1d",
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "forecast-heartbeat/1.0",
+        },
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=10) as response:
+            status_code = getattr(response, "status", response.getcode())
+            if not (200 <= int(status_code) < 300):
+                return 0, f"yahoo_err:http_{status_code}"
+            raw = response.read(2048)
+            if not raw:
+                return 0, "yahoo_err:empty_response"
+            payload = json.loads(raw.decode("utf-8", errors="replace"))
+            chart = payload.get("chart", {}) if isinstance(payload, dict) else {}
+            error = chart.get("error") if isinstance(chart, dict) else None
+            result = chart.get("result") if isinstance(chart, dict) else None
+            if error:
+                return 0, f"yahoo_err:{error}"
+            if result:
+                return 1, ""
+            return 0, "yahoo_err:missing_chart_result"
+    except HTTPError as e:
+        return 0, f"yahoo_err:http_{e.code}"
+    except URLError as e:
+        return 0, f"yahoo_err:{getattr(e, 'reason', e)}"
+    except Exception as e:
+        return 0, f"yahoo_err:{e}"
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +271,7 @@ async def _heartbeat_task() -> None:
     """Check IB / OpenRouter / SQLite health and log to heartbeat_log."""
     ib_ok = 0
     or_ok = 0
+    yahoo_ok = 0
     db_ok = 0
     notes = []
 
@@ -184,21 +284,39 @@ async def _heartbeat_task() -> None:
         except Exception as e:
             notes.append(f"sqlite_err:{e}")
 
-    # OpenRouter circuit-breaker check
+    # OpenRouter check: probe the real API instead of trusting circuit state.
     try:
-        from circuit_breaker import get_state
-        state = get_state()
-        or_ok = 1 if state == "CLOSED" else 0
-        if state != "CLOSED":
-            notes.append(f"openrouter:{state}")
-    except Exception:
-        or_ok = 1  # If no circuit breaker yet, assume ok
+        or_ok, or_note = _cached_probe("openrouter", _probe_openrouter)
+        if or_note:
+            notes.append(or_note)
+    except Exception as e:
+        notes.append(f"openrouter_err:{e}")
 
-    # IB check: just verify DB has recent accounts
+    # Yahoo check: probe a lightweight chart endpoint so data-source outages show up.
+    try:
+        yahoo_ok, yahoo_note = _cached_probe("yahoo", _probe_yahoo)
+        if yahoo_note:
+            notes.append(yahoo_note)
+    except Exception as e:
+        notes.append(f"yahoo_err:{e}")
+
+    # IB check: verify a live IB connection instead of relying on stale DB rows.
     if _state.db_manager:
         try:
-            account_count = _state.db_manager.get_accounts_count()
-            ib_ok = 1 if account_count > 0 else 0
+            if test_ib_connection_async is None:
+                notes.append("ib_err:test_connection_unavailable")
+            else:
+                order_mode = str(_cfg("ORDER_MODE", "paper") or "paper").lower()
+                host = _cfg("IB_HOST", "127.0.0.1")
+                port = _cfg_int("IB_PORT", 7496 if order_mode == "live" else 7497)
+                client_id = _cfg_int("IB_CLIENT_ID", 1)
+                result = await asyncio.wait_for(
+                    test_ib_connection_async(host=host, port=port, client_id=client_id),
+                    timeout=15,
+                )
+                ib_ok = 1 if result.get("success") else 0
+                if not result.get("success"):
+                    notes.append(f"ib_err:{result.get('error') or 'connection failed'}")
         except Exception as e:
             notes.append(f"ib_err:{e}")
 
@@ -206,7 +324,7 @@ async def _heartbeat_task() -> None:
     if _state.db_manager:
         _state.db_manager.log_heartbeat(ib_ok, or_ok, db_ok, "; ".join(notes))
 
-    logger.debug(f"heartbeat: ib={ib_ok} openrouter={or_ok} sqlite={db_ok}")
+    logger.debug(f"heartbeat: ib={ib_ok} openrouter={or_ok} yahoo={yahoo_ok} sqlite={db_ok}")
 
 
 async def _order_timeout_task() -> None:
@@ -457,6 +575,26 @@ async def _scheduled_order_status_sync_task() -> None:
     await loop.run_in_executor(_state.thread_pool, _run_order_status_sync_sync)
 
 
+async def _scheduled_portfolio_history_snapshot_task() -> None:
+    """Persist one portfolio history snapshot (positions + account summary) from IB."""
+    if _state.db_manager is None:
+        raise RuntimeError("scheduler: db manager is not initialized")
+
+    from scripts.core.ib_gateway_client import snapshot_portfolio_history_async
+
+    host = _cfg("IB_GATEWAY_HOST", "127.0.0.1")
+    port = _cfg_int("IB_GATEWAY_PORT", 7497)
+    client_id = _cfg_int("IB_GATEWAY_CLIENT_ID", 1)
+
+    count = await snapshot_portfolio_history_async(
+        _state.db_manager,
+        host=host,
+        port=int(port),
+        client_id=int(client_id),
+    )
+    logger.info(f"scheduler: portfolio_history_snapshot inserted {count} row(s)")
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -485,6 +623,7 @@ async def start_scheduler(db_manager) -> None:
     intraday_interval = _cfg_int("INTRADAY_UPDATE_INTERVAL_MINUTES", 60) * 60
     pending_orders_interval = _cfg_int("PENDING_ORDERS_INTERVAL_MINUTES", 1) * 60
     order_status_sync_interval = _cfg_int("ORDER_STATUS_SYNC_INTERVAL_SECONDS", 60)
+    portfolio_history_interval = _cfg_int("PORTFOLIO_HISTORY_SNAPSHOT_INTERVAL_MINUTES", 1440) * 60
 
     task_specs = [
         ("heartbeat",              _heartbeat_task,                    30,                     True),
@@ -492,6 +631,7 @@ async def start_scheduler(db_manager) -> None:
         ("expire_queued_orders",   _expire_queued_orders_task,         300,                    False),
         ("process_pending_orders", _scheduled_pending_orders_task,     pending_orders_interval, False),
         ("sync_order_statuses",    _scheduled_order_status_sync_task,   order_status_sync_interval, False),
+        ("portfolio_history_snapshot", _scheduled_portfolio_history_snapshot_task, portfolio_history_interval, False),
         ("update_price_data",      _scheduled_price_data_task,         price_data_interval,    False),
         ("update_intraday",        _scheduled_intraday_task,           intraday_interval,      False),
         ("scheduled_forecast",     _scheduled_forecast_task,           forecast_interval,      False),

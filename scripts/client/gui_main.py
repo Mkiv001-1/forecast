@@ -29,6 +29,158 @@ if _SCRIPTS_DIR not in sys.path:
 
 from scripts.shared.models import ForecastLog, TickerSetting, ProviderSetting, PositionRecord, AccountRecord, ConsensusRecord
 from scripts.client.api_client import ForecastApiClient
+from PyQt6.QtWidgets import QDateEdit
+from datetime import date
+class PortfolioHistoryTab(QWidget):
+    def __init__(self, api: ForecastApiClient, parent=None):
+        super().__init__(parent)
+        self.api = api
+        self._rows = []
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(6)
+
+        self.summary_label = QLabel("IB Summary: loading...")
+        self.summary_label.setWordWrap(True)
+        self.summary_label.setStyleSheet("font-weight: bold; color: #263238;")
+        layout.addWidget(self.summary_label)
+
+        # --- Фильтры и refresh ---
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Ticker:"))
+        self.ticker_combo = QComboBox()
+        self.ticker_combo.setMinimumWidth(120)
+        self.ticker_combo.addItem("ALL", "")
+        filter_row.addWidget(self.ticker_combo)
+
+        filter_row.addWidget(QLabel("From:"))
+        self.from_date = QDateEdit()
+        self.from_date.setCalendarPopup(True)
+        self.from_date.setDate(date.today().replace(day=1))
+        filter_row.addWidget(self.from_date)
+
+        filter_row.addWidget(QLabel("To:"))
+        self.to_date = QDateEdit()
+        self.to_date.setCalendarPopup(True)
+        self.to_date.setDate(date.today())
+        filter_row.addWidget(self.to_date)
+
+        self.refresh_btn = QPushButton("🔄 Refresh")
+        self.refresh_btn.clicked.connect(self.on_refresh)
+        filter_row.addWidget(self.refresh_btn)
+
+        filter_row.addStretch()
+        layout.addLayout(filter_row)
+
+        # --- Таблица истории ---
+        self.table = QTableWidget(0, 9)
+        self.table.setHorizontalHeaderLabels([
+            "Timestamp", "Ticker", "Equity", "Unrealized PnL", "Realized PnL",
+            "Cumulative PnL", "Volume", "Price", "Account"
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSortingEnabled(True)
+        layout.addWidget(self.table, 1)
+
+        self.total_label = QLabel("Rows: 0")
+        layout.addWidget(self.total_label)
+
+    def on_refresh(self):
+        # 1. Снять snapshot через API (FastAPI endpoint должен вызывать snapshot_portfolio_history)
+        try:
+            # Предполагается, что api имеет метод trigger_portfolio_history_snapshot()
+            self.api.trigger_portfolio_history_snapshot()
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to snapshot portfolio history:\n{e}")
+        self.load()
+
+    def load(self):
+        try:
+            self._load_summary_from_ib()
+            ticker = self.ticker_combo.currentData() or None
+            date_from = self.from_date.date().toString("yyyy-MM-dd")
+            date_to = self.to_date.date().toString("yyyy-MM-dd")
+            # Предполагается, что api.get_portfolio_history поддерживает фильтры
+            resp = self.api.get_portfolio_history(ticker=ticker, date_from=date_from, date_to=date_to)
+            self._rows = resp.get("items", []) if isinstance(resp, dict) else []
+            self._populate_table()
+            self._refresh_ticker_filter()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load portfolio history:\n{e}")
+
+    def _load_summary_from_ib(self):
+        try:
+            s = self.api.get_ib_portfolio_summary()
+            ts = str(s.get("timestamp", "") or "")
+            accounts_count = int(s.get("accounts_count", 0) or 0)
+            positions_count = int(s.get("positions_count", 0) or 0)
+            net_liq = float(s.get("net_liquidation", 0) or 0)
+            equity = float(s.get("equity", 0) or 0)
+            unrealized = float(s.get("unrealized_pnl", 0) or 0)
+            realized = float(s.get("realized_pnl", 0) or 0)
+            cash = float(s.get("cash", 0) or 0)
+            buying_power = float(s.get("buying_power", 0) or 0)
+            available_funds = float(s.get("available_funds", 0) or 0)
+            maint_margin = float(s.get("maintenance_margin", 0) or 0)
+
+            self.summary_label.setText(
+                "IB Account State | "
+                f"Accounts: {accounts_count} | Positions: {positions_count} | Updated: {ts}\n"
+                f"NetLiq: ${net_liq:,.2f} | Cash: ${cash:,.2f} | Buying Power: ${buying_power:,.2f} | "
+                f"Available Funds: ${available_funds:,.2f} | Maint. Margin: ${maint_margin:,.2f}\n"
+                f"Portfolio: Equity ${equity:,.2f} | Unrealized PnL ${unrealized:,.2f} | Realized PnL ${realized:,.2f}"
+            )
+        except Exception as e:
+            self.summary_label.setText(f"IB Summary unavailable: {e}")
+
+    def _populate_table(self):
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(0)
+        for r, row in enumerate(self._rows):
+            vals = [
+                str(row.get("timestamp", "")),
+                str(row.get("ticker", "")),
+                f"{row.get('equity', 0):,.2f}",
+                f"{row.get('unrealized_pnl', 0):,.2f}",
+                f"{row.get('realized_pnl', 0):,.2f}",
+                f"{row.get('cumulative_pnl', 0):,.2f}",
+                f"{row.get('volume', 0):,.2f}",
+                f"{row.get('price', 0):,.2f}",
+                str(row.get("account", "")),
+            ]
+            self.table.insertRow(r)
+            for c, v in enumerate(vals):
+                item = QTableWidgetItem(v)
+                if c in (3, 4, 5):  # PnL
+                    try:
+                        val = float(v.replace(",", ""))
+                        if val > 0:
+                            item.setForeground(QBrush(QColor("#2e7d32")))
+                        elif val < 0:
+                            item.setForeground(QBrush(QColor("#c62828")))
+                    except Exception:
+                        pass
+                self.table.setItem(r, c, item)
+        self.table.setSortingEnabled(True)
+        self.total_label.setText(f"Rows: {len(self._rows)}")
+
+    def _refresh_ticker_filter(self):
+        tickers = sorted({str(row.get("ticker", "")) for row in self._rows if row.get("ticker")})
+        current = self.ticker_combo.currentData()
+        self.ticker_combo.blockSignals(True)
+        self.ticker_combo.clear()
+        self.ticker_combo.addItem("ALL", "")
+        for t in tickers:
+            self.ticker_combo.addItem(t, t)
+        idx = self.ticker_combo.findData(current)
+        if idx >= 0:
+            self.ticker_combo.setCurrentIndex(idx)
+        self.ticker_combo.blockSignals(False)
 from scripts.client.activity_dialog import ActivityDialog
 from scripts.client.activity_runtime import ActivityManager
 from scripts.client.config import ClientConfig
@@ -4854,6 +5006,7 @@ class _TabLoader:
             ("Price Data",  lambda: w.price_tab.load()),
             ("Indicators",  lambda: w.indicators_tab.load()),
             ("Portfolio",   lambda: w.portfolio_tab.load()),
+            ("Portfolio History", lambda: w.portfolio_history_tab.load()),
             ("Trading",     lambda: w.trading_tab.load()),
             ("Runs",        lambda: w.forecast_runs_tab.load()),
             ("Scheduler",   lambda: w.scheduler_tab.load()),
@@ -4934,6 +5087,9 @@ class MainWindow(QMainWindow):
 
         self.portfolio_tab = PortfolioTab(self.api)
         self.tabs.addTab(self.portfolio_tab, "💼 Portfolio")
+
+        self.portfolio_history_tab = PortfolioHistoryTab(self.api)
+        self.tabs.addTab(self.portfolio_history_tab, "📊 Portfolio History")
 
         self.trading_tab = TradingTab(self.api)
         self.tabs.addTab(self.trading_tab, "💱 Trading")

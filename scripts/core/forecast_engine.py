@@ -19,7 +19,7 @@ def format_number(num):
 
 def get_method_instructions(method, ind, atr_percent):
     """Возвращает инструкции для конкретного метода анализа."""
-    bb = ind.get('bb', {})
+    bb = ind.get('bb', {}) if isinstance(ind.get('bb'), dict) else {}
     bb_upper = ind.get('bb_upper') or bb.get('upper', 0)
     bb_lower = ind.get('bb_lower') or bb.get('lower', 0)
     ma20     = ind.get('ma20', 0) or 1  # avoid division by zero
@@ -82,7 +82,7 @@ def get_method_instructions(method, ind, atr_percent):
     return instructions.get(method, instructions['momentum_trend'])
 
 _PROMPT_FOOTER = """
-ОТВЕТЬ СТРОГО В ФОРМАТЕ JSON:
+ОТВЕЧАЙ СТРОГО В ФОРМАТЕ JSON:
 {
     "confidence": число от 0 до 100,
     "side": "LONG" или "SHORT" или "NEUTRAL",
@@ -99,15 +99,29 @@ _PROMPT_FOOTER = """
 
 Требования:
 - confidence реалистичный (не более 80 без явных сигналов)
-- entry_limit_price — чёткая цена входа (для LONG: ниже текущей, для SHORT: выше текущей)
-- target_price — чёткая цена тейк-профита (минимум 1.5x R/R от стопа)
-- stop_loss — чёткая цена стоп-лосса (ниже ближайшей поддержки для LONG)
+- entry_limit_price — ДОЛЖЕН быть в диапазоне ±5% от текущей цены из раздела ТЕХНИЧЕСКИЕ ДАННЫЕ выше. НЕ ИСПОЛЬЗУЙ цены из памяти модели.
+- stop_loss — ДОЛЖЕН быть в диапазоне ±10% от текущей цены. Для LONG: ниже entry. Для SHORT: выше entry.
+- target_price — ДОЛЖЕН быть в диапазоне ±15% от текущей цены. Минимум 1.5x R/R от стопа.
+- ВСЕ три цены ВЫЧИСЛЯЙ от текущей цены (указана в ТЕХНИЧЕСКИЕ ДАННЫЕ), а не из своей памяти.
 - timeframe_hours — реалистичный горизонт для данного метода анализа
 - rationale — детальный анализ с обоснованием уровней"""
 
 
-def build_prompt(db_manager, ticker, ind, method):
-    """Build prompt from DB template if available, else fallback."""
+def build_prompt(db_manager, ticker, ind, method, price_data=None):
+    """Build prompt from DB template if available, else fallback.
+    
+    Args:
+        db_manager: Database manager instance
+        ticker: Stock ticker symbol
+        ind: Technical indicators dict (may include 'price_data' key)
+        method: Forecast method name
+        price_data: Optional list of OHLCV candles to include in prompt
+    """
+    # Pass price_data through indicators dict for backward compatibility
+    if price_data and 'price_data' not in ind:
+        ind = dict(ind)
+        ind['price_data'] = price_data
+    
     template = None
     if db_manager:
         try:
@@ -124,7 +138,7 @@ def build_prompt(db_manager, ticker, ind, method):
     forecast_date = (datetime.now() + timedelta(hours=horizon_hours)).strftime('%Y-%m-%d')
 
     atr_percent = (ind['atr14'] / ind['price'] * 100) if ind.get('price') else 0
-    bb = ind.get('bb', {})
+    bb = ind.get('bb', {}) if isinstance(ind.get('bb'), dict) else {}
     bb_upper = bb.get('upper') or ind.get('bb_upper', 0)
     bb_lower = bb.get('lower') or ind.get('bb_lower', 0)
     bb_pos = 0
@@ -172,6 +186,7 @@ def build_prompt(db_manager, ticker, ind, method):
         "market_context": mkt_ctx,
         "history":        history,
         "footer":         _PROMPT_FOOTER,
+        "recent_candles": _format_recent_candles(ind.get('price_data', []), num_candles=5),
         "price":          _fmt(ind.get('price')),
         "ma20":           _fmt(ind.get('ma20')),
         "ma50":           _fmt(ind.get('ma50')),
@@ -204,15 +219,37 @@ def build_prompt(db_manager, ticker, ind, method):
         logging.warning(f"Template format error for {method}: {e}, using fallback")
         return build_prompt_fallback(ticker, ind, method, db_manager=db_manager)
 
+def _format_recent_candles(price_data, num_candles=5):
+    """Format recent OHLCV candles for prompt inclusion."""
+    if not price_data or len(price_data) == 0:
+        return "Нет данных о свечах"
+    
+    candles = price_data[-num_candles:] if len(price_data) >= num_candles else price_data
+    lines = []
+    for c in reversed(candles):  # Most recent first
+        date_str = c.get('date', 'N/A')
+        if hasattr(date_str, 'strftime'):
+            date_str = date_str.strftime('%Y-%m-%d')
+        lines.append(
+            f"  {date_str}: O={c['open']:.2f} H={c['high']:.2f} L={c['low']:.2f} "
+            f"C={c['close']:.2f} V={c['volume']/1_000_000:.1f}M"
+        )
+    return "\n".join(lines)
+
+
 def build_prompt_fallback(ticker, ind, method, db_manager=None):
     """Build enriched forecast prompt with extended indicators and market context."""
     from multi_model_forecaster import _METHOD_HORIZON_HOURS
     horizon_hours = _METHOD_HORIZON_HOURS.get(method, 24)
     horizon = max(1, round(horizon_hours / 24))
     forecast_date = (datetime.now() + timedelta(hours=horizon_hours)).strftime('%Y-%m-%d')
+    data_date = datetime.now().strftime('%Y-%m-%d')  # Date when data was collected
+    
+    # Get price data for recent candles display
+    price_data = ind.get('price_data', []) if isinstance(ind, dict) else []
 
     atr_percent = (ind['atr14'] / ind['price'] * 100) if ind.get('price') else 0
-    bb = ind.get('bb', {})
+    bb = ind.get('bb', {}) if isinstance(ind.get('bb'), dict) else {}
     bb_upper = bb.get('upper') or ind.get('bb_upper', 0)
     bb_lower = bb.get('lower') or ind.get('bb_lower', 0)
     bb_position = 0
@@ -251,6 +288,16 @@ def build_prompt_fallback(ticker, ind, method, db_manager=None):
             pass
 
     base_prompt = f"""Сделай торговый прогноз для {ticker} на {forecast_date}.
+
+КРИТИЧЕСКИ ВАЖНО — ПРИВЯЗКА ЦЕН:
+- Используй ТОЛЬКО предоставленные ниже данные, актуальные на {data_date}
+- НЕ используй свои знания о ценах {ticker} — они УСТАРЕЛИ и неверны
+- Текущая цена = ${ind['price']:.2f} — ЭТО ЕДИНСТВЕННАЯ ПРАВИЛЬНАЯ ЦЕНА
+- entry_limit_price = ${ind['price']:.2f} ± 5% (диапазон: ${ind['price']*0.95:.2f} — ${ind['price']*1.05:.2f})
+- stop_loss = ${ind['price']:.2f} ± 10% (диапазон: ${ind['price']*0.90:.2f} — ${ind['price']*1.10:.2f})
+- target_price = ${ind['price']:.2f} ± 15% (диапазон: ${ind['price']*0.85:.2f} — ${ind['price']*1.15:.2f})
+- Уровни вне этих диапазонов будут АВТОМАТИЧЕСКИ ОТКЛОНЕНЫ системой
+
 Горизонт прогноза: {horizon} торговых дней.
 Рыночный режим: {ind.get('market_regime', 'N/A')} (ADX={ind.get('adx14', 0):.1f})
 
@@ -280,6 +327,9 @@ def build_prompt_fallback(ticker, ind, method, db_manager=None):
 
 Динамика цены:
 - 5д: {ind['change_5d']:+.1f}%  10д: {ind.get('change_10d', 0):+.1f}%  20д: {ind['change_20d']:+.1f}%  50д: {ind.get('change_50d', 0):+.1f}%
+
+ПОСЛЕДНИЕ ТОРГОВЫЕ ДНИ (реальные OHLCV данные):
+{_format_recent_candles(price_data, num_candles=5)}
 """
 
     method_instructions = get_method_instructions(method, ind, atr_percent)

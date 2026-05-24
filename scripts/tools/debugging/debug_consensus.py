@@ -1,10 +1,15 @@
-import sqlite3
+﻿import sqlite3
 import sys
 sys.path.insert(0, 'd:/Git/forecast/scripts')
 from core.sqlite_manager import SQLiteManager
 from core.consensus import calculate_consensus
 
-conn = sqlite3.connect('trading_robot.db')
+def _get_db_path():
+    from scripts.server.config import get_db_path
+    return get_db_path()
+
+
+conn = sqlite3.connect(_get_db_path())
 conn.row_factory = sqlite3.Row
 cur = conn.cursor()
 

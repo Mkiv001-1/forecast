@@ -3543,7 +3543,12 @@ class SchedulerTab(QWidget):
             self._tasks = self.api.get_scheduler_tasks()
             self._populate_tasks()
         except Exception as e:
-            logger.warning(f"Scheduler tasks load error: {e}")
+            err_msg = str(e)
+            # Suppress connection errors - MainWindow already shows connection error dialog
+            if "timeout" in err_msg.lower() or "connection" in err_msg.lower():
+                logger.debug(f"Scheduler tasks load skipped: server not connected")
+            else:
+                logger.warning(f"Scheduler tasks load error: {e}")
 
     def _populate_tasks(self):
         self.tasks_table.setRowCount(0)
@@ -3640,7 +3645,12 @@ class SchedulerTab(QWidget):
             items = self.api.get_heartbeat_history(limit=15)
             self._populate_heartbeat(items)
         except Exception as e:
-            logger.warning(f"Heartbeat history load error: {e}")
+            err_msg = str(e)
+            # Suppress connection errors - MainWindow already shows connection error dialog
+            if "timeout" in err_msg.lower() or "connection" in err_msg.lower():
+                logger.debug(f"Heartbeat history load skipped: server not connected")
+            else:
+                logger.warning(f"Heartbeat history load error: {e}")
 
     def _populate_heartbeat(self, items: list):
         self.hb_table.setRowCount(0)
@@ -5053,6 +5063,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.config = config
         self.api = ForecastApiClient(config.server_url, config.api_key)
+        self._connected = False
         self.setWindowTitle("Forecast Trading Robot")
         self.resize(1400, 900)
         self._build_ui()
@@ -5153,11 +5164,13 @@ class MainWindow(QMainWindow):
     def _check_connection(self):
         try:
             h = self.api.health()
+            self._connected = True
             self.conn_label.setText(f"● Connected  {self.config.server_url}")
             self.conn_label.setStyleSheet("color: #2e7d32; font-weight: bold;")
             self.info_label.setText(f"Server: {h.server}")
             self._load_all()
         except Exception as e:
+            self._connected = False
             self.conn_label.setText(f"● Disconnected — {e}")
             self.conn_label.setStyleSheet("color: #c62828; font-weight: bold;")
             QMessageBox.critical(

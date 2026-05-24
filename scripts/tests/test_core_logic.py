@@ -602,6 +602,15 @@ def test_order_manager_ticker_blocked():
     assert result["status"] == "SKIPPED_TICKER_BLOCKED"
 
 
+def test_order_manager_ticker_unknown():
+    from order_manager import submit_signal
+    db = _make_order_db()
+    with sqlite3.connect(db.db_file) as c:
+        c.execute("UPDATE config SET value='paper' WHERE key='ORDER_MODE'")
+    result = submit_signal("MSFT", _good_consensus(), _good_position(), db)
+    assert result["status"] == "SKIPPED_TICKER_UNKNOWN"
+
+
 def test_order_manager_duplicate_order():
     from order_manager import submit_signal
     db = _make_order_db()
@@ -2700,6 +2709,122 @@ def test_circuit_breaker_closed_allows_call():
     result = circuit_breaker.call_with_breaker(lambda: 42)
     assert result == 42
     assert circuit_breaker.status()["failure_count"] == 0
+
+
+# ===========================================================================
+# evaluate_logs_records — individual Logs evaluation
+# ===========================================================================
+
+def test_evaluate_logs_records_fills_actuals():
+    """evaluate_logs_records: NEW log record gets actuals filled and status=EVALUATED."""
+    from datetime import datetime, timedelta
+    from unittest.mock import patch
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+        db_path = os.path.join(tmpdir, "test.db")
+        con = sqlite3.connect(db_path)
+        con.execute("PRAGMA journal_mode=DELETE")
+        con.executescript("""
+            CREATE TABLE IF NOT EXISTS logs (
+                id                TEXT PRIMARY KEY,
+                forecast_date     TEXT,
+                created_at        TEXT,
+                ticker            TEXT,
+                method            TEXT,
+                model             TEXT,
+                confidence        REAL,
+                side              TEXT,
+                entry_price       REAL,
+                entry_conditions  TEXT,
+                exit_target       TEXT,
+                exit_stop         TEXT,
+                position_size     TEXT DEFAULT '',
+                rationale         TEXT,
+                forecast_prompt   TEXT,
+                prompt_response   TEXT,
+                status            TEXT DEFAULT 'NEW',
+                horizon_days      INTEGER DEFAULT 1,
+                actual_date       TEXT,
+                actual_open       REAL,
+                actual_close      REAL,
+                actual_high       REAL,
+                actual_low        REAL,
+                entry_triggered   INTEGER,
+                target_hit        INTEGER,
+                stop_hit          INTEGER,
+                pnl_pct           REAL,
+                direction_correct INTEGER,
+                exit_successful   INTEGER,
+                stop_loss         REAL,
+                run_id            INTEGER
+            );
+        """)
+        # Insert a NEW log record created >3h ago with forecast_date in the past
+        created = (datetime.now() - timedelta(hours=6)).strftime("%Y-%m-%d %H:%M:%S")
+        forecast_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        con.execute(
+            "INSERT INTO logs (id, forecast_date, created_at, ticker, method, model, "
+            "confidence, side, entry_price, exit_target, exit_stop, stop_loss, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("LOG_TEST_001", forecast_date, created, "TEST:XYZ", "mean_reversion",
+             "test-model", 70.0, "LONG", 100.0, "$110.00", "$90.00", 90.0, "NEW"),
+        )
+        con.commit()
+        con.close()
+
+        # Build a mock db_manager that uses SQLite directly
+        class _LogsDB:
+            def __init__(self, path):
+                self.db_file = path
+
+            def _connect(self):
+                c = sqlite3.connect(self.db_file, timeout=10)
+                c.row_factory = sqlite3.Row
+                c.execute("PRAGMA journal_mode=DELETE")
+                return c
+
+            def read_sheet(self, name):
+                import pandas as pd
+                tbl = "logs" if name == "Logs" else name.lower()
+                with self._connect() as c:
+                    return pd.read_sql_query(f"SELECT * FROM {tbl}", c)
+
+            def update_row_by_id(self, sheet, row_id, data):
+                tbl = "logs" if sheet == "Logs" else sheet.lower()
+                set_clause = ", ".join(f"{k} = ?" for k in data)
+                values = list(data.values()) + [row_id]
+                with self._connect() as c:
+                    c.execute(f"UPDATE {tbl} SET {set_clause} WHERE id = ?", values)
+                return True
+
+        db = _LogsDB(db_path)
+
+        # Mock fetch_price_data to return a known bar for the forecast_date
+        fake_bar = [{
+            "date": forecast_date,
+            "open": 101.0, "high": 115.0, "low": 99.0,
+            "close": 112.0, "volume": 1000000,
+        }]
+
+        with patch("actuals_evaluator.fetch_price_data", return_value=fake_bar):
+            from forecast_runner import evaluate_logs_records
+            count = evaluate_logs_records(db)
+
+        assert count == 1
+
+        con2 = sqlite3.connect(db_path)
+        con2.row_factory = sqlite3.Row
+        r = dict(con2.execute("SELECT * FROM logs WHERE id='LOG_TEST_001'").fetchone())
+        con2.close()
+
+        assert r["status"] == "EVALUATED"
+        assert r["actual_close"] == 112.0
+        assert r["actual_high"] == 115.0
+        assert r["actual_low"] == 99.0
+        assert r["actual_open"] == 101.0
+        assert r["direction_correct"] == 1  # LONG, entry=100, close=112
+        assert r["target_hit"] == 1         # LONG, high=115 >= target=110
+        assert r["stop_hit"] == 0           # LONG, low=99 > stop=90
 
 
 if __name__ == "__main__":

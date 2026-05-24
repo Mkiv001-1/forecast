@@ -52,6 +52,7 @@ def snapshot_portfolio_history(db_manager, host: str = "127.0.0.1", port: int = 
                 "price": float(pos.get("market_price", 0) or 0),
                 "account": pos.get("account", ""),
                 "currency": pos.get("currency", "USD") or "USD",
+                "con_id": pos.get("con_id"),
             }
         )
 
@@ -213,6 +214,7 @@ def fetch_ib_accounts(host: str = "127.0.0.1", port: int = 7497, client_id: int 
 
     Returns list of dicts ready for the accounts table.
     """
+    host = host or "127.0.0.1"
     accounts: List[Dict[str, Any]] = []
     try:
         from ib_insync import IB
@@ -274,6 +276,7 @@ def fetch_ib_positions(host: str = "127.0.0.1", port: int = 7497, client_id: int
 
     Returns list of dicts ready to upsert into portfolio table.
     """
+    host = host or "127.0.0.1"
     positions: List[Dict[str, Any]] = []
     try:
         from ib_insync import IB
@@ -519,6 +522,8 @@ def test_ib_connection(host: str = "127.0.0.1", port: int = 7497, client_id: int
 
     Returns dict with connection status, logs, and details.
     """
+    # Defensive: use default if host is empty or None
+    host = host or "127.0.0.1"
     logs: List[str] = []
     result = {
         "success": False,
@@ -673,6 +678,8 @@ def place_bracket_order(
             parent.account = account
         if allow_extended_hours:
             parent.outsideRth = True
+            if parent.tif == "DAY":
+                parent.tif = "GTC"
 
         # Take-profit: Limit
         tp_action = "SELL" if action == "BUY" else "BUY"
@@ -690,7 +697,11 @@ def place_bracket_order(
         sl_action = "SELL" if action == "BUY" else "BUY"
         if use_stop_limit:
             offset = stop_loss_price * stop_limit_offset_pct
-            lmt = stop_loss_price - offset if action == "BUY" else stop_loss_price + offset
+            # Stop-limit logic:
+            # For SELL stop-limit: limit BELOW stop (worse fill for seller = lower price)
+            # For BUY stop-limit: limit ABOVE stop (worse fill for buyer = higher price)
+            # This ensures the limit order can execute when the stop triggers
+            lmt = stop_loss_price - offset if sl_action == "SELL" else stop_loss_price + offset
             stop = StopLimitOrder(
                 action=sl_action,
                 totalQuantity=quantity,
@@ -714,10 +725,46 @@ def place_bracket_order(
 
         ib.sleep(1)
 
+        # Verify all orders were created successfully
+        parent_id = _safe_int(getattr(parent_trade.order, "orderId", 0))
+        target_id = _safe_int(getattr(target_trade.order, "orderId", 0))
+        stop_id = _safe_int(getattr(stop_trade.order, "orderId", 0))
+
+        created_ids = []
+        if parent_id > 0:
+            created_ids.append(("parent", parent_id))
+        if target_id > 0:
+            created_ids.append(("target", target_id))
+        if stop_id > 0:
+            created_ids.append(("stop", stop_id))
+
+        # Rollback if any order failed
+        if len(created_ids) < 3:
+            failed = []
+            if parent_id <= 0:
+                failed.append("parent")
+            if target_id <= 0:
+                failed.append("target")
+            if stop_id <= 0:
+                failed.append("stop")
+
+            logger.error(f"[IB] Partial bracket failure: {failed} not created. Rolling back...")
+
+            # Cancel successfully created orders
+            for role, order_id in created_ids:
+                try:
+                    cancel_order(order_id, host=host, port=port, client_id=client_id + 1)
+                    logger.info(f"[IB] Rolled back {role} order {order_id}")
+                except Exception as cancel_err:
+                    logger.warning(f"[IB] Failed to cancel {role} order {order_id}: {cancel_err}")
+
+            result["error"] = f"Partial bracket failure: {failed} not created"
+            return result
+
         result.update({
-            "parent_id": parent_trade.order.orderId,
-            "target_id": target_trade.order.orderId,
-            "stop_id":   stop_trade.order.orderId,
+            "parent_id": parent_id,
+            "target_id": target_id,
+            "stop_id":   stop_id,
             "parent_perm_id": _safe_int(getattr(parent_trade.order, "permId", 0)),
             "target_perm_id": _safe_int(getattr(target_trade.order, "permId", 0)),
             "stop_perm_id": _safe_int(getattr(stop_trade.order, "permId", 0)),
@@ -827,6 +874,7 @@ def close_position_market(
             order.account = account
         if allow_extended_hours:
             order.outsideRth = True
+            order.tif = "GTC"
         trade = ib.placeOrder(contract, order)
         ib.sleep(1)
         result.update({"order_id": trade.order.orderId, "status": "submitted", "error": None})
@@ -964,8 +1012,9 @@ def fetch_open_order_statuses(
         connected_client_id = _connect_with_client_id_fallback(ib, host, port, client_id, 15)
         if connected_client_id != client_id:
             logger.info(f"[IB] open orders fallback clientId={connected_client_id} (requested={client_id})")
-        trades = ib.openTrades()
+        ib.reqOpenOrders()
         ib.sleep(timeout)
+        trades = ib.openTrades()
 
         for t in trades:
             try:

@@ -87,7 +87,7 @@ class RobotRunner:
                     _sys.modules.pop(_mod, None)
 
             from scripts.core.sqlite_manager import SQLiteManager
-            from scripts.core.forecast_runner import run_trading_bot, evaluate_past_forecasts
+            from scripts.core.forecast_runner import run_trading_bot, evaluate_past_forecasts, evaluate_logs_records
 
             self._add_log(f"[{datetime.now().strftime('%H:%M:%S')}] Starting mode: {mode}")
             self._add_log(f"[{datetime.now().strftime('%H:%M:%S')}] DB: {self.db_file}")
@@ -122,12 +122,17 @@ class RobotRunner:
             elif mode == "evaluate":
                 self._add_log(f"[{datetime.now().strftime('%H:%M:%S')}] Running evaluation of past forecasts...")
                 evaluate_past_forecasts(db_manager)
-                self._add_log(f"[{datetime.now().strftime('%H:%M:%S')}] Evaluation complete.")
+                self._add_log(f"[{datetime.now().strftime('%H:%M:%S')}] Consensus evaluation complete.")
+                self._add_log(f"[{datetime.now().strftime('%H:%M:%S')}] Running evaluation of individual forecast logs...")
+                logs_evaluated = evaluate_logs_records(db_manager)
+                self._add_log(f"[{datetime.now().strftime('%H:%M:%S')}] Logs evaluation complete. Evaluated {logs_evaluated} records.")
 
             elif mode == "full":
                 self._add_log(f"[{datetime.now().strftime('%H:%M:%S')}] Running full cycle (evaluate + forecast)...")
                 evaluate_past_forecasts(db_manager)
-                self._add_log(f"[{datetime.now().strftime('%H:%M:%S')}] Evaluation done, starting forecast...")
+                self._add_log(f"[{datetime.now().strftime('%H:%M:%S')}] Consensus evaluation done.")
+                logs_evaluated = evaluate_logs_records(db_manager)
+                self._add_log(f"[{datetime.now().strftime('%H:%M:%S')}] Logs evaluation done ({logs_evaluated} records). Starting forecast...")
                 run_trading_bot(db_file=self.db_file)
                 self._add_log(f"[{datetime.now().strftime('%H:%M:%S')}] Full cycle complete.")
 

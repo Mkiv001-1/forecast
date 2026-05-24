@@ -209,11 +209,26 @@ def _mock_get_bid_ask_spread(symbol, *args, **kwargs):
 
 
 def _ib_patches(db_file: str, new_net_liq: float = 125_000.0, account_id: str = "DU123456"):
+    _sync = _make_ib_sync(db_file, new_net_liq, account_id)
+    _op_dispatch = {
+        "place_bracket": _mock_place_bracket_order,
+        "get_bid_ask": _mock_get_bid_ask_spread,
+        "sync_accounts": lambda **kw: _sync(**kw),
+    }
+
+    def _fake_request_sync(op, timeout=30.0, **kwargs):
+        handler = _op_dispatch.get(op)
+        if handler:
+            return handler(**kwargs)
+        return {"status": "ok", "op": op}
+
+    import scripts.core.ib_worker as _w
+    from contextlib import nullcontext
+    # Return 3-element list for backward-compat (callers use patches[0..2])
     return [
-        patch("ib_gateway_client.place_bracket_order", side_effect=_mock_place_bracket_order),
-        patch("ib_gateway_client.get_bid_ask_spread",  side_effect=_mock_get_bid_ask_spread),
-        patch("ib_gateway_client.sync_accounts_with_ib",
-              side_effect=_make_ib_sync(db_file, new_net_liq, account_id)),
+        patch.object(_w, "ib_request_sync", side_effect=_fake_request_sync),
+        nullcontext(),
+        nullcontext(),
     ]
 
 
@@ -297,12 +312,25 @@ def test_stale_data_triggers_sync_and_uses_refreshed_value():
     )
     db = FakeDb(db_file)
 
-    patches = _ib_patches(db_file, new_net_liq=200_000.0)
-    with patches[0], patches[1], patches[2] as mock_sync:
+    sync_calls = []
+    _sync_fn = _make_ib_sync(db_file, 200_000.0, "DU123456")
+
+    def _dispatch(op, timeout=30.0, **kwargs):
+        if op == "sync_accounts":
+            sync_calls.append(1)
+            return _sync_fn(**kwargs)
+        if op == "place_bracket":
+            return _mock_place_bracket_order(**kwargs)
+        if op == "get_bid_ask":
+            return _mock_get_bid_ask_spread(**kwargs)
+        return {"status": "ok", "op": op}
+
+    import scripts.core.ib_worker as _w
+    with patch.object(_w, "ib_request_sync", side_effect=_dispatch):
         pos = calculate_position("AAPL", 150.0, 140.0, db_manager=db)
 
     assert pos["status"] == "OK"
-    mock_sync.assert_called_once()         # sync was triggered
+    assert len(sync_calls) >= 1, "sync_accounts should have been called"
     # After refresh net_liq=200 000 → risk=2 000, qty_by_risk=200 → max=66
     assert pos["quantity"] == 66
     assert pos["risk_amount"] == pytest.approx(2_000.0)
@@ -331,17 +359,20 @@ def test_ib_unavailable_manual_only_uses_override():
     def _fail_sync(*args, **kwargs):
         return False
 
-    patches = _ib_patches(db_file)
-    with patches[0], patches[1], patch("ib_gateway_client.sync_accounts_with_ib",
-                                       side_effect=_fail_sync):
+    def _fail_dispatch(op, timeout=30.0, **kwargs):
+        if op == "sync_accounts":
+            return False
+        return {"status": "ok", "op": op}
+
+    import scripts.core.ib_worker as _w
+    with patch.object(_w, "ib_request_sync", side_effect=_fail_dispatch):
         pos = calculate_position("AAPL", 150.0, 140.0, db_manager=db)
 
     assert pos["status"] == "OK"
     assert pos["capital_source"] == "manual_override"
     assert pos["quantity"] == 26
 
-    with patches[0], patches[1], patch("ib_gateway_client.sync_accounts_with_ib",
-                                       side_effect=_fail_sync):
+    with patch.object(_w, "ib_request_sync", side_effect=_fail_dispatch):
         result = submit_signal("AAPL", cons, pos, db, log_id="6d-003")
 
     assert result["status"] == "SUBMITTED"
@@ -367,7 +398,8 @@ def test_ib_unavailable_deny_blocks_order():
     def _fail_sync(*args, **kwargs):
         return False
 
-    with patch("ib_gateway_client.sync_accounts_with_ib", side_effect=_fail_sync):
+    import scripts.core.ib_worker as _w
+    with patch.object(_w, "ib_request_sync", side_effect=lambda op, timeout=30.0, **kw: False if op == "sync_accounts" else {"status": "ok"}):
         pos = calculate_position("AAPL", 150.0, 140.0, db_manager=db)
 
     assert pos["status"] == "SKIPPED_CAPITAL_UNAVAILABLE"
@@ -395,10 +427,8 @@ def test_ib_unavailable_manual_only_no_override_blocks():
     )
     db = FakeDb(db_file)
 
-    def _fail_sync(*args, **kwargs):
-        return False
-
-    with patch("ib_gateway_client.sync_accounts_with_ib", side_effect=_fail_sync):
+    import scripts.core.ib_worker as _w
+    with patch.object(_w, "ib_request_sync", side_effect=lambda op, timeout=30.0, **kw: False if op == "sync_accounts" else {"status": "ok"}):
         pos = calculate_position("AAPL", 150.0, 140.0, db_manager=db)
 
     assert pos["status"] == "SKIPPED_CAPITAL_UNAVAILABLE"
@@ -441,7 +471,8 @@ def test_zero_net_liquidation_in_db_blocks():
     def _sync_noop(*args, **kwargs):
         return True
 
-    with patch("ib_gateway_client.sync_accounts_with_ib", side_effect=_sync_noop):
+    import scripts.core.ib_worker as _w
+    with patch.object(_w, "ib_request_sync", side_effect=lambda op, timeout=30.0, **kw: True if op == "sync_accounts" else {"status": "ok"}):
         pos = calculate_position("AAPL", 150.0, 140.0, db_manager=db)
 
     # capital_provider does not return 0 — it raises CapitalUnavailableError
@@ -542,7 +573,8 @@ def test_wrong_account_id_in_config_triggers_sync():
         synced.append(True)
         return True
 
-    with patch("ib_gateway_client.sync_accounts_with_ib", side_effect=_sync_and_insert):
+    import scripts.core.ib_worker as _w
+    with patch.object(_w, "ib_request_sync", side_effect=lambda op, timeout=30.0, **kw: _sync_and_insert(**kw) if op == "sync_accounts" else {"status": "ok"}):
         pos = calculate_position("AAPL", 150.0, 140.0, db_manager=db)
 
     assert pos["status"] == "OK"

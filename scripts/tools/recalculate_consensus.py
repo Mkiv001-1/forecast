@@ -186,12 +186,9 @@ def recalculate_consensus(db_manager, ticker: str = None):
 
 if __name__ == "__main__":
     import os
+    from scripts.server.config import get_db_path
     
-    db_file = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-        'trading_robot.db'
-    )
-    
+    db_file = get_db_path()
     db_manager = SQLiteManager(db_file)
     
     ticker = sys.argv[1] if len(sys.argv) > 1 else None

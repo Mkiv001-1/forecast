@@ -176,7 +176,8 @@ def calculate_consensus(
         ema_acc = None
         # Prefer model_stats (keyed by AI model name) over method_stats for ema_accuracy
         if model_stats and model in model_stats:
-            ema_acc = model_stats[model].get("ema_accuracy")
+            v = model_stats[model]
+            ema_acc = v.get("ema_accuracy") if isinstance(v, dict) else float(v)
         elif method_stats and method in method_stats:
             ema_acc = method_stats[method].get("ema_accuracy")
         if ema_acc is not None:

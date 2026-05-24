@@ -54,7 +54,9 @@ def process_ticker(db_manager, ticker, run_id=None):
 
         # Генерируем прогнозы для всех активных моделей × методов
         from multi_model_forecaster import generate_multi_model_forecasts
-        raw_forecasts, forecast_log_ids = generate_multi_model_forecasts(db_manager, ticker, indicators, methods, run_id=run_id)
+        raw_forecasts, forecast_log_ids = generate_multi_model_forecasts(
+            db_manager, ticker, indicators, methods, run_id=run_id, price_data=price_data
+        )
         log_ids = forecast_log_ids
 
         logging.info(f"✅ Сгенерировано {len(raw_forecasts)} прогнозов для {ticker}")
@@ -118,6 +120,74 @@ def evaluate_past_forecasts(db_manager):
         logging.error(f"❌ Критическая ошибка оценки прогнозов: {e}")
         raise
 
+
+def evaluate_logs_records(db_manager) -> int:
+    """Оценивает individual Logs записи (NEW → EVALUATED) с фактическими данными.
+
+    Returns:
+        int: количество успешно оценённых записей
+    """
+    try:
+        logging.info("📊 Начало оценки individual Logs записей")
+
+        forecasts = get_forecasts_to_evaluate(db_manager)
+        if not forecasts:
+            logging.info("ℹ️ Нет Logs записей для оценки")
+            return 0
+
+        evaluated = 0
+        no_data = 0
+        errors = 0
+        total = len(forecasts)
+
+        for idx, record in enumerate(forecasts, 1):
+            log_id = record.get('id')
+            ticker = record.get('ticker', '')
+            forecast_date = record.get('forecast_date', '')
+
+            try:
+                # Загрузка фактических данных
+                actual_data = fetch_actual_data(ticker, forecast_date, db_manager=db_manager)
+                if not actual_data:
+                    no_data += 1
+                    logging.info(f"  [{idx}/{total}] {log_id} {ticker} → NO_DATA")
+                    continue
+
+                # Оценка прогноза
+                evaluation = evaluate_forecast(record, actual_data)
+                if not evaluation:
+                    errors += 1
+                    logging.warning(f"  [{idx}/{total}] {log_id} {ticker} → evaluation empty")
+                    continue
+
+                # Объединяем actual_data + evaluation
+                merged = {}
+                merged.update(actual_data)
+                merged.update(evaluation)
+
+                # Сохраняем результат
+                success = update_forecast_with_actuals(db_manager, log_id, merged)
+                if success:
+                    evaluated += 1
+                    logging.info(f"  [{idx}/{total}] {log_id} {ticker} → EVALUATED")
+                else:
+                    errors += 1
+                    logging.warning(f"  [{idx}/{total}] {log_id} {ticker} → update failed")
+
+            except Exception as e:
+                errors += 1
+                logging.error(f"  [{idx}/{total}] {log_id} {ticker} → error: {e}")
+
+        logging.info(
+            f"✅ Logs evaluation completed: evaluated={evaluated}/{total}, "
+            f"no_data={no_data}, errors={errors}"
+        )
+        return evaluated
+
+    except Exception as e:
+        logging.error(f"❌ Критическая ошибка оценки Logs записей: {e}")
+        return 0
+
 def run_trading_bot(db_file: str = None, run_id: int = None, db_manager=None):
     """Основная функция запуска торгового робота.
     
@@ -137,10 +207,8 @@ def run_trading_bot(db_file: str = None, run_id: int = None, db_manager=None):
         
         if db_manager is None:
             if not db_file:
-                db_file = os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-                    'trading_robot.db'
-                )
+                from scripts.server.config import get_db_path
+                db_file = get_db_path()
             db_manager = SQLiteManager(db_file)
 
         # Читаем настройки (один вызов — используется и для tickers_planned, и для итерации)
@@ -201,10 +269,8 @@ def test_single_ticker(ticker='NASDAQ:NVDA', db_file: str = None):
         from sqlite_manager import SQLiteManager
         import os
         if not db_file:
-            db_file = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-                'trading_robot.db'
-            )
+            from scripts.server.config import get_db_path
+            db_file = get_db_path()
         db_manager = SQLiteManager(db_file)
         
         # Создаём run для теста
@@ -228,10 +294,8 @@ def clear_all_data(db_file: str = None):
         from sqlite_manager import SQLiteManager
         import os
         if not db_file:
-            db_file = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-                'trading_robot.db'
-            )
+            from scripts.server.config import get_db_path
+            db_file = get_db_path()
         db_manager = SQLiteManager(db_file)
 
         sheets_to_clear = ['PriceData', 'Indicators', 'Logs']
@@ -269,6 +333,7 @@ if __name__ == "__main__":
             from sqlite_manager import SQLiteManager
             db_manager = SQLiteManager()
             evaluate_past_forecasts(db_manager)
+            evaluate_logs_records(db_manager)
             
         elif command == '--forecast':
             logging.info("🤖 Генерация новых прогнозов")
@@ -279,6 +344,7 @@ if __name__ == "__main__":
             from sqlite_manager import SQLiteManager
             db_manager = SQLiteManager()
             evaluate_past_forecasts(db_manager)
+            evaluate_logs_records(db_manager)
             run_trading_bot()
             
         elif command == '--clear':

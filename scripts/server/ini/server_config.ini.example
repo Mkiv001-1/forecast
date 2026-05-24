@@ -3,6 +3,7 @@ host = 0.0.0.0
 port = 8000
 
 [data]
+db_file = database/trading_robot.db
 excel_file = trading_robot.xlsx
 
 [security]

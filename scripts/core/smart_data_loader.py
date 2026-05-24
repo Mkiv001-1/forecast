@@ -14,7 +14,7 @@ def fetch_price_data_smart(ticker, days=250, db_manager=None):
             from data_loader import load_cached_data_from_excel
             cached_data = load_cached_data_from_excel(ticker, days, db_manager)
             if cached_data:
-                logging.info(f"✅ Загружено {len(cached_data)} дней из кэша Excel для {ticker}")
+                logging.info(f"✅ Загружено {len(cached_data)} дней из кэша SQLite для {ticker}")
                 return cached_data
         except Exception as e:
             logging.warning(f"⚠️ Ошибка загрузки из кэша: {e}")

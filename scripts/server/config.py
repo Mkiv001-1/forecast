@@ -20,6 +20,11 @@ def _mask_secret(value: str) -> str:
     return f"{text[:4]}...{text[-4:]}"
 
 
+def get_db_path() -> str:
+    """Return the absolute path to the database file from server config."""
+    return ServerConfig().db_file
+
+
 class ServerConfig:
     CONFIG_FILE = _DEFAULT_INI
 
@@ -41,7 +46,7 @@ class ServerConfig:
             "port": "8000",
         }
         self._cfg["data"] = {
-            "db_file": "trading_robot.db",
+            "db_file": "database/trading_robot.db",
             "excel_file": "trading_robot.xlsx",
         }
         self._cfg["security"] = {
@@ -77,7 +82,7 @@ class ServerConfig:
 
     @property
     def db_file(self) -> str:
-        raw = self._cfg.get("data", "db_file", fallback="trading_robot.db")
+        raw = self._cfg.get("data", "db_file", fallback="database/trading_robot.db")
         if not os.path.isabs(raw):
             root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
             return os.path.join(root, raw)

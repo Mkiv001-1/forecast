@@ -76,6 +76,15 @@ def get_forecasts_to_evaluate(db_manager, days_back=30):
             logging.info("ℹ️ Таблица Logs пуста")
             return []
 
+        # Filter out inactive tickers
+        active_tickers = db_manager.get_settings()
+        if active_tickers and 'ticker' in df.columns:
+            before = len(df)
+            df = df[df['ticker'].isin(active_tickers)]
+            skipped = before - len(df)
+            if skipped:
+                logging.info(f"⏭️ Пропущено {skipped} записей неактивных тикеров")
+
         now = datetime.now()
         # Оцениваем прогнозы созданные > 3 часов назад (данные уже появились)
         threshold = now - timedelta(hours=3)

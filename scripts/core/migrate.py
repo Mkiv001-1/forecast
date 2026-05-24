@@ -427,7 +427,8 @@ if __name__ == "__main__":
     parser.add_argument("--migrate-schema", action="store_true",
                         help="Add missing columns to existing DB schema (e.g., actual_open, exit_successful)")
     parser.add_argument("--xlsx", default=os.path.join(_PROJECT_ROOT, "trading_robot.xlsx"))
-    parser.add_argument("--db",   default=os.path.join(_PROJECT_ROOT, "trading_robot.db"))
+    from scripts.server.config import get_db_path
+    parser.add_argument("--db",   default=get_db_path())
     args = parser.parse_args()
 
     if args.migrate_schema:

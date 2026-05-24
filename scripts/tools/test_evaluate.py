@@ -1,4 +1,4 @@
-import sys
+﻿import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'scripts', 'core'))
 
@@ -8,7 +8,12 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 from sqlite_manager import SQLiteManager
 from unified_logs_manager import get_forecasts_to_evaluate
 
-db_file = os.path.join(os.path.dirname(__file__), 'trading_robot.db')
+def _get_db_path():
+    from scripts.server.config import get_db_path
+    return get_db_path()
+
+
+db_file = _get_db_path()
 em = SQLiteManager(db_file)
 
 print("=" * 60)

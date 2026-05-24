@@ -136,13 +136,13 @@ def _table_exists(con: sqlite3.Connection, table: str) -> bool:
 
 def _open_orders_count_sql(has_trades_table: bool) -> str:
     if not has_trades_table:
-        return "SELECT COUNT(*) FROM orders WHERE UPPER(order_role)='ENTRY' AND status IN ('QUEUED','SUBMITTED','FILLED_ENTRY')"
+        return "SELECT COUNT(*) FROM orders WHERE UPPER(order_role)='ENTRY' AND status IN ('QUEUED','SUBMITTED','FILLED_ENTRY') AND status != 'STALE'"
     return (
         "SELECT COUNT(*) "
         "FROM orders o "
         "LEFT JOIN trades t ON t.ib_parent_id = o.ib_parent_id "
         "WHERE "
-        "UPPER(o.order_role)='ENTRY' AND ("
+        "UPPER(o.order_role)='ENTRY' AND o.status != 'STALE' AND ("
         "o.status IN ('QUEUED','SUBMITTED') "
         "OR (o.status = 'FILLED_ENTRY' AND COALESCE(UPPER(t.status), 'OPEN') = 'OPEN')"
         ")"
@@ -195,6 +195,32 @@ def _is_ticker_blocked(db_manager, ticker: str) -> bool:
                 (ticker,)
             ).fetchone()
             return bool(row[0]) if row else False
+    except Exception:
+        return False
+
+
+def _is_ticker_known(db_manager, ticker: str) -> bool:
+    """Return True only if ticker exists in settings.
+
+    Accepts rows regardless of the 'active' column presence so the check
+    works both in production (settings has active) and in legacy test DBs
+    that were created without it.  A ticker must at least be registered;
+    the trading_blocked guard handles the active/inactive distinction.
+    """
+    try:
+        with sqlite3.connect(db_manager.db_file) as con:
+            cols = {r[1].lower() for r in con.execute("PRAGMA table_info(settings)").fetchall()}
+            if "active" in cols:
+                row = con.execute(
+                    "SELECT 1 FROM settings WHERE UPPER(ticker)=UPPER(?) AND active=1",
+                    (ticker,)
+                ).fetchone()
+            else:
+                row = con.execute(
+                    "SELECT 1 FROM settings WHERE UPPER(ticker)=UPPER(?)",
+                    (ticker,)
+                ).fetchone()
+            return row is not None
     except Exception:
         return False
 
@@ -431,6 +457,11 @@ def submit_signal(
         reason = position_size.get("status", "UNKNOWN")
         return {"status": reason, "order_ids": [], "message": f"Position sizing: {reason}"}
 
+    # Guard: ticker not registered
+    if not _is_ticker_known(db_manager, ticker):
+        logger.warning(f"order_manager: {ticker} not found in settings, rejecting")
+        return {"status": "SKIPPED_TICKER_UNKNOWN", "order_ids": [], "message": f"{ticker} not in settings"}
+
     # Guard: ticker blocked
     if _is_ticker_blocked(db_manager, ticker):
         return {"status": "SKIPPED_TICKER_BLOCKED", "order_ids": [], "message": f"{ticker} is blocked"}
@@ -482,8 +513,8 @@ def submit_signal(
         max_spread_pct = _cfg_float(db_manager, "MAX_SPREAD_PCT", 0.005)
         ib_port = _get_ib_port(mode)
         try:
-            from ib_gateway_client import get_bid_ask_spread_safe
-            spread_info = get_bid_ask_spread_safe(symbol, port=ib_port)
+            from scripts.core.ib_worker import ib_request_sync
+            spread_info = ib_request_sync("get_bid_ask", symbol=symbol, port=ib_port)
             if spread_info.get("status") == "ok":
                 spread_pct = spread_info.get("spread_pct", 0)
                 if spread_pct > max_spread_pct:
@@ -496,10 +527,16 @@ def submit_signal(
             logger.warning(f"order_manager: slippage guard failed for {ticker}: {e} (proceeding)")
             spread_info = {}
 
-        # Determine order status based on market hours
+        # Determine order status based on market hours and queue settings
         queue_age_hours = _cfg_int(db_manager, "ORDER_QUEUE_MAX_AGE_HOURS", 24)
         allow_extended  = _cfg_bool(db_manager, "ALLOW_EXTENDED_HOURS")
-        initial_status  = "SUBMITTED" if (_is_market_hours() or allow_extended) else "QUEUED"
+        queue_day_orders = _cfg_bool(db_manager, "QUEUE_DAY_ORDERS")
+        
+        # Queue DAY orders until market open if enabled, otherwise submit immediately
+        if queue_day_orders and entry_tif == "DAY" and not _is_market_hours() and not allow_extended:
+            initial_status = "QUEUED"
+        else:
+            initial_status = "SUBMITTED"
 
         use_stop_limit         = _cfg_bool(db_manager, "USE_STOP_LIMIT")
         stop_limit_offset_pct  = _cfg_float(db_manager, "STOP_LIMIT_OFFSET_PCT", 0.0005)
@@ -588,8 +625,9 @@ def submit_signal(
     ib_call_started = time.monotonic()
 
     try:
-        from ib_gateway_client import place_bracket_order_safe
-        ib_result = place_bracket_order_safe(
+        from scripts.core.ib_worker import ib_request_sync
+        ib_result = ib_request_sync(
+            "place_bracket",
             symbol=symbol,
             action=action,
             quantity=quantity,
@@ -825,16 +863,17 @@ def rollback_bracket_group(
     logger.warning(f"order_manager: initiating rollback for parent DB id={parent_db_id}")
 
     # Step 1 — mark ROLLBACK_PENDING
+    parent_quantity = 0
     try:
         with sqlite3.connect(db_manager.db_file) as con:
             row = con.execute(
-                "SELECT ticker, ib_parent_id, account_type FROM orders WHERE id=?",
+                "SELECT ticker, ib_parent_id, account_type, quantity FROM orders WHERE id=?",
                 (parent_db_id,)
             ).fetchone()
             if not row:
                 logger.error(f"rollback: parent order {parent_db_id} not found")
                 return False
-            ticker, ib_parent_id, mode = row[0], row[1], row[2]
+            ticker, ib_parent_id, mode, parent_quantity = row[0], row[1], row[2], row[3] or 0
 
             con.execute(
                 "UPDATE orders SET status='ROLLBACK_PENDING' WHERE ib_parent_id=?",
@@ -856,19 +895,19 @@ def rollback_bracket_group(
                 (ib_parent_id,)
             ).fetchall()
 
-        from ib_gateway_client import cancel_order_safe
+        from scripts.core.ib_worker import ib_request_sync
         for child_ib_id, role, status in children:
             if status not in ("FILLED", "CANCELLED"):
                 logger.info(f"rollback: cancelling {role} IB#{child_ib_id}")
-            cancel_order_safe(child_ib_id, port=ib_port)
+            ib_request_sync("cancel_order", order_id=child_ib_id, port=ib_port)
 
     except Exception as e:
         logger.error(f"rollback: cancel children failed: {e}")
 
     # Step 3 — close position at market
     try:
-        from ib_gateway_client import close_position_market_safe
-        close_result = close_position_market_safe(symbol, quantity=1, port=ib_port)
+        from scripts.core.ib_worker import ib_request_sync
+        close_result = ib_request_sync("close_position", symbol=symbol, quantity=parent_quantity, port=ib_port)
         logger.info(f"rollback: close_position_market result: {close_result}")
     except Exception as e:
         logger.error(f"rollback: close position failed: {e}")
@@ -1319,8 +1358,8 @@ def activate_consensus_order(
         return {"status": "SKIPPED", "message": "ORDER_MODE=disabled"}
 
     # Build position size
-    from position_sizer import calculate_position
-    from capital_provider import get_capital
+    from scripts.core.position_sizer import calculate_position
+    from scripts.core.capital_provider_backup import get_capital
 
     capital = get_capital(db_manager)
     if capital.get("status") != "OK":

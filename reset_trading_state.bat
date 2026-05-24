@@ -55,6 +55,7 @@ echo   [3] Full reset (IB + DB)
 echo   [4] IB only
 echo   [5] DB only
 echo   [6] Custom args
+echo   [7] Clean slate (IB + ALL data: logs, consensus, orders, trades, EMA reset)
 echo   [Q] Cancel
 echo.
 set "CHOICE="
@@ -90,6 +91,12 @@ if /I "%CHOICE%"=="6" (
     set "CUSTOM_ARGS="
     set /p "CUSTOM_ARGS=Enter custom args for reset_trading_state.py: "
     set "FINAL_ARGS=%CUSTOM_ARGS%"
+    exit /b 0
+)
+if /I "%CHOICE%"=="7" (
+    call :CONFIRM_DESTRUCTIVE "CLEAN SLATE (IB + all logs/consensus/trades + EMA reset)"
+    if errorlevel 1 exit /b 1
+    set "FINAL_ARGS=--clean-slate"
     exit /b 0
 )
 if /I "%CHOICE%"=="Q" exit /b 1

@@ -10,7 +10,7 @@ Usage:
     from scripts.core.app_context import get_context, init_context
     
     # Initialize once at startup
-    init_context(db_file="trading_robot.db")
+    init_context(db_file="database/trading_robot.db")
     
     # Get context anywhere
     ctx = get_context()

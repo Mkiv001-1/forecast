@@ -68,7 +68,7 @@ def _cfg(key: str, default: str = "") -> str:
         return default
     try:
         v = _state.db_manager.get_config_value(key)
-        return v if v is not None else default
+        return v if v else default
     except Exception:
         return default
 
@@ -300,19 +300,20 @@ async def _heartbeat_task() -> None:
     except Exception as e:
         notes.append(f"yahoo_err:{e}")
 
-    # IB check: verify a live IB connection instead of relying on stale DB rows.
+    # IB check: verify a live IB connection via ib_worker queue.
     if _state.db_manager:
         try:
-            if test_ib_connection_async is None:
-                notes.append("ib_err:test_connection_unavailable")
+            from scripts.core.ib_worker import ib_request, is_running
+            if not is_running():
+                notes.append("ib_err:worker_not_running")
             else:
                 order_mode = str(_cfg("ORDER_MODE", "paper") or "paper").lower()
                 host = _cfg("IB_HOST", "127.0.0.1")
                 port = _cfg_int("IB_PORT", 7496 if order_mode == "live" else 7497)
                 client_id = _cfg_int("IB_CLIENT_ID", 1)
                 result = await asyncio.wait_for(
-                    test_ib_connection_async(host=host, port=port, client_id=client_id),
-                    timeout=15,
+                    ib_request("test_connection", host=host, port=port, client_id=client_id),
+                    timeout=20,
                 )
                 ib_ok = 1 if result.get("success") else 0
                 if not result.get("success"):
@@ -330,7 +331,7 @@ async def _heartbeat_task() -> None:
 async def _order_timeout_task() -> None:
     """Check for bracket groups with missing children after fill."""
     try:
-        from order_manager import check_child_timeouts
+        from scripts.core.order_manager import check_child_timeouts
         check_child_timeouts(_state.db_manager)
     except Exception as e:
         logger.error(f"scheduler: order_timeout_task error: {e}")
@@ -419,6 +420,28 @@ async def _scheduled_consensus_evaluate_task() -> None:
     logger.info("scheduler: scheduled consensus evaluate run complete")
 
 
+def _run_logs_evaluate_sync() -> None:
+    """Blocking call to evaluate_logs_records — executed in thread pool."""
+    _ensure_core_path()
+    os.chdir(_PROJECT_ROOT)
+    from scripts.core.sqlite_manager import SQLiteManager
+    from scripts.core.forecast_runner import evaluate_logs_records
+    db_file = _state.db_manager.db_file if _state.db_manager else None
+    db = SQLiteManager(db_file)
+    count = evaluate_logs_records(db)
+    logger.info(f"scheduler: logs_evaluate completed, {count} records evaluated")
+
+
+async def _scheduled_logs_evaluate_task() -> None:
+    """Run evaluation of individual Logs records in a thread pool (non-blocking)."""
+    loop = asyncio.get_running_loop()
+    logger.info("scheduler: starting scheduled logs evaluate run")
+    if _state.thread_pool is None:
+        raise RuntimeError("scheduler: thread pool is not initialized")
+    await loop.run_in_executor(_state.thread_pool, _run_logs_evaluate_sync)
+    logger.info("scheduler: scheduled logs evaluate run complete")
+
+
 def _run_price_data_update_sync() -> None:
     """Fetch and save fresh price data for all active tickers."""
     _ensure_core_path()
@@ -447,6 +470,99 @@ def _run_price_data_update_sync() -> None:
         except Exception as e:
             logger.error(f"scheduler: price_data_update error for {ticker}: {e}")
     logger.info(f"scheduler: price_data_update done. updated={updated}/{len(tickers)}")
+
+
+def _run_startup_price_data_backfill() -> None:
+    """On server startup: check last date per ticker and fetch any missing days."""
+    _ensure_core_path()
+    os.chdir(_PROJECT_ROOT)
+    import pandas as _pd
+    from datetime import date as _date
+    from scripts.core.sqlite_manager import SQLiteManager
+    from scripts.core.data_loader import fetch_price_data
+
+    db_file = _state.db_manager.db_file if _state.db_manager else None
+    db = SQLiteManager(db_file)
+    tickers = db.get_active_tickers() if hasattr(db, "get_active_tickers") else []
+    if not tickers:
+        tickers = db.get_active_tickers_direct()
+    if not tickers:
+        logger.warning("startup backfill: no active tickers")
+        return
+
+    from datetime import datetime as _dt
+    import sqlite3 as _sqlite3
+
+    today = _date.today()
+    # Last completed trading day: today if weekday, else last Friday
+    weekday = today.weekday()
+    if weekday == 5:  # Saturday
+        last_trading_day = today - _pd.tseries.offsets.BDay(1)
+        last_trading_day = last_trading_day.date()
+    elif weekday == 6:  # Sunday
+        last_trading_day = today - _pd.tseries.offsets.BDay(1)
+        last_trading_day = last_trading_day.date()
+    else:
+        last_trading_day = today
+
+    updated = 0
+    for ticker in tickers:
+        try:
+            # Read last date directly — avoids the configurable staleness threshold
+            with _sqlite3.connect(db.db_file) as _con:
+                _con.row_factory = _sqlite3.Row
+                _row = _con.execute(
+                    "SELECT MAX(date) as last_date FROM price_data WHERE ticker=?", (ticker,)
+                ).fetchone()
+            last_date_str = _row["last_date"] if _row else None
+
+            if last_date_str:
+                last_day = _dt.strptime(last_date_str[:10], "%Y-%m-%d").date()
+                missing_bdays = max(len(_pd.bdate_range(start=last_day, end=last_trading_day)) - 1, 0)
+            else:
+                last_day = None
+                missing_bdays = 999
+
+            if missing_bdays == 0:
+                logger.info(f"startup backfill: {ticker} is up to date (last={last_date_str}), skipping")
+                continue
+
+            if last_date_str:
+                days_to_fetch = max(missing_bdays + 5, 10)
+                logger.info(
+                    f"startup backfill: {ticker} missing ~{missing_bdays} bdays since {last_date_str}, "
+                    f"fetching {days_to_fetch}d"
+                )
+            else:
+                days_to_fetch = 250
+                logger.info(f"startup backfill: {ticker} has no data, fetching {days_to_fetch}d")
+
+            data = fetch_price_data(ticker, days=days_to_fetch, db_manager=db)
+            if data:
+                db.save_price_data(data, ticker=ticker)
+                updated += 1
+                logger.info(f"startup backfill: {ticker} saved {len(data)} bars")
+            else:
+                logger.warning(f"startup backfill: no data returned for {ticker}")
+        except Exception as e:
+            logger.error(f"startup backfill: error for {ticker}: {e}")
+
+    logger.info(f"startup backfill: done. updated={updated}/{len(tickers)}")
+
+
+async def run_startup_price_data_backfill() -> None:
+    """Async wrapper: run startup price backfill in a thread pool."""
+    loop = asyncio.get_running_loop()
+    if _state.thread_pool is not None:
+        await loop.run_in_executor(_state.thread_pool, _run_startup_price_data_backfill)
+    else:
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="startup-backfill"
+        )
+        try:
+            await loop.run_in_executor(pool, _run_startup_price_data_backfill)
+        finally:
+            pool.shutdown(wait=False)
 
 
 async def _scheduled_price_data_task() -> None:
@@ -509,6 +625,32 @@ async def _expire_queued_orders_task() -> None:
                 logger.info(f"scheduler: expired {expired} QUEUED orders older than {max_age_hours}h")
     except Exception as e:
         logger.error(f"scheduler: expire_queued_orders error: {e}")
+
+
+async def _expire_filled_orders_task() -> None:
+    """Archive FILLED_ENTRY orders older than FILLED_ORDERS_RETENTION_DAYS."""
+    retention_days = _cfg_int("FILLED_ORDERS_RETENTION_DAYS", 30)
+    cutoff = (datetime.now(tz=timezone.utc) - timedelta(days=retention_days)).isoformat()
+    try:
+        if _state.db_manager:
+            archived = _state.db_manager.expire_filled_orders(cutoff)
+            if archived:
+                logger.info(f"scheduler: archived {archived} FILLED_ENTRY orders older than {retention_days} days")
+    except Exception as e:
+        logger.error(f"scheduler: expire_filled_orders error: {e}")
+
+
+async def _expire_stuck_submitted_orders_task() -> None:
+    """Mark stuck SUBMITTED orders as STALE if older than SUBMITTED_ORDERS_MAX_AGE_HOURS."""
+    max_age_hours = _cfg_int("SUBMITTED_ORDERS_MAX_AGE_HOURS", 12)
+    cutoff = (datetime.now(tz=timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
+    try:
+        if _state.db_manager:
+            stale = _state.db_manager.expire_stuck_submitted_orders(cutoff)
+            if stale:
+                logger.info(f"scheduler: marked {stale} SUBMITTED orders as STALE (older than {max_age_hours}h)")
+    except Exception as e:
+        logger.error(f"scheduler: expire_stuck_submitted_orders error: {e}")
 
 
 def _run_process_pending_orders_sync() -> None:
@@ -595,6 +737,44 @@ async def _scheduled_portfolio_history_snapshot_task() -> None:
     logger.info(f"scheduler: portfolio_history_snapshot inserted {count} row(s)")
 
 
+def _run_portfolio_sync_sync() -> None:
+    """Fetch positions from IB and update Portfolio table — executed in thread pool."""
+    _ensure_core_path()
+    os.chdir(_PROJECT_ROOT)
+    from scripts.core.sqlite_manager import SQLiteManager
+    from scripts.core.ib_gateway_client import sync_portfolio_with_ib_safe
+    from datetime import datetime, timezone
+
+    db_file = _state.db_manager.db_file if _state.db_manager else None
+    db = SQLiteManager(db_file)
+
+    order_mode = str(db.get_config_value("ORDER_MODE") or "paper").lower()
+    port = 7496 if order_mode == "live" else 7497
+    client_id = _cfg_int("IB_GATEWAY_CLIENT_ID", 1)
+
+    ok = sync_portfolio_with_ib_safe(
+        db,
+        host=_cfg("IB_GATEWAY_HOST", "127.0.0.1"),
+        port=int(port),
+        client_id=int(client_id),
+        type=order_mode,
+    )
+    if ok:
+        synced_at = datetime.now(tz=timezone.utc).isoformat()
+        db.set_config_value("LAST_PORTFOLIO_SYNC_AT", synced_at)
+        logger.info(f"scheduler: portfolio_sync completed at {synced_at}")
+    else:
+        raise RuntimeError("portfolio sync failed - check IB Gateway connection")
+
+
+async def _scheduled_portfolio_sync_task() -> None:
+    """Run IB portfolio synchronization in a thread pool (non-blocking)."""
+    loop = asyncio.get_running_loop()
+    if _state.thread_pool is None:
+        raise RuntimeError("scheduler: thread pool is not initialized")
+    await loop.run_in_executor(_state.thread_pool, _run_portfolio_sync_sync)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -624,19 +804,26 @@ async def start_scheduler(db_manager) -> None:
     pending_orders_interval = _cfg_int("PENDING_ORDERS_INTERVAL_MINUTES", 1) * 60
     order_status_sync_interval = _cfg_int("ORDER_STATUS_SYNC_INTERVAL_SECONDS", 60)
     portfolio_history_interval = _cfg_int("PORTFOLIO_HISTORY_SNAPSHOT_INTERVAL_MINUTES", 1440) * 60
+    portfolio_sync_interval = _cfg_int("PORTFOLIO_SYNC_INTERVAL_MINUTES", 5) * 60  # Every 5 minutes by default
+
+    logs_evaluate_interval = _cfg_int("LOGS_EVALUATE_INTERVAL_MINUTES", 120) * 60
 
     task_specs = [
         ("heartbeat",              _heartbeat_task,                    30,                     True),
         ("order_timeout_check",    _order_timeout_task,                15,                     False),
         ("expire_queued_orders",   _expire_queued_orders_task,         300,                    False),
+        ("expire_filled_orders",  _expire_filled_orders_task,         86400,                  False),  # Once daily
+        ("expire_stuck_submitted", _expire_stuck_submitted_orders_task, 3600,                 False),  # Hourly
         ("process_pending_orders", _scheduled_pending_orders_task,     pending_orders_interval, False),
         ("sync_order_statuses",    _scheduled_order_status_sync_task,   order_status_sync_interval, False),
+        ("portfolio_sync",         _scheduled_portfolio_sync_task,     portfolio_sync_interval, True),  # Run on start
         ("portfolio_history_snapshot", _scheduled_portfolio_history_snapshot_task, portfolio_history_interval, False),
         ("update_price_data",      _scheduled_price_data_task,         price_data_interval,    False),
         ("update_intraday",        _scheduled_intraday_task,           intraday_interval,      False),
         ("scheduled_forecast",     _scheduled_forecast_task,           forecast_interval,      False),
         ("scheduled_evaluate",     _scheduled_evaluate_task,           evaluate_interval,      False),
         ("consensus_evaluate",     _scheduled_consensus_evaluate_task, evaluate_interval,      False),
+        ("logs_evaluate",          _scheduled_logs_evaluate_task,      logs_evaluate_interval, False),
     ]
 
     for name, factory, interval, run_on_start in task_specs:

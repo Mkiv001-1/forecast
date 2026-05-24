@@ -258,7 +258,7 @@ def reset_ib_state(
                 allow_extended_hours=allow_extended_hours,
                 host=host,
                 port=port,
-                client_id=client_id + 100 + idx,
+                client_id=client_id + 100,
             )
             if str(result.get("status", "")).lower() == "submitted":
                 summary["positions_close_submitted"] += 1
@@ -323,10 +323,19 @@ def main() -> int:
         action="store_true",
         help="Do not force consensus.eval_status='PENDING' during DB reset",
     )
+    parser.add_argument(
+        "--clean-slate",
+        action="store_true",
+        help="Full clean slate: delete all logs/consensus/orders/trades and reset provider EMA weights",
+    )
     args = parser.parse_args()
 
     if args.ib_only and args.db_only:
         print("Error: --ib-only and --db-only are mutually exclusive")
+        return 2
+
+    if args.clean_slate and args.db_only:
+        print("Error: --clean-slate and --db-only are mutually exclusive (clean-slate includes IB reset)")
         return 2
 
     db_file = _resolve_db_file(args.db_file)
@@ -340,7 +349,7 @@ def main() -> int:
     print(f"ORDER_MODE: {order_mode}")
     print(f"IB endpoint: {args.host}:{ib_port}")
     print(f"Dry run: {args.dry_run}")
-    print(f"Modes: ib_only={args.ib_only}, db_only={args.db_only}")
+    print(f"Modes: ib_only={args.ib_only}, db_only={args.db_only}, clean_slate={args.clean_slate}")
 
     ib_summary: Dict[str, Any] = {"ok": True}
     db_summary: Dict[str, Any] = {"ok": True}
@@ -378,19 +387,48 @@ def main() -> int:
     if not args.ib_only:
         if args.dry_run:
             print("DB summary:")
-            print("  dry-run: DB reset skipped")
+            if args.clean_slate:
+                dry = db.full_clean_slate_dry_run()
+                for key in [
+                    "would_delete_forecast_run_links",
+                    "would_delete_logs",
+                    "would_delete_consensus",
+                    "would_delete_forecast_runs",
+                    "would_delete_orders",
+                    "would_delete_trades",
+                    "would_delete_ib_transactions",
+                    "would_reset_providers",
+                ]:
+                    print(f"  {key}: {dry.get(key)}")
+            else:
+                print("  dry-run: DB reset skipped")
         else:
-            db_summary = db.reset_orders_and_trades_state(
-                reset_eval_status=not args.no_reset_eval_status
-            )
-            print("DB summary:")
-            for key in [
-                "deleted_ib_transactions",
-                "deleted_orders",
-                "deleted_trades",
-                "updated_consensus",
-            ]:
-                print(f"  {key}: {db_summary.get(key)}")
+            if args.clean_slate:
+                db_summary = db.full_clean_slate()
+                print("DB summary (clean slate):")
+                for key in [
+                    "deleted_forecast_run_links",
+                    "deleted_logs",
+                    "deleted_consensus",
+                    "deleted_forecast_runs",
+                    "deleted_ib_transactions",
+                    "deleted_orders",
+                    "deleted_trades",
+                    "reset_providers",
+                ]:
+                    print(f"  {key}: {db_summary.get(key)}")
+            else:
+                db_summary = db.reset_orders_and_trades_state(
+                    reset_eval_status=not args.no_reset_eval_status
+                )
+                print("DB summary:")
+                for key in [
+                    "deleted_ib_transactions",
+                    "deleted_orders",
+                    "deleted_trades",
+                    "updated_consensus",
+                ]:
+                    print(f"  {key}: {db_summary.get(key)}")
             if db_summary.get("errors"):
                 print("  errors:")
                 for err in db_summary.get("errors", []):

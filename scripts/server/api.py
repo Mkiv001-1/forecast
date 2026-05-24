@@ -90,6 +90,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"startup: cleanup stuck runs failed: {e}")
 
+    # Start IB worker (single-connection serialized queue)
+    try:
+        _ensure_paths()
+        from scripts.core.ib_worker import start_ib_worker
+        db = _get_db_manager()
+        await start_ib_worker(db)
+        logger.info("IB worker started")
+    except Exception as e:
+        logger.warning(f"IB worker startup failed (non-fatal): {e}")
+
     # Start background task scheduler
     try:
         _ensure_paths()
@@ -100,7 +110,23 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Scheduler startup failed (non-fatal): {e}")
 
+    # Backfill any missing price data since the last server run
+    try:
+        from scripts.core.scheduler import run_startup_price_data_backfill
+        logger.info("startup: checking price data freshness...")
+        await run_startup_price_data_backfill()
+    except Exception as e:
+        logger.warning(f"startup: price data backfill failed (non-fatal): {e}")
+
     yield
+
+    # Stop IB worker
+    try:
+        from scripts.core.ib_worker import stop_ib_worker
+        await stop_ib_worker()
+        logger.info("IB worker stopped")
+    except Exception as e:
+        logger.warning(f"IB worker shutdown error: {e}")
 
     # Stop scheduler on shutdown
     try:
@@ -898,9 +924,9 @@ async def sync_accounts(
     type: str = Query("paper"),
 ):
     try:
-        from scripts.core.ib_gateway_client import sync_accounts_with_ib_async
+        from scripts.core.ib_worker import ib_request
         em = _get_db_manager()
-        ok = await sync_accounts_with_ib_async(em, host=host, port=port, client_id=client_id, type=type)
+        ok = await ib_request("sync_accounts", db_manager=em, host=host, port=port, client_id=client_id, type=type)
         if not ok:
             raise HTTPException(status_code=502, detail="IB Gateway returned no accounts. Ensure TWS/Gateway is running and API is enabled on port " + str(port))
         return {"synced": True, "client_id": client_id, "type": type}
@@ -940,10 +966,10 @@ async def sync_portfolio(
     type: str = Query("paper"),
 ):
     try:
-        from scripts.core.ib_gateway_client import sync_portfolio_with_ib_async
+        from scripts.core.ib_worker import ib_request
         from datetime import datetime, timezone
         em = _get_db_manager()
-        ok = await sync_portfolio_with_ib_async(em, host=host, port=port, client_id=client_id, type=type)
+        ok = await ib_request("sync_portfolio", db_manager=em, host=host, port=port, client_id=client_id, type=type)
         if not ok:
             raise HTTPException(status_code=502, detail="IB Gateway returned no positions. Ensure TWS/Gateway is running and API is enabled on port " + str(port))
         synced_at = datetime.now(tz=timezone.utc).isoformat()
@@ -984,7 +1010,7 @@ async def get_portfolio_history(
             params.append(date_from)
         if date_to:
             clauses.append("timestamp<=?")
-            params.append(date_to)
+            params.append(date_to + "T23:59:59")
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY timestamp DESC LIMIT ?"
@@ -1006,10 +1032,9 @@ async def trigger_portfolio_history_snapshot(
 ):
     """Принудительно собрать snapshot портфеля через IB Gateway."""
     try:
-        from scripts.core.ib_gateway_client import snapshot_portfolio_history_async
-
+        from scripts.core.ib_worker import ib_request
         em = _get_db_manager()
-        count = await snapshot_portfolio_history_async(em, host=host, port=port, client_id=client_id)
+        count = await ib_request("snapshot_portfolio", db_manager=em, host=host, port=port, client_id=client_id)
         return {"snapshots_added": int(count or 0)}
     except Exception as e:
         logger.exception("Error triggering portfolio history snapshot")
@@ -1028,11 +1053,11 @@ async def get_ib_portfolio_summary(
     If refresh=true, trigger a fresh IB snapshot first.
     """
     try:
-        from scripts.core.ib_gateway_client import snapshot_portfolio_history_async
+        from scripts.core.ib_worker import ib_request
 
         em = _get_db_manager()
         if refresh:
-            await snapshot_portfolio_history_async(em, host=host, port=port, client_id=client_id)
+            await ib_request("snapshot_portfolio", db_manager=em, host=host, port=port, client_id=client_id)
 
         with em._connect() as con:
             row = con.execute(
@@ -1085,8 +1110,8 @@ async def test_ib_connection_endpoint(
     client_id: int = Query(1, ge=0, le=999),
 ):
     """Test IB Gateway connection and return detailed logs."""
-    from scripts.core.ib_gateway_client import test_ib_connection_async
-    result = await test_ib_connection_async(host=host, port=port, client_id=client_id)
+    from scripts.core.ib_worker import ib_request
+    result = await ib_request("test_connection", host=host, port=port, client_id=client_id)
     return result
 
 
@@ -1099,18 +1124,8 @@ async def get_ib_position_status(
 ):
     """Fetch live status for a single IB position identified by con_id."""
     try:
-        from scripts.core.ib_gateway_client import fetch_ib_position_status_by_con_id
-        import asyncio
-
-        result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: fetch_ib_position_status_by_con_id(
-                con_id=int(con_id),
-                host=host,
-                port=int(port),
-                client_id=int(client_id),
-            ),
-        )
+        from scripts.core.ib_worker import ib_request
+        result = await ib_request("fetch_position_status", con_id=int(con_id), host=host, port=int(port), client_id=int(client_id))
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1128,18 +1143,8 @@ async def get_ib_order_status(
 ):
     """Fetch live status for a single IB order identified by ib_order_id."""
     try:
-        from scripts.core.ib_gateway_client import fetch_ib_order_status_by_order_id
-        import asyncio
-
-        result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: fetch_ib_order_status_by_order_id(
-                order_id=int(ib_order_id),
-                host=host,
-                port=int(port),
-                client_id=int(client_id),
-            ),
-        )
+        from scripts.core.ib_worker import ib_request
+        result = await ib_request("fetch_order_status", order_id=int(ib_order_id), host=host, port=int(port), client_id=int(client_id))
         return result
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1446,11 +1451,8 @@ async def cancel_order_endpoint(order_id: int):
             raise HTTPException(status_code=404, detail="Order not found")
         ib_id, mode = row["ib_order_id"], row["account_type"]
         port = 7496 if mode == "live" else 7497
-        from scripts.core.ib_gateway_client import cancel_order
-        import asyncio
-        ok = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: cancel_order(ib_id, port=port)
-        )
+        from scripts.core.ib_worker import ib_request
+        ok = await ib_request("cancel_order", order_id=ib_id, port=port)
         return {"cancelled": ok, "order_id": order_id, "ib_order_id": ib_id}
     except HTTPException:
         raise
@@ -1475,18 +1477,15 @@ async def sync_orders_from_ib(
             order_mode = str(em.get_config_value("ORDER_MODE") or "paper").lower()
             resolved_port = 7496 if order_mode == "live" else 7497
 
-        from scripts.core.order_status_sync import sync_orders_with_ib
-        import asyncio
+        from scripts.core.ib_worker import ib_request
 
-        result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: sync_orders_with_ib(
-                em,
-                host=host,
-                port=int(resolved_port),
-                client_id=int(client_id),
-                source="manual",
-            ),
+        result = await ib_request(
+            "sync_orders",
+            db_manager=em,
+            host=host,
+            port=int(resolved_port),
+            client_id=int(client_id),
+            source="manual",
         )
 
         if bool(result.get("ok", False)):

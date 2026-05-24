@@ -1,5 +1,10 @@
-import sqlite3
-conn = sqlite3.connect('trading_robot.db')
+﻿import sqlite3
+
+def _get_db_path():
+    from scripts.server.config import get_db_path
+    return get_db_path()
+
+conn = sqlite3.connect(_get_db_path())
 cur = conn.cursor()
 
 print('Checking logs table data:')

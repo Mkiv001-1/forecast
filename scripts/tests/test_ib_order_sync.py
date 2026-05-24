@@ -821,3 +821,100 @@ def test_process_ib_order_updates_no_crash_on_empty(tmp_path):
     db = FakeDbManager(db_file)
     from order_manager import process_ib_order_updates
     process_ib_order_updates(db, [])
+
+
+# ---------------------------------------------------------------------------
+# Test: _mark_missing_submitted_orders_cancelled via sync_orders_with_ib
+# ---------------------------------------------------------------------------
+
+def test_sync_marks_submitted_entry_cancelled_when_absent_from_ib(tmp_path, monkeypatch):
+    """SUBMITTED ENTRY order absent from IB open orders must be marked CANCELLED,
+    sibling child orders cancelled, and the linked trade closed."""
+    db_file = _make_db(tmp_path)
+    db = FakeDbManager(db_file)
+
+    monkeypatch.setattr(
+        "order_status_sync._fetch_statuses_with_event_loop",
+        lambda host, port, client_id: [],
+    )
+
+    from order_status_sync import sync_orders_with_ib
+    result = sync_orders_with_ib(db, port=7497)
+
+    assert result["ok"] is True
+    assert result["updated_orders"] >= 1
+
+    with sqlite3.connect(db_file) as con:
+        entry = con.execute("SELECT status FROM orders WHERE ib_order_id=1001").fetchone()
+        tp = con.execute("SELECT status FROM orders WHERE ib_order_id=1002").fetchone()
+        sl = con.execute("SELECT status FROM orders WHERE ib_order_id=1003").fetchone()
+        trade = con.execute("SELECT status FROM trades WHERE ib_parent_id=1001").fetchone()
+
+    assert entry[0] == "CANCELLED"
+    assert tp[0] == "CANCELLED"
+    assert sl[0] == "CANCELLED"
+    assert trade[0] == "CANCELLED"
+
+
+def test_sync_does_not_cancel_entry_present_in_ib(tmp_path, monkeypatch):
+    """SUBMITTED ENTRY order that IB still reports as open must not be cancelled."""
+    db_file = _make_db(tmp_path)
+    db = FakeDbManager(db_file)
+
+    monkeypatch.setattr(
+        "order_status_sync._fetch_statuses_with_event_loop",
+        lambda host, port, client_id: [
+            {
+                "ib_order_id": 1001,
+                "status": "Submitted",
+                "avg_fill_price": 0.0,
+                "filled_qty": 0.0,
+                "last_update": "",
+            }
+        ],
+    )
+
+    from order_status_sync import sync_orders_with_ib
+    result = sync_orders_with_ib(db, port=7497)
+
+    assert result["ok"] is True
+
+    with sqlite3.connect(db_file) as con:
+        entry = con.execute("SELECT status FROM orders WHERE ib_order_id=1001").fetchone()
+        trade = con.execute("SELECT status FROM trades WHERE ib_parent_id=1001").fetchone()
+
+    assert entry[0] == "SUBMITTED"
+    assert trade[0] == "OPEN"
+
+
+# ---------------------------------------------------------------------------
+# Test: expire_stuck_submitted_orders closes linked trades
+# ---------------------------------------------------------------------------
+
+def test_expire_stuck_submitted_orders_closes_trade(tmp_path):
+    """expire_stuck_submitted_orders must also set linked OPEN trade to CANCELLED."""
+    db_file = _make_db(tmp_path)
+    db = FakeDbManager(db_file)
+
+    old_ts = "2020-01-01T00:00:00+00:00"
+    with sqlite3.connect(db_file) as con:
+        con.execute("UPDATE orders SET submitted_at=? WHERE ib_order_id=1001", (old_ts,))
+
+    import sys, os
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "core"))
+    from sqlite_manager import SQLiteManager
+
+    sm = SQLiteManager(db_file)
+    cutoff = "2025-01-01T00:00:00+00:00"
+    stale_count = sm.expire_stuck_submitted_orders(cutoff)
+
+    assert stale_count > 0
+
+    with sqlite3.connect(db_file) as con:
+        entry = con.execute("SELECT status FROM orders WHERE ib_order_id=1001").fetchone()
+        trade = con.execute("SELECT status FROM trades WHERE ib_parent_id=1001").fetchone()
+
+    assert entry[0] == "STALE"
+    assert trade[0] == "CANCELLED"
+
+

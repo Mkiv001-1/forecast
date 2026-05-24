@@ -23,6 +23,32 @@ def _write_server_ini(ini_path: str, db_file: str, api_key: str) -> None:
         f.write(f"api_key = {api_key}\n")
 
 
+# ---------------------------------------------------------------------------
+# Common lifespan dummies (scheduler + ib_worker)
+# ---------------------------------------------------------------------------
+
+async def _dummy_start_ib_worker(_db=None):
+    return None
+
+async def _dummy_stop_ib_worker():
+    return None
+
+
+def _patch_lifecycle(monkeypatch):
+    """Patch both scheduler and ib_worker lifecycle in all tests."""
+    monkeypatch.setattr("scripts.core.scheduler.start_scheduler", _dummy_start_scheduler_shared)
+    monkeypatch.setattr("scripts.core.scheduler.stop_scheduler", _dummy_stop_scheduler_shared)
+    monkeypatch.setattr("scripts.core.ib_worker.start_ib_worker", _dummy_start_ib_worker)
+    monkeypatch.setattr("scripts.core.ib_worker.stop_ib_worker", _dummy_stop_ib_worker)
+
+
+async def _dummy_start_scheduler_shared(_db):
+    return None
+
+async def _dummy_stop_scheduler_shared():
+    return None
+
+
 def test_api_config_scheduler_max_workers_roundtrip(monkeypatch):
     from scripts.server.config import ServerConfig
     import scripts.server.api as api_mod
@@ -42,6 +68,8 @@ def test_api_config_scheduler_max_workers_roundtrip(monkeypatch):
         monkeypatch.setattr(ServerConfig, "CONFIG_FILE", ini_file)
         monkeypatch.setattr("scripts.core.scheduler.start_scheduler", _dummy_start_scheduler)
         monkeypatch.setattr("scripts.core.scheduler.stop_scheduler", _dummy_stop_scheduler)
+        monkeypatch.setattr("scripts.core.ib_worker.start_ib_worker", _dummy_start_ib_worker)
+        monkeypatch.setattr("scripts.core.ib_worker.stop_ib_worker", _dummy_stop_ib_worker)
 
         headers = {"X-API-Key": api_key}
         with TestClient(api_mod.app) as client:
@@ -105,10 +133,13 @@ def test_api_ib_position_status_endpoint(monkeypatch):
         monkeypatch.setattr(ServerConfig, "CONFIG_FILE", ini_file)
         monkeypatch.setattr("scripts.core.scheduler.start_scheduler", _dummy_start_scheduler)
         monkeypatch.setattr("scripts.core.scheduler.stop_scheduler", _dummy_stop_scheduler)
-        monkeypatch.setattr(
-            "scripts.core.ib_gateway_client.fetch_ib_position_status_by_con_id",
-            _fake_position_status,
-        )
+        monkeypatch.setattr("scripts.core.ib_worker.start_ib_worker", _dummy_start_ib_worker)
+        monkeypatch.setattr("scripts.core.ib_worker.stop_ib_worker", _dummy_stop_ib_worker)
+
+        async def _fake_ib_request(op, **kwargs):
+            return _fake_position_status(**kwargs)
+
+        monkeypatch.setattr("scripts.core.ib_worker.ib_request", _fake_ib_request)
 
         headers = {"X-API-Key": api_key}
         with TestClient(api_mod.app) as client:
@@ -157,10 +188,13 @@ def test_api_ib_order_status_endpoint(monkeypatch):
         monkeypatch.setattr(ServerConfig, "CONFIG_FILE", ini_file)
         monkeypatch.setattr("scripts.core.scheduler.start_scheduler", _dummy_start_scheduler)
         monkeypatch.setattr("scripts.core.scheduler.stop_scheduler", _dummy_stop_scheduler)
-        monkeypatch.setattr(
-            "scripts.core.ib_gateway_client.fetch_ib_order_status_by_order_id",
-            _fake_order_status,
-        )
+        monkeypatch.setattr("scripts.core.ib_worker.start_ib_worker", _dummy_start_ib_worker)
+        monkeypatch.setattr("scripts.core.ib_worker.stop_ib_worker", _dummy_stop_ib_worker)
+
+        async def _fake_ib_request(op, **kwargs):
+            return _fake_order_status(**kwargs)
+
+        monkeypatch.setattr("scripts.core.ib_worker.ib_request", _fake_ib_request)
 
         headers = {"X-API-Key": api_key}
         with TestClient(api_mod.app) as client:
@@ -195,10 +229,13 @@ def test_api_ib_position_status_invalid_id(monkeypatch):
         monkeypatch.setattr(ServerConfig, "CONFIG_FILE", ini_file)
         monkeypatch.setattr("scripts.core.scheduler.start_scheduler", _dummy_start_scheduler)
         monkeypatch.setattr("scripts.core.scheduler.stop_scheduler", _dummy_stop_scheduler)
-        monkeypatch.setattr(
-            "scripts.core.ib_gateway_client.fetch_ib_position_status_by_con_id",
-            _raise_invalid,
-        )
+        monkeypatch.setattr("scripts.core.ib_worker.start_ib_worker", _dummy_start_ib_worker)
+        monkeypatch.setattr("scripts.core.ib_worker.stop_ib_worker", _dummy_stop_ib_worker)
+
+        async def _fake_ib_request(op, **kwargs):
+            _raise_invalid(**kwargs)
+
+        monkeypatch.setattr("scripts.core.ib_worker.ib_request", _fake_ib_request)
 
         headers = {"X-API-Key": api_key}
         with TestClient(api_mod.app) as client:
@@ -229,10 +266,13 @@ def test_api_ib_order_status_invalid_id(monkeypatch):
         monkeypatch.setattr(ServerConfig, "CONFIG_FILE", ini_file)
         monkeypatch.setattr("scripts.core.scheduler.start_scheduler", _dummy_start_scheduler)
         monkeypatch.setattr("scripts.core.scheduler.stop_scheduler", _dummy_stop_scheduler)
-        monkeypatch.setattr(
-            "scripts.core.ib_gateway_client.fetch_ib_order_status_by_order_id",
-            _raise_invalid,
-        )
+        monkeypatch.setattr("scripts.core.ib_worker.start_ib_worker", _dummy_start_ib_worker)
+        monkeypatch.setattr("scripts.core.ib_worker.stop_ib_worker", _dummy_stop_ib_worker)
+
+        async def _fake_ib_request(op, **kwargs):
+            _raise_invalid(**kwargs)
+
+        monkeypatch.setattr("scripts.core.ib_worker.ib_request", _fake_ib_request)
 
         headers = {"X-API-Key": api_key}
         with TestClient(api_mod.app) as client:
@@ -263,10 +303,13 @@ def test_api_portfolio_sync_persists_last_sync(monkeypatch):
         monkeypatch.setattr(ServerConfig, "CONFIG_FILE", ini_file)
         monkeypatch.setattr("scripts.core.scheduler.start_scheduler", _dummy_start_scheduler)
         monkeypatch.setattr("scripts.core.scheduler.stop_scheduler", _dummy_stop_scheduler)
-        monkeypatch.setattr(
-            "scripts.core.ib_gateway_client.sync_portfolio_with_ib_async",
-            _fake_sync_portfolio_with_ib_async,
-        )
+        monkeypatch.setattr("scripts.core.ib_worker.start_ib_worker", _dummy_start_ib_worker)
+        monkeypatch.setattr("scripts.core.ib_worker.stop_ib_worker", _dummy_stop_ib_worker)
+
+        async def _fake_ib_request(op, **kwargs):
+            return await _fake_sync_portfolio_with_ib_async(**kwargs)
+
+        monkeypatch.setattr("scripts.core.ib_worker.ib_request", _fake_ib_request)
 
         headers = {"X-API-Key": api_key}
         with TestClient(api_mod.app) as client:
@@ -312,10 +355,14 @@ def test_api_orders_sync_persists_last_sync(monkeypatch):
         monkeypatch.setattr(ServerConfig, "CONFIG_FILE", ini_file)
         monkeypatch.setattr("scripts.core.scheduler.start_scheduler", _dummy_start_scheduler)
         monkeypatch.setattr("scripts.core.scheduler.stop_scheduler", _dummy_stop_scheduler)
-        monkeypatch.setattr(
-            "scripts.core.order_status_sync.sync_orders_with_ib",
-            _fake_sync_orders_with_ib,
-        )
+        monkeypatch.setattr("scripts.core.ib_worker.start_ib_worker", _dummy_start_ib_worker)
+        monkeypatch.setattr("scripts.core.ib_worker.stop_ib_worker", _dummy_stop_ib_worker)
+
+        async def _fake_ib_request(op, **kwargs):
+            db = kwargs.pop("db_manager", None)
+            return _fake_sync_orders_with_ib(db, **kwargs)
+
+        monkeypatch.setattr("scripts.core.ib_worker.ib_request", _fake_ib_request)
 
         headers = {"X-API-Key": api_key}
         with TestClient(api_mod.app) as client:
@@ -350,6 +397,8 @@ def test_api_ib_transactions_endpoint(monkeypatch):
         monkeypatch.setattr(ServerConfig, "CONFIG_FILE", ini_file)
         monkeypatch.setattr("scripts.core.scheduler.start_scheduler", _dummy_start_scheduler)
         monkeypatch.setattr("scripts.core.scheduler.stop_scheduler", _dummy_stop_scheduler)
+        monkeypatch.setattr("scripts.core.ib_worker.start_ib_worker", _dummy_start_ib_worker)
+        monkeypatch.setattr("scripts.core.ib_worker.stop_ib_worker", _dummy_stop_ib_worker)
 
         headers = {"X-API-Key": api_key}
         with TestClient(api_mod.app) as client:
@@ -410,7 +459,13 @@ def test_api_cancel_order_does_not_mark_cancelled_before_sync(monkeypatch):
         monkeypatch.setattr(ServerConfig, "CONFIG_FILE", ini_file)
         monkeypatch.setattr("scripts.core.scheduler.start_scheduler", _dummy_start_scheduler)
         monkeypatch.setattr("scripts.core.scheduler.stop_scheduler", _dummy_stop_scheduler)
-        monkeypatch.setattr("scripts.core.ib_gateway_client.cancel_order", lambda order_id, port=7497: True)
+        monkeypatch.setattr("scripts.core.ib_worker.start_ib_worker", _dummy_start_ib_worker)
+        monkeypatch.setattr("scripts.core.ib_worker.stop_ib_worker", _dummy_stop_ib_worker)
+
+        async def _fake_ib_request(op, **kwargs):
+            return True
+
+        monkeypatch.setattr("scripts.core.ib_worker.ib_request", _fake_ib_request)
 
         headers = {"X-API-Key": api_key}
         with TestClient(api_mod.app) as client:
@@ -469,6 +524,8 @@ def test_api_orders_trades_expose_trade_uid_and_perm_id(monkeypatch):
         monkeypatch.setattr(ServerConfig, "CONFIG_FILE", ini_file)
         monkeypatch.setattr("scripts.core.scheduler.start_scheduler", _dummy_start_scheduler)
         monkeypatch.setattr("scripts.core.scheduler.stop_scheduler", _dummy_stop_scheduler)
+        monkeypatch.setattr("scripts.core.ib_worker.start_ib_worker", _dummy_start_ib_worker)
+        monkeypatch.setattr("scripts.core.ib_worker.stop_ib_worker", _dummy_stop_ib_worker)
 
         headers = {"X-API-Key": api_key}
         with TestClient(api_mod.app) as client:
@@ -671,3 +728,81 @@ def test_api_trades_supports_trade_id_filter(monkeypatch):
             assert len(items) == 1
             assert int(items[0].get("id")) == int(target_trade_id)
             assert items[0].get("trade_uid") == "tid-filter-002"
+
+
+def test_api_orders_sync_cancels_missing_submitted_entry(monkeypatch):
+    """POST /orders/sync with empty IB response cancels SUBMITTED ENTRY orders
+    absent from IB and marks their trades CANCELLED."""
+    from scripts.server.config import ServerConfig
+    import scripts.server.api as api_mod
+
+    async def _dummy_start_scheduler(_db):
+        return None
+
+    async def _dummy_stop_scheduler():
+        return None
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmpdir:
+        db_file = os.path.join(tmpdir, "api_test.db")
+        ini_file = os.path.join(tmpdir, "server_config.ini")
+        api_key = "test-api-key"
+        _write_server_ini(ini_file, db_file, api_key)
+
+        monkeypatch.setattr(ServerConfig, "CONFIG_FILE", ini_file)
+        monkeypatch.setattr("scripts.core.scheduler.start_scheduler", _dummy_start_scheduler)
+        monkeypatch.setattr("scripts.core.scheduler.stop_scheduler", _dummy_stop_scheduler)
+        monkeypatch.setattr(
+            "scripts.core.order_status_sync._fetch_statuses_with_event_loop",
+            lambda host, port, client_id: [],
+        )
+
+        headers = {"X-API-Key": api_key}
+        with TestClient(api_mod.app) as client:
+            with sqlite3.connect(db_file) as con:
+                con.execute(
+                    """INSERT INTO orders(ticker, ib_order_id, ib_parent_id, order_role,
+                       order_type, action, quantity, status, account_type,
+                       created_at, submitted_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    ("NASDAQ:TQQQ", 5001, 5001, "ENTRY", "LMT", "BUY", 10,
+                     "SUBMITTED", "paper",
+                     "2024-01-15T14:00:00", "2024-01-15T14:00:01"),
+                )
+                con.execute(
+                    """INSERT INTO orders(ticker, ib_order_id, ib_parent_id, order_role,
+                       order_type, action, quantity, limit_price, status, account_type,
+                       created_at, submitted_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    ("NASDAQ:TQQQ", 5002, 5001, "TAKE_PROFIT", "LMT", "SELL", 10,
+                     80.0, "SUBMITTED", "paper",
+                     "2024-01-15T14:00:00", "2024-01-15T14:00:01"),
+                )
+                con.execute(
+                    """INSERT INTO trades(ticker, ib_parent_id, signal, quantity,
+                       entry_price, stop_loss, target_price, status,
+                       created_at, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    ("NASDAQ:TQQQ", 5001, "LONG", 10, 74.8, 72.5, 82.3,
+                     "OPEN", "2024-01-15T14:00:00", "2024-01-15T14:00:00"),
+                )
+
+            r = client.post("/orders/sync", headers=headers)
+            assert r.status_code == 200
+            payload = r.json()
+            assert payload.get("ok") is True
+            assert payload.get("updated_orders", 0) >= 1
+
+            with sqlite3.connect(db_file) as con:
+                entry = con.execute(
+                    "SELECT status FROM orders WHERE ib_order_id=5001"
+                ).fetchone()
+                tp = con.execute(
+                    "SELECT status FROM orders WHERE ib_order_id=5002"
+                ).fetchone()
+                trade = con.execute(
+                    "SELECT status FROM trades WHERE ib_parent_id=5001"
+                ).fetchone()
+
+            assert entry[0] == "CANCELLED"
+            assert tp[0] == "CANCELLED"
+            assert trade[0] == "CANCELLED"

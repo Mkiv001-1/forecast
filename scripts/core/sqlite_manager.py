@@ -131,6 +131,7 @@ CREATE TABLE IF NOT EXISTS portfolio (
     ticker        TEXT NOT NULL,
     account       TEXT DEFAULT '',
     broker        TEXT DEFAULT 'ibkr',
+    type          TEXT DEFAULT 'paper',
     quantity      REAL DEFAULT 0,
     avg_cost      REAL DEFAULT 0,
     market_price  REAL DEFAULT 0,
@@ -385,7 +386,8 @@ CREATE TABLE IF NOT EXISTS portfolio_history (
     cash            REAL    DEFAULT 0,
     maintenance_margin REAL DEFAULT 0,
     positions_count INTEGER DEFAULT 0,
-    accounts_count  INTEGER DEFAULT 0
+    accounts_count  INTEGER DEFAULT 0,
+    con_id          INTEGER DEFAULT NULL  -- IB Contract ID for linking to orders
 );
 CREATE INDEX IF NOT EXISTS idx_portfolio_history_ticker ON portfolio_history(ticker);
 CREATE INDEX IF NOT EXISTS idx_portfolio_history_timestamp ON portfolio_history(timestamp);
@@ -443,6 +445,10 @@ _DEFAULT_CONFIG = [
     ("ORDER_ROLLBACK_TIMEOUT_SEC",   "30",         "Seconds to wait for rollback confirmation"),
     ("AUTO_BLOCK_ON_ROLLBACK_FAIL",  "true",       "Block ticker trading on ROLLBACK_FAILED"),
     ("ALERT_CHANNELS",               "[]",         "Notification channels: push, email, telegram (JSON list)"),
+    # Order queue and cleanup
+    ("QUEUE_DAY_ORDERS",             "true",       "Queue DAY orders until market open (false = submit immediately)"),
+    ("FILLED_ORDERS_RETENTION_DAYS", "30",         "Days to keep FILLED_ENTRY orders before cleanup"),
+    ("SUBMITTED_ORDERS_MAX_AGE_HOURS", "12",       "Hours before SUBMITTED orders become STALE (if not updated)"),
     # Consensus
     ("CONSENSUS_MAX_DEVIATION",      "0.15",       "Max target_price deviation from current price (15%)"),
     # Model weights
@@ -457,6 +463,7 @@ _DEFAULT_CONFIG = [
     ("ORDER_STATUS_SYNC_INTERVAL_SECONDS", "60",   "Interval for automatic IB order status synchronization in seconds"),
     ("HEARTBEAT_OPENROUTER_GRACE_SEC","120",        "Grace period before circuit-open triggers degradation"),
     ("PORTFOLIO_HISTORY_SNAPSHOT_INTERVAL_MINUTES", "1440", "How often to collect portfolio history snapshot (minutes)"),
+    ("PORTFOLIO_SYNC_INTERVAL_MINUTES", "5",       "How often to sync Portfolio table from IB Gateway (minutes)"),
     ("IB_GATEWAY_HOST",             "127.0.0.1",   "IB Gateway host for scheduler tasks"),
     ("IB_GATEWAY_PORT",             "7497",        "IB Gateway port for scheduler tasks"),
     ("IB_GATEWAY_CLIENT_ID",        "1",           "IB Gateway client id for scheduler tasks"),
@@ -546,6 +553,9 @@ _DEFAULT_PROMPT_TEMPLATES = [
 - RSI(14): {rsi:.1f} | MACD hist: {macd_hist:+.2f} | ADX: {adx:.1f}
 - OBV: {obv_trend} | Динамика: 5д={change_5d:+.1f}% 20д={change_20d:+.1f}%
 
+ПОСЛЕДНИЕ 5 СВЕЧЕЙ (актуальные OHLCV — использовать для всех ценовых уровней):
+{recent_candles}
+
 МЕТОД: MOMENTUM TREND
 Определи направление тренда и силу импульса. Используй выравнивание MA и ADX.
 Тренд сильный если ADX>25, бычий если EMA9>EMA21 и цена выше MA50.
@@ -559,6 +569,9 @@ _DEFAULT_PROMPT_TEMPLATES = [
 - Цена: ${price:.2f} | BB верх: ${bb_upper:.2f} | BB низ: ${bb_lower:.2f} | Позиция: {bb_pos:.0f}%
 - Stoch RSI: {stoch_rsi:.2f} | RSI: {rsi:.1f} | ATR: {atr_pct:.1f}%
 - Динамика: 5д={change_5d:+.1f}% 20д={change_20d:+.1f}%
+
+ПОСЛЕДНИЕ 5 СВЕЧЕЙ (актуальные OHLCV — использовать для всех ценовых уровней):
+{recent_candles}
 
 МЕТОД: PRICE ACTION
 Оцени уровни поддержки/сопротивления и перекупленность/перепроданность.
@@ -574,6 +587,9 @@ _DEFAULT_PROMPT_TEMPLATES = [
 - Динамика: 5д={change_5d:+.1f}% 10д={change_10d:+.1f}% 20д={change_20d:+.1f}% 50д={change_50d:+.1f}%
 - Объём: {volume_current} ({vol_ratio:.1f}x среднего)
 
+ПОСЛЕДНИЕ 5 СВЕЧЕЙ (актуальные OHLCV — использовать для всех ценовых уровней):
+{recent_candles}
+
 МЕТОД: RELATIVE STRENGTH
 Оцени относительную силу актива vs рынок и устойчивость тренда.
 {history}
@@ -586,6 +602,9 @@ _DEFAULT_PROMPT_TEMPLATES = [
 - Цена: ${price:.2f} | ATR: ${atr:.2f} ({atr_pct:.1f}%) | ADX: {adx:.1f}
 - BB: [{bb_lower:.2f} — {bb_upper:.2f}] ширина {bb_width:.2f} | RSI: {rsi:.1f}
 - Динамика: 5д={change_5d:+.1f}% 20д={change_20d:+.1f}%
+
+ПОСЛЕДНИЕ 5 СВЕЧЕЙ (актуальные OHLCV — использовать для всех ценовых уровней):
+{recent_candles}
 
 МЕТОД: VOLATILITY BREAKOUT
 Оцени режим волатильности и риск пробоя Bollinger Bands.
@@ -601,6 +620,9 @@ _DEFAULT_PROMPT_TEMPLATES = [
 - RSI: {rsi:.1f} | Stoch RSI: {stoch_rsi:.2f} | MACD hist: {macd_hist:+.2f}
 - Динамика: 5д={change_5d:+.1f}% 20д={change_20d:+.1f}%
 
+ПОСЛЕДНИЕ 5 СВЕЧЕЙ (актуальные OHLCV — использовать для всех ценовых уровней):
+{recent_candles}
+
 МЕТОД: MEAN REVERSION
 Оцени вероятность возврата цены к MA20/MA50. Ищи дивергенции RSI и цены.
 Лучший сигнал: RSI<30 + цена ниже MA20 на >5% (oversold bounce).
@@ -614,6 +636,9 @@ _DEFAULT_PROMPT_TEMPLATES = [
 - Цена: ${price:.2f} | Объём: {volume_current} ({vol_ratio:.1f}x среднего)
 - OBV тренд: {obv_trend} | ATR: {atr_pct:.1f}% | ADX: {adx:.1f}
 - Динамика: 5д={change_5d:+.1f}% 20д={change_20d:+.1f}%
+
+ПОСЛЕДНИЕ 5 СВЕЧЕЙ (актуальные OHLCV — использовать для всех ценовых уровней):
+{recent_candles}
 
 МЕТОД: VOLUME BREAKOUT
 Оцени силу объёмного импульса и вероятность пробоя ключевого уровня.
@@ -659,6 +684,8 @@ class _SQLiteManagerQueriesMixin:
     def insert_portfolio_history(self, records: List[Dict[str, Any]]) -> int:
         """Массовая вставка истории портфеля в таблицу portfolio_history.
 
+        Предотвращает дублирование записей на основе (timestamp, ticker, account, row_type).
+
         Args:
             records: список dict с ключами: timestamp, ticker, equity, unrealized_pnl,
                 realized_pnl, cumulative_pnl, volume, price, account, currency
@@ -673,42 +700,67 @@ class _SQLiteManagerQueriesMixin:
             "timestamp", "ticker", "row_type", "equity", "unrealized_pnl", "realized_pnl", "cumulative_pnl",
             "volume", "price", "account", "currency",
             "net_liquidation", "buying_power", "available_funds", "cash",
-            "maintenance_margin", "positions_count", "accounts_count",
+            "maintenance_margin", "positions_count", "accounts_count", "con_id",
         ]
-        values = []
-        for r in records:
-            values.append(
-                (
-                    r.get("timestamp", None),
-                    r.get("ticker", None),
-                    r.get("row_type", "position"),
-                    r.get("equity", None),
-                    r.get("unrealized_pnl", None),
-                    r.get("realized_pnl", None),
-                    r.get("cumulative_pnl", None),
-                    r.get("volume", None),
-                    r.get("price", None),
-                    r.get("account", None),
-                    r.get("currency", None),
-                    r.get("net_liquidation", None),
-                    r.get("buying_power", None),
-                    r.get("available_funds", None),
-                    r.get("cash", None),
-                    r.get("maintenance_margin", None),
-                    r.get("positions_count", None),
-                    r.get("accounts_count", None),
-                )
-            )
-        sql = f"""
-            INSERT INTO portfolio_history
-            ({', '.join(cols)})
-            VALUES ({', '.join(['?'] * len(cols))})
-        """
+
         try:
             with self._connect() as con:
-                con.executemany(sql, values)
+                inserted = 0
+                skipped = 0
+                for r in records:
+                    # Проверка на дубликат по (timestamp, ticker, account, row_type)
+                    check_sql = """
+                        SELECT 1 FROM portfolio_history
+                        WHERE timestamp = ? AND ticker = ? AND account = ? AND row_type = ?
+                        LIMIT 1
+                    """
+                    exists = con.execute(
+                        check_sql,
+                        (
+                            r.get("timestamp"),
+                            r.get("ticker"),
+                            r.get("account", ""),
+                            r.get("row_type", "position"),
+                        ),
+                    ).fetchone()
+
+                    if exists:
+                        skipped += 1
+                        continue
+
+                    values = [
+                        r.get("timestamp", None),
+                        r.get("ticker", None),
+                        r.get("row_type", "position"),
+                        r.get("equity", None),
+                        r.get("unrealized_pnl", None),
+                        r.get("realized_pnl", None),
+                        r.get("cumulative_pnl", None),
+                        r.get("volume", None),
+                        r.get("price", None),
+                        r.get("account", None),
+                        r.get("currency", None),
+                        r.get("net_liquidation", None),
+                        r.get("buying_power", None),
+                        r.get("available_funds", None),
+                        r.get("cash", None),
+                        r.get("maintenance_margin", None),
+                        r.get("positions_count", None),
+                        r.get("accounts_count", None),
+                        r.get("con_id", None),
+                    ]
+                    sql = f"""
+                        INSERT INTO portfolio_history
+                        ({', '.join(cols)})
+                        VALUES ({', '.join(['?'] * len(cols))})
+                    """
+                    con.execute(sql, values)
+                    inserted += 1
+
                 con.commit()
-            return len(values)
+                if skipped > 0:
+                    logger.info(f"insert_portfolio_history: inserted={inserted}, skipped duplicates={skipped}")
+                return inserted
         except Exception as e:
             logger.error(f"insert_portfolio_history error: {e}")
             return 0
@@ -886,6 +938,62 @@ class _SQLiteManagerQueriesMixin:
             logger.warning(f"expire_queued_orders failed: {e}")
             return 0
 
+    def expire_filled_orders(self, cutoff_iso: str) -> int:
+        """Archive FILLED_ENTRY orders older than cutoff.
+        
+        Args:
+            cutoff_iso: ISO datetime string for cutoff
+            
+        Returns:
+            Number of orders archived
+        """
+        try:
+            with self._connect() as con:
+                cur = con.execute(
+                    "UPDATE orders SET status='ARCHIVED' WHERE status='FILLED_ENTRY' AND filled_at < ?",
+                    (cutoff_iso,)
+                )
+            return cur.rowcount
+        except Exception as e:
+            logger.warning(f"expire_filled_orders failed: {e}")
+            return 0
+
+    def expire_stuck_submitted_orders(self, cutoff_iso: str) -> int:
+        """Mark stuck SUBMITTED orders as STALE if they're older than cutoff.
+
+        Also closes any OPEN trades whose ENTRY order is being marked STALE,
+        preventing phantom open positions in the portfolio.
+
+        Args:
+            cutoff_iso: ISO datetime string for cutoff
+
+        Returns:
+            Number of ENTRY orders marked as STALE
+        """
+        from datetime import datetime, timezone
+        now_utc = datetime.now(tz=timezone.utc).isoformat()
+        try:
+            with self._connect() as con:
+                con.execute(
+                    """UPDATE trades SET status='CANCELLED', updated_at=?
+                       WHERE status='OPEN'
+                         AND ib_parent_id IN (
+                             SELECT ib_parent_id FROM orders
+                             WHERE UPPER(order_role)='ENTRY'
+                               AND status='SUBMITTED'
+                               AND submitted_at < ?
+                         )""",
+                    (now_utc, cutoff_iso),
+                )
+                cur = con.execute(
+                    "UPDATE orders SET status='STALE' WHERE status='SUBMITTED' AND submitted_at < ?",
+                    (cutoff_iso,)
+                )
+            return cur.rowcount
+        except Exception as e:
+            logger.warning(f"expire_stuck_submitted_orders failed: {e}")
+            return 0
+
     def get_pending_consensus_orders(self) -> list:
         """Get consensus records in PENDING_ORDER state.
         
@@ -963,7 +1071,7 @@ class _SQLiteManagerQueriesMixin:
 class SQLiteManager(_SQLiteManagerQueriesMixin):
     """SQLite-backed storage. Drop-in replacement for ExcelManager."""
 
-    def __init__(self, db_file: str = "trading_robot.db"):
+    def __init__(self, db_file: str = "database/trading_robot.db"):
         self.db_file = os.path.abspath(db_file)
         self._init_db()
 
@@ -1039,6 +1147,7 @@ class SQLiteManager(_SQLiteManagerQueriesMixin):
             ("logs",      "actual_open",               "REAL"),
             ("logs",      "exit_successful",           "INTEGER"),
             ("accounts",  "type",                      "TEXT DEFAULT ''"),
+            ("portfolio", "type",                      "TEXT DEFAULT 'paper'"),
             # Step 1 additions
             ("settings",  "sector",                    "TEXT DEFAULT ''"),
             ("settings",  "trading_blocked",           "INTEGER DEFAULT 0"),
@@ -1602,6 +1711,144 @@ class SQLiteManager(_SQLiteManagerQueriesMixin):
             summary["errors"].append(str(e))
             logger.error(f"Error resetting orders/trades state: {e}")
             return summary
+
+    def full_clean_slate(self) -> dict:
+        """Delete all forecast/consensus/order data and reset provider EMA weights.
+
+        Keeps configuration tables intact:
+          providers, tickers/settings, method_config, config, price_data, indicators.
+
+        Deletion order respects FK dependencies:
+          forecast_run_links → logs → consensus → forecast_runs
+          ib_order_transactions → orders → trades  (already done by reset_orders_and_trades_state)
+
+        Returns:
+            Dict with row counts and errors list.
+        """
+        summary: Dict[str, Any] = {
+            "ok": False,
+            "deleted_forecast_run_links": 0,
+            "deleted_logs": 0,
+            "deleted_consensus": 0,
+            "deleted_forecast_runs": 0,
+            "deleted_orders": 0,
+            "deleted_trades": 0,
+            "deleted_ib_transactions": 0,
+            "reset_providers": 0,
+            "errors": [],
+        }
+
+        try:
+            with self._connect() as con:
+                cur = con.cursor()
+
+                # 1) forecast_run_links (references logs + forecast_runs)
+                try:
+                    cur.execute("DELETE FROM forecast_run_links")
+                    summary["deleted_forecast_run_links"] = cur.rowcount or 0
+                except Exception as e:
+                    summary["errors"].append(f"delete forecast_run_links: {e}")
+
+                # 2) logs
+                try:
+                    cur.execute("DELETE FROM logs")
+                    summary["deleted_logs"] = cur.rowcount or 0
+                except Exception as e:
+                    summary["errors"].append(f"delete logs: {e}")
+
+                # 3) consensus
+                try:
+                    cur.execute("DELETE FROM consensus")
+                    summary["deleted_consensus"] = cur.rowcount or 0
+                except Exception as e:
+                    summary["errors"].append(f"delete consensus: {e}")
+
+                # 4) forecast_runs
+                try:
+                    cur.execute("DELETE FROM forecast_runs")
+                    summary["deleted_forecast_runs"] = cur.rowcount or 0
+                except Exception as e:
+                    summary["errors"].append(f"delete forecast_runs: {e}")
+
+                # 5) execution tables
+                try:
+                    cur.execute("DELETE FROM ib_order_transactions")
+                    summary["deleted_ib_transactions"] = cur.rowcount or 0
+                except Exception as e:
+                    summary["errors"].append(f"delete ib_order_transactions: {e}")
+
+                try:
+                    cur.execute("DELETE FROM orders")
+                    summary["deleted_orders"] = cur.rowcount or 0
+                except Exception as e:
+                    summary["errors"].append(f"delete orders: {e}")
+
+                try:
+                    cur.execute("DELETE FROM trades")
+                    summary["deleted_trades"] = cur.rowcount or 0
+                except Exception as e:
+                    summary["errors"].append(f"delete trades: {e}")
+
+                # 6) Reset provider EMA weights to neutral 0.5
+                try:
+                    cur.execute(
+                        "UPDATE providers SET ema_accuracy = 0.5, ema_updated_at = NULL, forecast_count = 0"
+                    )
+                    summary["reset_providers"] = cur.rowcount or 0
+                except Exception as e:
+                    summary["errors"].append(f"reset providers ema_accuracy: {e}")
+
+                con.commit()
+
+            summary["ok"] = len(summary["errors"]) == 0
+            return summary
+        except Exception as e:
+            summary["errors"].append(str(e))
+            logger.error(f"full_clean_slate: fatal error: {e}")
+            return summary
+
+    def full_clean_slate_dry_run(self) -> dict:
+        """Return row counts that would be deleted by full_clean_slate() without making changes."""
+        summary: Dict[str, Any] = {
+            "ok": True,
+            "would_delete_forecast_run_links": 0,
+            "would_delete_logs": 0,
+            "would_delete_consensus": 0,
+            "would_delete_forecast_runs": 0,
+            "would_delete_orders": 0,
+            "would_delete_trades": 0,
+            "would_delete_ib_transactions": 0,
+            "would_reset_providers": 0,
+            "errors": [],
+        }
+        table_map = {
+            "would_delete_forecast_run_links": "forecast_run_links",
+            "would_delete_logs": "logs",
+            "would_delete_consensus": "consensus",
+            "would_delete_forecast_runs": "forecast_runs",
+            "would_delete_orders": "orders",
+            "would_delete_trades": "trades",
+            "would_delete_ib_transactions": "ib_order_transactions",
+        }
+        try:
+            with self._connect() as con:
+                for key, table in table_map.items():
+                    try:
+                        row = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+                        summary[key] = int(row[0]) if row else 0
+                    except Exception:
+                        summary[key] = 0
+                try:
+                    row = con.execute(
+                        "SELECT COUNT(*) FROM providers WHERE ema_accuracy IS NOT NULL"
+                    ).fetchone()
+                    summary["would_reset_providers"] = int(row[0]) if row else 0
+                except Exception:
+                    pass
+        except Exception as e:
+            summary["errors"].append(str(e))
+            summary["ok"] = False
+        return summary
 
     # ------------------------------------------------------------------
     # Domain helpers (ExcelManager-compatible)

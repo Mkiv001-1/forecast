@@ -91,10 +91,19 @@ def test_create_trade_and_three_orders_visible_in_trading_tab():
     def _fake_spread(*args, **kwargs):
         return {"status": "no_data", "spread_pct": 0.0}
 
-    with patch("ib_gateway_client.place_bracket_order", side_effect=_fake_place_bracket_order):
-        with patch("ib_gateway_client.get_bid_ask_spread", side_effect=_fake_spread):
-            with patch("order_manager._is_market_hours", return_value=True):
-                result = submit_signal(
+    _op_map = {
+        "place_bracket": lambda **kw: _fake_place_bracket_order(**kw),
+        "get_bid_ask": lambda **kw: _fake_spread(**kw),
+    }
+
+    def _dispatch(op, timeout=30.0, **kwargs):
+        fn = _op_map.get(op)
+        return fn(**kwargs) if fn else {"status": "ok"}
+
+    import scripts.core.ib_worker as _w
+    with patch.object(_w, "ib_request_sync", side_effect=_dispatch):
+        with patch("order_manager._is_market_hours", return_value=True):
+            result = submit_signal(
                     ticker=ticker,
                     consensus=consensus,
                     position_size=position_size,

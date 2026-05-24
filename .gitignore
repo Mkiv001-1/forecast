@@ -44,6 +44,9 @@ Thumbs.db
 .server.pid
 .client.pid
 
-# SQLite WAL files
+# SQLite database files
+database/*.db
+database/*.db-shm
+database/*.db-wal
 *.db-shm
 *.db-wal

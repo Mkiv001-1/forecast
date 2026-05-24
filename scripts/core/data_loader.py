@@ -152,7 +152,7 @@ def fetch_intraday_yfinance(ticker: str, days: int = 60, interval: str = "1h", m
 
 def fetch_price_data(ticker, days=250, db_manager=None):
     """
-    Универсальная функция загрузки данных с кэшированием в Excel
+    Универсальная функция загрузки данных с кэшированием в SQLite
     """
     from config import DATA_SOURCE
     
@@ -196,7 +196,7 @@ def fetch_price_data(ticker, days=250, db_manager=None):
     return new_data
 
 def load_cached_data_from_excel(ticker, days, db_manager):
-    """Загружает кэшированные данные из Excel"""
+    """Загружает кэшированные данные из SQLite"""
     try:
         price_df = db_manager.read_sheet('PriceData')
         if price_df is None or price_df.empty:

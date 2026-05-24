@@ -48,8 +48,8 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--db-file",
-        default=os.path.join(_PROJECT_ROOT, "trading_robot.db"),
-        help="Path to SQLite DB file",
+        default=None,
+        help="Path to SQLite DB file (default: from server_config.ini)",
     )
     parser.add_argument(
         "--ids",
@@ -138,7 +138,11 @@ def _select_candidates(con: sqlite3.Connection, args: argparse.Namespace) -> lis
 
 def main() -> int:
     args = _parse_args()
-    db_file = os.path.abspath(args.db_file)
+    if args.db_file:
+        db_file = os.path.abspath(args.db_file)
+    else:
+        from scripts.server.config import get_db_path
+        db_file = get_db_path()
 
     if not os.path.exists(db_file):
         logger.error(f"DB file not found: {db_file}")

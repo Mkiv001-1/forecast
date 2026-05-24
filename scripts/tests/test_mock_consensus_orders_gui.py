@@ -164,14 +164,22 @@ _mock_ib = MockIBGateway()
 
 
 def mock_ib_gateway():
-    """Context manager to patch IB gateway functions."""
-    return patch.multiple(
-        'ib_gateway_client',
-        place_bracket_order=_mock_ib.place_bracket_order,
-        get_bid_ask_spread=_mock_ib.get_bid_ask_spread,
-        cancel_order=_mock_ib.cancel_order,
-        close_position_market=_mock_ib.close_position_market,
-    )
+    """Patch ib_request_sync so order_manager calls go through MockIBGateway."""
+    _op_dispatch = {
+        "place_bracket": _mock_ib.place_bracket_order,
+        "get_bid_ask": _mock_ib.get_bid_ask_spread,
+        "cancel_order": _mock_ib.cancel_order,
+        "close_position": _mock_ib.close_position_market,
+    }
+
+    def _fake_request_sync(op, timeout=30.0, **kwargs):
+        handler = _op_dispatch.get(op)
+        if handler:
+            return handler(**kwargs)
+        return {"status": "ok", "op": op}
+
+    import scripts.core.ib_worker as _w
+    return patch.object(_w, "ib_request_sync", side_effect=_fake_request_sync)
 
 
 # ============================================================================

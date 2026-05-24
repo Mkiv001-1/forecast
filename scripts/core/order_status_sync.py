@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 import sqlite3
-import asyncio
 import json
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -29,7 +28,7 @@ _IB_TO_INTERNAL = {
     "INACTIVE": "REJECTED",
 }
 
-_TERMINAL_ORDER_STATUSES = {"FILLED", "FILLED_ENTRY", "CANCELLED", "REJECTED", "EXPIRED"}
+_TERMINAL_ORDER_STATUSES = {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"}
 
 
 def _now_utc_iso() -> str:
@@ -103,31 +102,9 @@ def _table_has_column(con: sqlite3.Connection, table: str, column: str) -> bool:
 
 
 def _fetch_statuses_with_event_loop(host: str, port: int, client_id: int) -> list:
-    """Fetch IB statuses ensuring a loop exists in the current worker thread.
-
-    ib_insync/eventkit accesses asyncio loop policy during import/init, so
-    executor threads need an explicitly attached event loop.
-    """
-    created_loop: Optional[asyncio.AbstractEventLoop] = None
-    try:
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            try:
-                asyncio.get_event_loop()
-            except RuntimeError:
-                created_loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(created_loop)
-
-        from scripts.core.ib_gateway_client import fetch_open_order_statuses
-
-        return fetch_open_order_statuses(host=host, port=port, client_id=client_id)
-    finally:
-        if created_loop is not None:
-            try:
-                created_loop.close()
-            finally:
-                asyncio.set_event_loop(None)
+    """Fetch IB order statuses directly (bypasses ib_worker to avoid deadlock)."""
+    from scripts.core.ib_gateway_client import _run_with_isolated_loop, fetch_open_order_statuses
+    return _run_with_isolated_loop(fetch_open_order_statuses, host=host, port=port, client_id=client_id)
 
 
 def _update_trade_on_entry_fill(con: sqlite3.Connection, ib_parent_id: int, fill_price: Optional[float], filled_at: str) -> int:
@@ -534,6 +511,99 @@ def _sync_consensus_from_trade(con: sqlite3.Connection, trade_id: Optional[int],
     return 0
 
 
+def _mark_missing_submitted_orders_cancelled(
+    db_manager,
+    ib_order_ids_seen: set,
+    event_source: str,
+    summary: dict,
+) -> None:
+    """Cancel local SUBMITTED ENTRY orders that IB no longer reports as open.
+
+    When a DAY-TIF order expires at market close, IB stops returning it in
+    open-order queries.  Without this step the local record stays SUBMITTED
+    forever, blocking all future consensus orders for the same ticker.
+
+    Only ENTRY orders are checked — child orders (TAKE_PROFIT / STOP_LOSS)
+    are cancelled implicitly by IB when the parent expires, and their siblings
+    are handled by the regular sync loop.
+    """
+    now = _now_utc_iso()
+    try:
+        with sqlite3.connect(db_manager.db_file) as con:
+            con.row_factory = sqlite3.Row
+            has_trade_uid = _table_has_column(con, "orders", "trade_uid")
+            select_cols = "id, ticker, ib_order_id, ib_parent_id, submitted_at"
+            if has_trade_uid:
+                select_cols = "id, ticker, ib_order_id, ib_parent_id, trade_uid, submitted_at"
+            rows = con.execute(
+                f"""SELECT {select_cols}
+                   FROM orders
+                   WHERE UPPER(order_role)='ENTRY'
+                     AND status='SUBMITTED'
+                     AND ib_order_id > 0"""
+            ).fetchall()
+
+            for row in rows:
+                ib_id = int(row["ib_order_id"] or 0)
+                if ib_id in ib_order_ids_seen:
+                    continue
+
+                con.execute(
+                    "UPDATE orders SET status='CANCELLED', error_message=? WHERE id=?",
+                    ("IB:expired_or_cancelled", int(row["id"])),
+                )
+                summary["updated_orders"] = summary.get("updated_orders", 0) + 1
+
+                ib_parent_id = int(row["ib_parent_id"] or 0)
+
+                con.execute(
+                    """UPDATE orders SET status='CANCELLED', error_message='IB:parent_expired'
+                       WHERE ib_parent_id=? AND UPPER(order_role) IN ('TAKE_PROFIT','STOP_LOSS')
+                         AND status='SUBMITTED'""",
+                    (ib_parent_id,),
+                )
+
+                trade_id: Optional[int] = None
+                if ib_parent_id:
+                    t = con.execute(
+                        "SELECT id FROM trades WHERE ib_parent_id=? ORDER BY id DESC LIMIT 1",
+                        (ib_parent_id,),
+                    ).fetchone()
+                    if t:
+                        trade_id = int(t["id"])
+                        con.execute(
+                            "UPDATE trades SET status='CANCELLED', updated_at=? WHERE id=? AND status='OPEN'",
+                            (now, trade_id),
+                        )
+                        summary["updated_trades"] = summary.get("updated_trades", 0) + 1
+
+                order_trade_uid = str(row["trade_uid"] if has_trade_uid else "") or ""
+                _log_status_transaction(
+                    db_manager,
+                    con=con,
+                    event_type="ORDER_STATUS_UPDATE",
+                    operation_status="APPLIED",
+                    event_source=event_source,
+                    ticker=str(row["ticker"] or ""),
+                    trade_uid=order_trade_uid,
+                    ib_order_id=ib_id,
+                    ib_perm_id=0,
+                    ib_parent_id=ib_parent_id,
+                    order_id=int(row["id"]),
+                    trade_id=trade_id,
+                    status_before="SUBMITTED",
+                    status_after="CANCELLED",
+                    response_payload={"reason": "missing_from_ib_open_orders"},
+                )
+                logger.info(
+                    f"order_status_sync: ENTRY order id={row['id']} IB#{ib_id} "
+                    f"{row['ticker']} not in IB open orders → CANCELLED"
+                )
+    except Exception as e:
+        logger.error(f"_mark_missing_submitted_orders_cancelled failed: {e}")
+        summary["errors"].append(f"missing_check_error:{e}")
+
+
 def sync_orders_with_ib(
     db_manager,
     host: str = "127.0.0.1",
@@ -561,11 +631,12 @@ def sync_orders_with_ib(
         return summary
     summary["scanned"] = len(statuses)
 
-    if not statuses:
-        return summary
-
     event_source = "sync_scheduler" if str(source).lower() == "scheduler" else "sync_manual"
     mapping_warning_set: set[str] = set()
+
+    if not statuses:
+        _mark_missing_submitted_orders_cancelled(db_manager, set(), event_source, summary)
+        return summary
 
     try:
         with sqlite3.connect(db_manager.db_file) as con:
@@ -711,6 +782,9 @@ def sync_orders_with_ib(
                             )
                 except Exception as row_error:
                     summary["errors"].append(f"row_error:{row_error}")
+
+        ib_order_ids_seen: set[int] = {int(s.get("ib_order_id") or 0) for s in statuses if s.get("ib_order_id")}
+        _mark_missing_submitted_orders_cancelled(db_manager, ib_order_ids_seen, event_source, summary)
 
     except Exception as e:
         logger.error(f"order_status_sync failed: {e}")

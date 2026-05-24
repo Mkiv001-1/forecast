@@ -53,12 +53,13 @@ def evaluate_consensus_records(db_manager) -> int:
         with db_manager._connect() as con:
             df = pd.read_sql_query(
                 """
-                SELECT * FROM consensus
-                WHERE eval_status IN ('PENDING', 'NO_DATA')
-                  AND eval_target_date IS NOT NULL
-                  AND eval_target_date != ''
-                  AND eval_target_date <= ?
-                ORDER BY eval_target_date ASC
+                SELECT c.* FROM consensus c
+                JOIN settings s ON c.ticker = s.ticker AND s.active = 1
+                WHERE c.eval_status IN ('PENDING', 'NO_DATA')
+                  AND c.eval_target_date IS NOT NULL
+                  AND c.eval_target_date != ''
+                  AND c.eval_target_date <= ?
+                ORDER BY c.eval_target_date ASC
                 """,
                 con,
                 params=[now_str],

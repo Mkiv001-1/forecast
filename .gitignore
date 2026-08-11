@@ -50,3 +50,36 @@ database/*.db-shm
 database/*.db-wal
 *.db-shm
 *.db-wal
+# === Auto-added: Python ===
+venv/
+.venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# === Auto-added: Environment / secrets ===
+.env
+.env.*
+!.env.example
+
+# === Auto-added: Node.js ===
+node_modules/
+
+# === Auto-added: IDE / AI tools ===
+.windsurf/
+.claude/worktrees/
+.idea/
+*.swp
+*.swo
+
+# === Auto-added: OS ===
+.DS_Store
+Thumbs.db
+
+# === Auto-added: Logs ===
+*.log

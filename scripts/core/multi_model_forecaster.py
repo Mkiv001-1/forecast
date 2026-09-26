@@ -95,7 +95,7 @@ def generate_forecast_with_model(db_manager, ticker, indicators, method, model_c
 
     prompt = build_prompt(db_manager, ticker, indicators, method, price_data=price_data)
 
-    response = call_ai_model(db_manager, model_cfg, prompt)
+    response = call_ai_model(db_manager, model_cfg, prompt, base_url=OPENROUTER_URL, model_prefix="")
     if not response:
         logging.error(f"❌ No response from {model_name}")
         return None, None, None

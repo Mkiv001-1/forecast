@@ -1,12 +1,10 @@
 """
-Universal AI client for all models via OpenRouter.
-Single API key, OpenAI-compatible format.
-All AI providers (claude, gpt-4o, deepseek, gemini, sonar-pro) are called
-through https://openrouter.ai/api/v1/chat/completions
+Universal AI client supporting both OpenRouter (cloud) and LM Studio (local).
 """
 
 import json
 import logging
+import os
 import time
 from typing import Optional
 
@@ -14,7 +12,13 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-_OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+# Cloud: OpenRouter
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+# Local: LM Studio
+LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
+
+_APP_URL = "https://forecast-robot.local"
 
 
 class RateLimitError(Exception):
@@ -25,19 +29,27 @@ class RateLimitError(Exception):
         super().__init__(f"Rate limited: {model} (retry after {retry_after}s)")
 
 
-_APP_URL = "https://forecast-robot.local"
-
-
 class AIClient:
-    """Calls any OpenRouter-supported model with a single API key."""
+    """Calls AI models via OpenRouter or LM Studio local server."""
 
-    def __init__(self, api_key: str):
-        if not api_key:
-            raise ValueError("OpenRouter API key is required")
-        self.api_key = api_key
+    def __init__(self, api_key: str, base_url: str = OPENROUTER_URL, model_prefix: str = ""):
+        self.base_url = base_url
+        self.model_prefix = model_prefix
+
+        if base_url == LM_STUDIO_URL:
+            # LM Studio local server — no API key needed, use dummy
+            self.api_key = "sk-local-dummy"
+            logger.info(f"AIClient configured for LM Studio local server at {base_url}")
+        else:
+            # OpenRouter cloud — require real API key
+            if not api_key:
+                raise ValueError("OpenRouter API key is required")
+            self.api_key = api_key
+            logger.info(f"AIClient configured for OpenRouter cloud")
+
         self._session = requests.Session()
         self._session.headers.update({
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {self.api_key}",
             "HTTP-Referer": _APP_URL,
             "Content-Type": "application/json",
         })
@@ -52,12 +64,19 @@ class AIClient:
         max_retries: int = 3,
     ) -> str:
         """
-        Call a model via OpenRouter.
+        Call a model via OpenRouter or LM Studio.
+        For LM Studio: model should be the exact ID from /v1/models endpoint.
+        For OpenRouter: model should be provider/model format (e.g. anthropic/claude-3-opus-20240229).
         Returns the assistant message content string.
         Raises on unrecoverable error after max_retries.
         """
+        # LM Studio models may have a prefix; strip it if present
+        display_model = model
+        if self.model_prefix and model.startswith(self.model_prefix):
+            display_model = model[len(self.model_prefix):]
+
         payload = {
-            "model": model,
+            "model": display_model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": user_prompt},
@@ -70,7 +89,7 @@ class AIClient:
         try:
             from circuit_breaker import is_open
             if is_open():
-                raise RuntimeError(f"circuit_breaker: OpenRouter OPEN — {model} call rejected")
+                raise RuntimeError(f"circuit_breaker: {self.base_url} OPEN — {model} call rejected")
         except ImportError:
             pass  # circuit_breaker not yet available
 
@@ -79,7 +98,7 @@ class AIClient:
             try:
                 logger.debug(f"[{model}] attempt {attempt}/{max_retries}")
                 response = self._session.post(
-                    _OPENROUTER_URL,
+                    self.base_url,
                     json=payload,
                     timeout=120,
                 )
@@ -150,23 +169,32 @@ class AIClient:
         raise RuntimeError(f"All {max_retries} attempts failed for model '{model}': {last_error}")
 
 
-def get_ai_client(db_manager) -> Optional[AIClient]:
+def get_ai_client(db_manager, base_url: str = OPENROUTER_URL, model_prefix: str = "") -> Optional[AIClient]:
     """
-    Create AIClient using the OpenRouter API key from the database config.
-    Returns None if the key is not configured.
+    Create AIClient using the API key from the database config.
+    If base_url is LM_STUDIO_URL, no API key is required (local server).
+    Returns None if the key is not configured (for OpenRouter cloud).
     """
+    if base_url == LM_STUDIO_URL:
+        # LM Studio local server — no API key needed
+        logger.info("Creating AIClient for LM Studio local server")
+        return AIClient(api_key="", base_url=base_url, model_prefix=model_prefix)
+
+    # OpenRouter cloud — require real API key
     api_key = db_manager.get_config_value("OPENROUTER_API_KEY", "").strip()
     if not api_key:
         logger.warning("OPENROUTER_API_KEY is not configured in DB config table")
         return None
-    return AIClient(api_key)
+    return AIClient(api_key=api_key, base_url=base_url, model_prefix=model_prefix)
 
 
-def get_active_ai_models(db_manager) -> list:
+def get_active_ai_models(db_manager, base_url: str = OPENROUTER_URL) -> list:
     """
     Return list of active AI model dicts from providers table.
     Each dict: {name, model, temperature, max_tokens, rate_limit}
     If OPENROUTER_FREE_ONLY=true, appends :free suffix to model IDs.
+    For LM Studio local server, models are read from the providers table
+    with model IDs as-is (e.g. 'qwen3.5-9b').
     """
     try:
         free_only = db_manager.get_config_value("OPENROUTER_FREE_ONLY", "false").strip().lower() == "true"

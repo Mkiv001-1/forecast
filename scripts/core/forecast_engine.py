@@ -336,16 +336,19 @@ def build_prompt_fallback(ticker, ind, method, db_manager=None):
 
     return base_prompt + method_instructions + _PROMPT_FOOTER
 
-def call_ai_model(db_manager, model_cfg: dict, prompt: str) -> str:
+def call_ai_model(db_manager, model_cfg: dict, prompt: str, base_url: str = OPENROUTER_URL, model_prefix: str = "") -> str:
     """
-    Call an AI model via OpenRouter.
+    Call an AI model via OpenRouter or LM Studio.
     model_cfg: dict with keys model, temperature, max_tokens.
+    base_url: OPENROUTER_URL or LM_STUDIO_URL
+    model_prefix: prefix to strip from model ID (e.g. 'lmstudio/' for LM Studio)
     Returns raw response string.
+    Raises if AI client not configured.
     """
     from ai_client import get_ai_client
-    client = get_ai_client(db_manager)
+    client = get_ai_client(db_manager, base_url=base_url, model_prefix=model_prefix)
     if not client:
-        raise ValueError("OpenRouter API key not configured. Set OPENROUTER_API_KEY in Config tab.")
+        raise ValueError(f"AI model not configured. Set OPENROUTER_API_KEY in Config tab (cloud) or enable LM Studio (local).")
     return client.call(
         model=model_cfg["model"],
         user_prompt=prompt,
@@ -368,7 +371,7 @@ def call_perplexity_api(prompt, providers_manager):
             (m for m in models if "sonar" in m.get("model", "") or "perplexity" in m.get("model", "")),
             {"model": "perplexity/sonar-pro", "temperature": 0.2, "max_tokens": 2000},
         )
-        return call_ai_model(db_manager, model_cfg, prompt)
+        return call_ai_model(db_manager, model_cfg, prompt, base_url=OPENROUTER_URL, model_prefix="")
     except Exception as e:
         logging.error(f"❌ Ошибка API: {e}")
         raise
